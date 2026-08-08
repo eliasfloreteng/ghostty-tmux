@@ -5,6 +5,7 @@ const glib = @import("glib");
 
 const cli = @import("../../../cli.zig");
 const configpkg = @import("../../../config.zig");
+const termio = @import("../../../termio.zig");
 
 const log = std.log.scoped(.gtk_ghostty_overrides);
 
@@ -15,6 +16,11 @@ command: ?configpkg.Command,
 shell_integration: ?configpkg.Config.ShellIntegration,
 working_directory: ?[:0]const u8,
 title: ?[:0]const u8,
+
+/// Set when the surface displays a tmux control mode pane rather than
+/// running a process. The router is borrowed: `Surface.new` takes its own
+/// reference.
+tmux: ?termio.Tmux.Pane = null,
 
 pub const none: Overrides = .{
     .command = null,
