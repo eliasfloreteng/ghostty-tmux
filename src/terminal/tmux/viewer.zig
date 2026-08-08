@@ -2966,3 +2966,45 @@ test "write before startup completes is dropped" {
         },
     });
 }
+
+test "list-windows windows action outlives the parse" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 42,
+            .name = "main",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                ,
+            } },
+            .contains_tags = &.{.windows},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    const windows = for (actions) |action| {
+                        if (action == .windows) break action.windows;
+                    } else return error.WindowsActionMissing;
+
+                    // The action must point at our own window list. Anything
+                    // else is freed by the time we return to the caller.
+                    try testing.expectEqual(
+                        @intFromPtr(v.windows.items.ptr),
+                        @intFromPtr(windows.ptr),
+                    );
+                    try testing.expectEqual(v.windows.items.len, windows.len);
+
+                    try testing.expectEqual(1, windows.len);
+                    try testing.expectEqual(0, windows[0].id);
+                    try testing.expectEqual(83, windows[0].width);
+                    try testing.expectEqual(44, windows[0].height);
+                }
+            }).check,
+        },
+    });
+}
