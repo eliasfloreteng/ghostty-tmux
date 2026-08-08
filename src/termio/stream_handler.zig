@@ -84,6 +84,11 @@ pub const StreamHandler = struct {
     /// transaction, if any.
     kitty_clipboard_write: ?*terminal.kitty.clipboard.WriteState = null,
 
+    /// Carries pane operations from the viewer out to whatever is
+    /// displaying each pane. Present only while this surface is hosting a
+    /// control mode session. This is an owned reference.
+    tmux_router: if (tmux_enabled) ?*terminal.tmux.Router else void = if (tmux_enabled) null else {},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
