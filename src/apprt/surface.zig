@@ -160,6 +160,16 @@ pub const Message = union(enum) {
     /// Renderer pushed a new frame, redraw this surface.
     redraw,
 
+    /// The tmux control mode window and pane layout changed. This is the
+    /// full set of windows, not a delta; the receiver is responsible for
+    /// diffing it against what it last saw.
+    ///
+    /// The receiver owns the snapshot and must `destroy` it.
+    tmux_windows: if (terminal.options.tmux_control_mode)
+        *terminal.tmux.WindowSet
+    else
+        void,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
