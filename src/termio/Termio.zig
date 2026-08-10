@@ -196,6 +196,7 @@ pub const DerivedConfig = struct {
     xt_checksum_report: bool,
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
+    tmux_pause_after: u32,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -234,6 +235,7 @@ pub const DerivedConfig = struct {
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
+            .tmux_pause_after = config.@"tmux-pause-after",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations

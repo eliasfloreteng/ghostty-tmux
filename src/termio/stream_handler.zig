@@ -45,6 +45,10 @@ pub const StreamHandler = struct {
     /// whoever owns StreamHandler.
     enquiry_response: []const u8,
 
+    /// Seconds of backlog tmux may hold before pausing a pane, or 0 to
+    /// leave pause mode off. Read when a control mode session starts.
+    tmux_pause_after: u32 = 0,
+
     /// The color reporting format for OSC requests.
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
 
@@ -188,6 +192,7 @@ pub const StreamHandler = struct {
         self.clipboard_write_limit = config.clipboard_write_limit;
         self.enquiry_response = config.enquiry_response;
         self.xt_checksum_report = config.xt_checksum_report;
+        self.tmux_pause_after = config.tmux_pause_after;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
@@ -490,7 +495,9 @@ pub const StreamHandler = struct {
                         assert(self.tmux_viewer == null);
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
-                        viewer.* = try .init(global.io(), self.alloc);
+                        viewer.* = try .init(global.io(), self.alloc, .{
+                            .pause_after = self.tmux_pause_after,
+                        });
                         errdefer viewer.deinit();
 
                         // One router per host surface, kept across
