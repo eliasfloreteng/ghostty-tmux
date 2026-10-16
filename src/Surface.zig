@@ -1363,6 +1363,17 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // Mark our flag that we exited immediately
     self.child_exited = true;
 
+    // A tmux pane has no process. This is its pane going away in tmux,
+    // or the whole session ending, and in neither case is there anything
+    // left to show or wait for: the pane's content and what ran in it
+    // live on (or died) on the tmux server, and a "process exited"
+    // overlay over a pane that may still be running elsewhere would be
+    // wrong. So it closes, whatever `wait-after-command` says.
+    if (self.io.backend == .tmux) {
+        self.close();
+        return;
+    }
+
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.
     if (info.runtime_ms <= self.config.abnormal_command_exit_runtime_ms) runtime: {

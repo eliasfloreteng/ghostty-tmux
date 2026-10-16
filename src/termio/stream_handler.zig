@@ -197,6 +197,61 @@ pub const StreamHandler = struct {
         }
     }
 
+    /// Hand the surface a snapshot of the session's windows.
+    fn tmuxWindows(
+        self: *StreamHandler,
+        windows: []const terminal.tmux.Viewer.Window,
+    ) void {
+        if (comptime !tmux_enabled) return;
+
+        // The action's memory belongs to the viewer's arena and dies on
+        // the next call to next, so the surface gets a snapshot that owns
+        // itself. It has to be fully built before we push it:
+        // surfaceMessageWriter can drop the renderer lock while it waits
+        // on a full mailbox.
+        const set = terminal.tmux.WindowSet.create(
+            self.alloc,
+            windows,
+        ) catch |err| {
+            log.warn("failed to snapshot tmux windows: {}", .{err});
+            return;
+        };
+
+        // Stamped after the snapshot is built, so a failed create above
+        // cannot burn a number and leave the surface waiting for one that
+        // never arrives. Every number handed out here is delivered:
+        // surfaceMessageWriter waits for room rather than dropping.
+        const seq = self.tmux_host.tmux_windows_seq.fetchAdd(
+            1,
+            .monotonic,
+        ) + 1;
+
+        self.surfaceMessageWriter(.{ .tmux_windows = .{
+            .set = set,
+            .seq = seq,
+        } });
+    }
+
+    /// The host's output ended without control mode ending: no `%exit`,
+    /// no string terminator, just nothing more, ever. End the session
+    /// exactly as if the DCS had been terminated, so its panes are closed
+    /// and the GUI is told.
+    pub fn tmuxEndOfInput(self: *StreamHandler) void {
+        if (comptime !tmux_enabled) return;
+        if (self.tmux_viewer == null) return;
+
+        log.info("tmux control mode input ended without an exit", .{});
+        var cmd: terminal.dcs.Command = .{ .tmux = .{ .exit = null } };
+        self.dcsCommand(&cmd) catch |err| {
+            log.warn("failed to end tmux control mode err={}", .{err});
+        };
+
+        // The DCS itself never ended, so its handler still holds the
+        // control mode parser. Nothing more will reach it.
+        self.dcs.deinit();
+        self.dcs = .{};
+    }
+
     /// This queues a render operation with the renderer thread. The render
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.
@@ -613,8 +668,10 @@ pub const StreamHandler = struct {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
                         // The viewer has already closed every pane's sink
-                        // and is freed at the end of this block.
-                        .exit => {},
+                        // and is freed at the end of this block. The GUI
+                        // is told the session has no windows any more,
+                        // the same way a session change starts over.
+                        .exit => self.tmuxWindows(&.{}),
 
                         // The surface is on another thread, so the text
                         // is copied out of the viewer's buffers. Losing
@@ -646,7 +703,7 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => |windows| windows: {
+                        .windows => |windows| {
                             // Claim a channel for every pane we now know
                             // about, before anyone outside can learn the
                             // pane ids. Attaching this early is what makes
@@ -655,38 +712,7 @@ pub const StreamHandler = struct {
                             // this action is emitted, so their replies
                             // arrive after we are attached.
                             self.tmuxAttachPanes(viewer);
-                            // The action's memory belongs to the viewer's
-                            // arena and dies on the next call to next, so
-                            // the surface gets a snapshot that owns itself.
-                            // It has to be fully built before we push it:
-                            // surfaceMessageWriter can drop the renderer
-                            // lock while it waits on a full mailbox.
-                            const set = terminal.tmux.WindowSet.create(
-                                self.alloc,
-                                windows,
-                            ) catch |err| {
-                                log.warn(
-                                    "failed to snapshot tmux windows: {}",
-                                    .{err},
-                                );
-                                break :windows;
-                            };
-
-                            // Stamped after the snapshot is built, so a
-                            // failed create above cannot burn a number and
-                            // leave the surface waiting for one that never
-                            // arrives. Every number handed out here is
-                            // delivered: surfaceMessageWriter waits for
-                            // room rather than dropping.
-                            const seq = self.tmux_host.tmux_windows_seq.fetchAdd(
-                                1,
-                                .monotonic,
-                            ) + 1;
-
-                            self.surfaceMessageWriter(.{ .tmux_windows = .{
-                                .set = set,
-                                .seq = seq,
-                            } });
+                            self.tmuxWindows(windows);
                         },
                     }
                 }

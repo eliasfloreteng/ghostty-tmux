@@ -366,7 +366,9 @@ pub const Action = union(Key) {
 
     /// The tmux control mode window and pane layout changed. This is the
     /// full set of windows, not a delta; the receiver diffs it against
-    /// whatever it built last time.
+    /// whatever it built last time. An empty set means the session has
+    /// no windows here any more: it switched to another session (a new
+    /// set follows) or it ended (nothing follows).
     tmux_windows: TmuxWindows,
 
     /// tmux has something to tell the user. See `TmuxNotice`.

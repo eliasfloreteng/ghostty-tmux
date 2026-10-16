@@ -1400,6 +1400,12 @@ pub const ReadThread = struct {
         /// remaining batches and then exits.
         done: bool = false,
 
+        /// Set alongside `done` when the stream ended because the pty
+        /// did (EOF, hangup or a read error) rather than because we were
+        /// asked to quit. The parse stage then tells termio, once every
+        /// batch before it has been processed.
+        eof: bool = false,
+
         /// The buffer storage itself.
         bufs: [buffer_count][buffer_capacity]u8 = undefined,
     };
@@ -1478,12 +1484,20 @@ pub const ReadThread = struct {
                 pipeline.mutex.lockUncancelable(global.io());
                 defer pipeline.mutex.unlock(global.io());
                 while (pipeline.count == 0) {
-                    if (pipeline.done) return;
+                    if (pipeline.done) break :batch &.{};
                     pipeline.batch_ready.waitUncancelable(global.io(), &pipeline.mutex);
                 }
                 const slot = pipeline.tail;
                 break :batch pipeline.bufs[slot][0..pipeline.lens[slot]];
             };
+
+            // The stream is over and everything before the end has been
+            // processed. Gather only publishes non-empty batches, so an
+            // empty one is only ever this.
+            if (batch.len == 0) {
+                if (pipeline.eof) io.processOutputEnd();
+                return;
+            }
 
             // The batch buffer is owned by this stage until we advance
             // the tail below, so it is safe to read outside the lock.
@@ -1524,11 +1538,16 @@ pub const ReadThread = struct {
             setQosClass();
         }
 
+        // Whether we are leaving because the pty ended rather than
+        // because we were told to quit.
+        var eof = false;
+
         // However we exit, tell the parse stage the stream is over so
         // it drains the ring and joins us.
         defer {
             pipeline.mutex.lockUncancelable(global.io());
             pipeline.done = true;
+            pipeline.eof = eof;
             pipeline.mutex.unlock(global.io());
             pipeline.batch_ready.signal(global.io());
         }
@@ -1699,7 +1718,10 @@ pub const ReadThread = struct {
                 pipeline.batch_ready.signal(global.io());
             }
 
-            if (fatal) return;
+            if (fatal) {
+                eof = true;
+                return;
+            }
 
             // A full buffer means the stream is still hot, so go
             // claim the next buffer without an intervening poll.
@@ -1722,6 +1744,7 @@ pub const ReadThread = struct {
             // read thread.
             if (pollfds[0].revents & posix.POLL.HUP != 0) {
                 log.info("pty fd closed, read thread exiting", .{});
+                eof = true;
                 return;
             }
         }
@@ -2302,4 +2325,55 @@ test "execCommand windows: direct command is passed through unchanged" {
     try testing.expectEqual(2, result.len);
     try testing.expectEqualStrings("C:\\tools\\foo.exe", result[0]);
     try testing.expectEqualStrings("arg with spaces", result[1]);
+}
+
+test "read thread: the pty ending is told apart from a quit" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    // Hung up: everything holding the slave is gone, as when the child
+    // and everything it started have exited.
+    {
+        const pty = try ptypkg.Pty.open(.{
+            .ws_row = 24,
+            .ws_col = 80,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        });
+        defer _ = posix.system.close(pty.master);
+        try testing.expect(ReadThread.setNonblock(pty.master));
+        _ = posix.system.close(pty.slave);
+
+        const quit = try compat_fd.pipe2(.{ .CLOEXEC = true });
+        defer compat_fd.close(quit[0]);
+        defer compat_fd.close(quit[1]);
+
+        var pipeline: ReadThread.Pipeline = .{};
+        ReadThread.gatherMainPosix(pty.master, quit[0], &pipeline);
+        try testing.expect(pipeline.done);
+        try testing.expect(pipeline.eof);
+    }
+
+    // Asked to quit, with the pty still open.
+    {
+        const pty = try ptypkg.Pty.open(.{
+            .ws_row = 24,
+            .ws_col = 80,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        });
+        defer _ = posix.system.close(pty.master);
+        defer _ = posix.system.close(pty.slave);
+        try testing.expect(ReadThread.setNonblock(pty.master));
+
+        const quit = try compat_fd.pipe2(.{ .CLOEXEC = true });
+        defer compat_fd.close(quit[0]);
+        defer compat_fd.close(quit[1]);
+        _ = posix.system.write(quit[1], "x", 1);
+
+        var pipeline: ReadThread.Pipeline = .{};
+        ReadThread.gatherMainPosix(pty.master, quit[0], &pipeline);
+        try testing.expect(pipeline.done);
+        try testing.expect(!pipeline.eof);
+    }
 }

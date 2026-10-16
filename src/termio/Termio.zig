@@ -388,9 +388,9 @@ fn tmuxEndpointOps(ctx: *anyopaque, ops: []const terminalpkg.tmux.Op) void {
 fn tmuxEndpointClose(ctx: *anyopaque) void {
     const self: *Termio = @ptrCast(@alignCast(ctx));
 
-    // Present the pane the way a terminal whose process ended is
-    // presented, which gets us the existing overlay and close behavior
-    // for free. The runtime is deliberately large so this does not look
+    // Report the pane the way a terminal whose process ended is
+    // reported, which `Surface.childExited` turns into a close for a
+    // tmux pane. The runtime is deliberately large so this does not look
     // like a process that died immediately, which is treated as a crash.
     _ = self.surface_mailbox.push(.{
         .child_exited = .{
@@ -998,6 +998,29 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.processOutputLocked(buf);
+}
+
+/// The output processed by `processOutput` is over: the pty reported
+/// end of file or an error, so nothing more will ever arrive. Called from
+/// the same thread as `processOutput`, after the last of it.
+///
+/// Only a tmux control mode session cares. It ends with tmux's `%exit`
+/// and the string terminator that closes its DCS, but a connection that
+/// simply drops -- ssh losing the network, the host process killed --
+/// sends neither, and without this the session's panes would sit there
+/// frozen, still looking live, for as long as this surface stayed open.
+pub fn processOutputEnd(self: *Termio) void {
+    if (comptime !StreamHandler.tmux_enabled) return;
+
+    const router = router: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.terminal_stream.handler.tmuxEndOfInput();
+        break :router self.terminal_stream.handler.tmux_router;
+    };
+
+    // As in processOutput: the closes are delivered without our lock.
+    if (router) |r| r.flush();
 }
 
 /// Process output from readdata but the lock is already held.
