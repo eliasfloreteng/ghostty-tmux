@@ -369,6 +369,9 @@ pub const Action = union(Key) {
     /// whatever it built last time.
     tmux_windows: TmuxWindows,
 
+    /// tmux has something to tell the user. See `TmuxNotice`.
+    tmux_notice: TmuxNotice,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -442,6 +445,7 @@ pub const Action = union(Key) {
         move_tab_to_new_window,
         resize_window,
         tmux_windows,
+        tmux_notice,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1090,6 +1094,59 @@ pub const TmuxWindows = struct {
             terminal.tmux.WindowSet.Node.Kind,
             "GHOSTTY_TMUX_NODE_",
         );
+    }
+};
+
+/// Text from a tmux control mode session meant for the user.
+///
+/// A normal tmux client shows these on its status line or in a pane. A
+/// control mode client is only told about them, so if the GUI does not
+/// show them nobody sees them. They are uncommon: tmux only says this
+/// much when something happened that the user would want to know, and
+/// most sessions never produce one.
+///
+/// The target is always the surface *hosting* the session (the one that
+/// ran `tmux -CC`), never one of its pane surfaces, so a GUI can find the
+/// session's windows the same way it does for `tmux_windows`. `kind`
+/// says what kind of text it is:
+///
+///   - `message`: `display-message` was run against this client, for
+///     example by a key binding or script in another client. Transient
+///     and informational; a status-line-like toast suits it.
+///   - `config_error`: an error from loading tmux.conf. Several may
+///     arrive together when the session is attached, one per error.
+///   - `command_error`: something the user asked for, routed to tmux on
+///     their behalf, failed (a split with no room for another pane, a
+///     command racing a pane that just went away). The text is tmux's
+///     own error, e.g. "can't find pane: %3".
+///   - `exit`: the session ended and this is tmux's reason, e.g.
+///     "detached" or "server exited". Sent only when tmux gives one,
+///     right before the session's pane surfaces are closed, so a GUI that
+///     wants to show it should not attach it to a pane surface.
+///
+/// The text is tmux's, UTF-8 in practice but not guaranteed to be, and
+/// not localized. It is only valid for the duration of the action call.
+pub const TmuxNotice = struct {
+    kind: Kind,
+    text: [:0]const u8,
+
+    pub const Kind = terminal.tmux.Viewer.Notice.Kind;
+
+    // Sync with: ghostty_action_tmux_notice_s
+    pub const C = extern struct {
+        kind: Kind,
+        text: [*:0]const u8,
+    };
+
+    pub fn cval(self: TmuxNotice) C {
+        return .{
+            .kind = self.kind,
+            .text = self.text.ptr,
+        };
+    }
+
+    test "ghostty.h TmuxNotice.Kind" {
+        try lib.checkGhosttyHEnum(Kind, "GHOSTTY_TMUX_NOTICE_");
     }
 };
 

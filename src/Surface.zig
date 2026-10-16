@@ -1187,6 +1187,22 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .tmux_notice => |notice| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            defer notice.text.deinit();
+
+            var stack = std.heap.stackFallback(256, self.alloc);
+            const alloc = stack.get();
+            const text = try alloc.dupeZ(u8, notice.text.slice());
+            defer alloc.free(text);
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_notice,
+                .{ .kind = notice.kind, .text = text },
+            );
+        },
+
         .child_exited => |v| self.childExited(v),
 
         .desktop_notification => |notification| {

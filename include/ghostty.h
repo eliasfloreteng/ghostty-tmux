@@ -1006,6 +1006,34 @@ typedef struct {
   size_t len;
 } ghostty_action_tmux_windows_s;
 
+// apprt.action.TmuxNotice.Kind
+typedef enum {
+  GHOSTTY_TMUX_NOTICE_MESSAGE,
+  GHOSTTY_TMUX_NOTICE_CONFIG_ERROR,
+  GHOSTTY_TMUX_NOTICE_COMMAND_ERROR,
+  GHOSTTY_TMUX_NOTICE_EXIT,
+} ghostty_tmux_notice_kind_e;
+
+// apprt.action.TmuxNotice.C
+//
+// Text from a tmux control mode session meant for the user, which a
+// normal tmux client would have shown on its status line. The target is
+// the surface hosting the session, never a pane surface. `text` is NUL
+// terminated, never empty, and only valid for the duration of the
+// action callback; copy it to keep it.
+//
+//   MESSAGE        display-message aimed at this client; informational.
+//   CONFIG_ERROR   an error from loading tmux.conf, one per action.
+//   COMMAND_ERROR  something the user asked tmux to do failed; the text
+//                  is tmux's error.
+//   EXIT           the session ended and this is tmux's reason. Sent
+//                  only when tmux gives one, just before the session's
+//                  pane surfaces are closed.
+typedef struct {
+  ghostty_tmux_notice_kind_e kind;
+  const char* text;
+} ghostty_action_tmux_notice_s;
+
 // apprt.Action.Key
 typedef enum {
   GHOSTTY_ACTION_QUIT,
@@ -1079,6 +1107,7 @@ typedef enum {
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_TMUX_WINDOWS,
+  GHOSTTY_ACTION_TMUX_NOTICE,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1124,6 +1153,7 @@ typedef union {
   ghostty_action_readonly_e readonly;
   ghostty_action_open_config_e open_config;
   ghostty_action_tmux_windows_s tmux_windows;
+  ghostty_action_tmux_notice_s tmux_notice;
 } ghostty_action_u;
 
 typedef struct {

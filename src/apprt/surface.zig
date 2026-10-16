@@ -170,6 +170,19 @@ pub const Message = union(enum) {
     else
         void,
 
+    /// tmux has something to tell the user. See `apprt.action.TmuxNotice`.
+    tmux_notice: if (terminal.options.tmux_control_mode)
+        TmuxNotice
+    else
+        void,
+
+    pub const TmuxNotice = struct {
+        kind: terminal.tmux.Viewer.Notice.Kind,
+
+        /// The receiver owns this and must `deinit` it.
+        text: WriteReq,
+    };
+
     /// A tmux window snapshot and where it sits in the sequence of them.
     ///
     /// The sequence number exists so a snapshot that has already been

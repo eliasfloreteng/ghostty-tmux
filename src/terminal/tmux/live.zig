@@ -100,6 +100,13 @@ const Session = struct {
     /// means to provoke one should check that it did.
     pauses: usize = 0,
 
+    /// The notices the viewer has reported, by kind.
+    notices: [std.meta.fields(Viewer.Notice.Kind).len]struct {
+        count: usize = 0,
+        last: [256]u8 = undefined,
+        last_len: usize = 0,
+    } = @splat(.{}),
+
     /// Start a server running `command` in its one pane, then attach.
     ///
     /// The session is created detached first so that `command` has already
@@ -128,6 +135,10 @@ const Session = struct {
         /// before attaching, so a test about the attach capture is not
         /// racing the command that fills it.
         min_history: usize = 0,
+
+        /// A tmux.conf for the server, instead of none at all. Written
+        /// next to the socket and removed with it.
+        config: ?[]const u8 = null,
     };
 
     fn startWith(
@@ -165,10 +176,22 @@ const Session = struct {
             const x = try std.fmt.bufPrint(&x_buf, "{d}", .{cols});
             const y = try std.fmt.bufPrint(&y_buf, "{d}", .{rows});
 
+            const config_path = try std.fmt.allocPrint(alloc, "{s}.conf", .{socket});
+            defer alloc.free(config_path);
+            if (opts.config) |config| {
+                // Through the shell rather than a file API, the same way
+                // everything else here reaches the filesystem.
+                const out = try run(alloc, &.{
+                    "sh", "-c", "printf '%s\\n' \"$0\" > \"$1\"", config, config_path,
+                });
+                alloc.free(out);
+            }
+
             var argv: std.ArrayList([]const u8) = .empty;
             defer argv.deinit(alloc);
             try argv.appendSlice(alloc, &.{
-                "tmux", "-f", "/dev/null", "-S", socket,
+                "tmux", "-f",   if (opts.config != null) config_path else "/dev/null",
+                "-S",   socket,
             });
 
             // One invocation, so the option is set on the server that
@@ -276,6 +299,12 @@ const Session = struct {
             "tmux", "-f", "/dev/null", "-S", self.socket, "kill-server",
         })) |out| self.alloc.free(out) else |_| {}
 
+        // The config written by `StartOptions.config`, if there was one.
+        if (std.fmt.allocPrint(self.alloc, "{s}.conf", .{self.socket})) |path| {
+            defer self.alloc.free(path);
+            if (run(self.alloc, &.{ "rm", "-f", path })) |out| self.alloc.free(out) else |_| {}
+        } else |_| {}
+
         self.alloc.free(self.socket);
     }
 
@@ -349,18 +378,18 @@ const Session = struct {
     }
 
     fn notify(self: *Session, n: anytype) !void {
-        // `.enter` and `.exit` are the DCS handler telling us control mode
-        // began and ended, not tmux notifications; the real stream handler
-        // creates and destroys the viewer on them. Here the viewer outlives
-        // the session struct, so entering is a no-op and exiting is just
-        // recorded.
+        // `.enter` is the DCS handler telling us control mode began; the
+        // real stream handler creates the viewer on it. `.exit` is either
+        // tmux's `%exit` or the DCS ending, and the stream handler feeds
+        // it to the viewer before destroying it. Here the viewer outlives
+        // the session struct, so entering is a no-op and exiting is
+        // recorded and passed on.
         switch (n) {
             .pause => self.pauses += 1,
             .enter => return,
-            .exit => {
-                self.exited = true;
-                return;
-            },
+            // Still handed to the viewer, as the stream handler does, so
+            // that tmux's reason for exiting is reported.
+            .exit => self.exited = true,
             else => {},
         }
 
@@ -376,8 +405,22 @@ const Session = struct {
         for (actions) |action| switch (action) {
             .command => |c| try self.write(c),
             .exit => self.exited = true,
+            .notice => |n| {
+                const kind = &self.notices[@intCast(@intFromEnum(n.kind))];
+                kind.count += 1;
+                const len = @min(n.text.len, kind.last.len);
+                @memcpy(kind.last[0..len], n.text[0..len]);
+                kind.last_len = len;
+            },
             else => {},
         };
+    }
+
+    /// The last notice of a kind the viewer reported, or null if none.
+    fn lastNotice(self: *const Session, kind: Viewer.Notice.Kind) ?[]const u8 {
+        const k = &self.notices[@intCast(@intFromEnum(kind))];
+        if (k.count == 0) return null;
+        return k.last[0..k.last_len];
     }
 
     fn write(self: *Session, bytes: []const u8) !void {
@@ -1587,4 +1630,111 @@ test "live: a large styled history does not break the attach" {
     defer alloc.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "050000 coloured history") != null);
     try testing.expect(!session.exited);
+}
+
+test "live: tmux's messages for the user reach the viewer" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // A config with a mistake in it. tmux keeps the error for the first
+    // client to attach, and writes it into that client's attach reply.
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "cat",
+        .{ .config = "set -g status off\nthis-is-not-a-command" },
+    );
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    {
+        const err = session.lastNotice(.config_error) orelse
+            return error.NoConfigError;
+        try testing.expect(std.mem.indexOf(u8, err, "this-is-not-a-command") != null);
+    }
+
+    // `display-message` aimed at us, as a key binding or script in
+    // another client would do.
+    const client = try session.ask(&.{ "list-clients", "-F", "#{client_name}" });
+    defer alloc.free(client);
+    {
+        const out = try session.ask(&.{
+            "display-message",    "-c", std.mem.trim(u8, client, " \r\n"),
+            "hello from display",
+        });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.lastNotice(.message) != null;
+        }
+    }.pred);
+    try testing.expectEqualStrings("hello from display", session.lastNotice(.message).?);
+
+    // A command we send for the user that tmux refuses: a split of a
+    // pane far too small to split again and again.
+    for (0..40) |_| try session.input(.{ .split = .{ .pane_id = 0, .direction = .down } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.lastNotice(.command_error) != null and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        session.lastNotice(.command_error).?,
+        "no space",
+    ) != null or std.mem.indexOf(
+        u8,
+        session.lastNotice(.command_error).?,
+        "too small",
+    ) != null);
+
+    // Everything else tmux 3.6 tells a control client about, which must
+    // all be taken in stride.
+    const noise = [_][]const []const u8{
+        &.{ "set-buffer", "-b", "buf1", "data" },
+        &.{ "delete-buffer", "-b", "buf1" },
+        &.{ "copy-mode", "-t", "%0" },
+        &.{ "send-keys", "-t", "%0", "-X", "cancel" },
+        &.{ "rename-session", "renamed session" },
+        &.{ "new-session", "-d", "-s", "other", "cat" },
+        &.{ "new-window", "-d", "-t", "other:", "cat" },
+        &.{ "rename-window", "-t", "other:1", "otherwin" },
+        &.{ "kill-window", "-t", "other:1" },
+        &.{ "rename-window", "-t", "%0", "" },
+        &.{ "kill-session", "-t", "other" },
+    };
+    for (noise) |args| {
+        const out = try session.ask(args);
+        alloc.free(out);
+    }
+    {
+        const out = try session.ask(&.{
+            "refresh-client", "-t",                              std.mem.trim(u8, client, " \r\n"),
+            "-B",             "sub1:%0:#{pane_current_command}",
+        });
+        alloc.free(out);
+    }
+
+    // Still attached and still working. No newline: the splits above
+    // left pane 0 a row or two high, and a line fed to `cat` would
+    // scroll out of it again.
+    try session.input(.{ .write = .{ .pane_id = 0, .data = "survived" } });
+    try session.waitForPaneText(0, "survived");
+    try testing.expect(!session.exited);
+    try testing.expectEqual(.command_queue, session.viewer.state);
+
+    // The window renamed to nothing came through as nothing, rather than
+    // being dropped as malformed and keeping its old name. (Renaming
+    // turns automatic-rename off, so tmux leaves it empty.)
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len > 0 and
+                v.viewer.windows.items[0].name.len == 0;
+        }
+    }.pred);
 }

@@ -449,7 +449,11 @@ pub const Parser = struct {
                 .{ .@"continue" = .{ .pane_id = id } };
         } else if (std.mem.eql(u8, cmd, "%extended-output")) cmd: {
             var re = oni.Regex.init(
-                "^%extended-output %([0-9]+) ([0-9]+) : (.*)$",
+                // tmux(1) reserves room for arguments after the age
+                // ("pane-id age ... : value") and says to ignore them.
+                // They come before the first " : ", and the value is
+                // everything after it.
+                "^%extended-output %([0-9]+) ([0-9]+)(?: [^:]*)? : (.*)$",
                 .{ .capture_group = true },
                 oni.Encoding.utf8,
                 oni.Syntax.default,
@@ -609,7 +613,9 @@ pub const Parser = struct {
             return .{ .session_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
             var re = oni.Regex.init(
-                "^%window-renamed @([0-9]+) (.+)$",
+                // `(.*)`: renaming a window to nothing is legal, and
+                // tmux then sends the separator with no name after it.
+                "^%window-renamed @([0-9]+) (.*)$",
                 .{ .capture_group = true },
                 oni.Encoding.utf8,
                 oni.Syntax.default,
@@ -769,6 +775,66 @@ pub const Parser = struct {
             // Important: do not clear buffer here since client/name point to it
             self.state = .idle;
             return .{ .client_session_changed = .{ .client = client, .session_id = session_id, .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%message")) {
+            // The text of a `display-message` aimed at us. Free text,
+            // spaces and all, so it is simply the rest of the line.
+            //
+            // Important: do not clear the buffer, the text points into it.
+            self.state = .idle;
+            return .{ .message = restOfLine(line, cmd) };
+        } else if (std.mem.eql(u8, cmd, "%config-error")) {
+            // An error from loading tmux.conf, as free text.
+            //
+            // Important: do not clear the buffer, the text points into it.
+            self.state = .idle;
+            return .{ .config_error = restOfLine(line, cmd) };
+        } else if (std.mem.eql(u8, cmd, "%paste-buffer-changed") or
+            std.mem.eql(u8, cmd, "%paste-buffer-deleted"))
+        {
+            // A buffer name is free text too.
+            const name = restOfLine(line, cmd);
+
+            // Important: do not clear the buffer, the name points into it.
+            self.state = .idle;
+            return if (std.mem.eql(u8, cmd, "%paste-buffer-changed"))
+                .{ .paste_buffer_changed = .{ .name = name } }
+            else
+                .{ .paste_buffer_deleted = .{ .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%pane-mode-changed")) cmd: {
+            const rest = restOfLine(line, cmd);
+            if (rest.len < 2 or rest[0] != '%') {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
+                break :cmd;
+            }
+            const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
+                break :cmd;
+            };
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .pane_mode_changed = .{ .pane_id = id } };
+        } else if (std.mem.eql(u8, cmd, "%subscription-changed")) cmd: {
+            // `name $session @window index %pane ... : value`. The ids
+            // are `-` for a subscription that is not about a window or
+            // pane, and tmux(1) reserves room for more arguments before
+            // the colon, so only the name and the value are taken: the
+            // name is the first argument (subscription names cannot
+            // contain a space or a colon) and the value is everything
+            // after the first " : ".
+            const rest = restOfLine(line, cmd);
+            const sep = std.mem.indexOf(u8, rest, " : ") orelse {
+                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
+                break :cmd;
+            };
+            const name_end = std.mem.indexOfScalar(u8, rest, ' ') orelse unreachable;
+
+            // Important: do not clear the buffer, both point into it.
+            self.state = .idle;
+            return .{ .subscription_changed = .{
+                .name = rest[0..name_end],
+                .value = rest[sep + 3 ..],
+            } };
         } else {
             // Unknown notification, log it and return to idle state.
             log.warn("unknown tmux control mode notification={s}", .{cmd});
@@ -779,6 +845,12 @@ pub const Parser = struct {
         self.state = .idle;
 
         return null;
+    }
+
+    /// Everything after a notification's name and the space following
+    /// it, for notifications whose only argument is free text.
+    fn restOfLine(line: []const u8, cmd: []const u8) []const u8 {
+        return if (line.len > cmd.len + 1) line[cmd.len + 1 ..] else "";
     }
 
     // Mark the tmux state as broken.
@@ -871,10 +943,11 @@ pub const Notification = union(enum) {
 
     /// Control mode ended.
     ///
-    /// Carries tmux's reason when it gave one. Nothing acts on it, but it
-    /// is the only explanation we ever get for a session ending, and
-    /// "too far behind" reads very differently from a clean detach when
-    /// something has gone wrong. It points into the parser's buffer and
+    /// Carries tmux's reason when it gave one. It is the only explanation
+    /// we ever get for a session ending, and "too far behind" reads very
+    /// differently from a clean detach when something has gone wrong, so
+    /// the viewer passes it on to the user. It points into the parser's
+    /// buffer and
     /// so is bounded by `max_line_bytes` like every other line.
     exit: ?[]const u8,
 
@@ -987,6 +1060,43 @@ pub const Notification = union(enum) {
         client: []const u8,
         session_id: usize,
         name: []const u8,
+    },
+
+    /// A message for this client, from `display-message` run against it
+    /// without `-p`. tmux would show this on a normal client's status
+    /// line.
+    message: []const u8,
+
+    /// An error from loading the tmux configuration file. A normal client
+    /// would be shown these in a pane when it attaches.
+    ///
+    /// Note that tmux writes these as part of the reply to the command
+    /// that attached, so the first ones usually arrive *inside* the
+    /// initial `%begin` block rather than as a notification of their own;
+    /// see the viewer's startup handling. This variant is the ones that
+    /// do arrive on their own.
+    config_error: []const u8,
+
+    /// A paste buffer was created or changed.
+    paste_buffer_changed: struct {
+        name: []const u8,
+    },
+
+    /// A paste buffer was deleted.
+    paste_buffer_deleted: struct {
+        name: []const u8,
+    },
+
+    /// A pane entered or left a mode such as copy mode. Control clients
+    /// are not sent what a pane in a mode looks like, only this.
+    pane_mode_changed: struct {
+        pane_id: usize,
+    },
+
+    /// A subscription set with `refresh-client -B` changed value.
+    subscription_changed: struct {
+        name: []const u8,
+        value: []const u8,
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
@@ -1615,4 +1725,154 @@ test "tmux client-session-changed" {
     try testing.expectEqualStrings("/dev/pts/1", n.client_session_changed.client);
     try testing.expectEqual(2, n.client_session_changed.session_id);
     try testing.expectEqualStrings("mysession", n.client_session_changed.name);
+}
+
+/// Feed one complete line to a parser and return what it produced.
+fn testLine(c: *Parser, line: []const u8) !?Notification {
+    for (line) |byte| try std.testing.expect(try c.put(byte) == null);
+    return try c.put('\n');
+}
+
+test "tmux window-renamed to nothing" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    // Exactly what tmux 3.6 sends for `rename-window ''`: the separator
+    // and no name.
+    const n = (try testLine(&c, "%window-renamed @0 ")).?;
+    try testing.expect(n == .window_renamed);
+    try testing.expectEqual(0, n.window_renamed.id);
+    try testing.expectEqualStrings("", n.window_renamed.name);
+}
+
+test "tmux extended-output tolerates arguments it does not know" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    const n = (try testLine(&c, "%extended-output %3 12 future args : a : b")).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(3, n.output.pane_id);
+    try testing.expectEqual(12, n.output.age_ms.?);
+    try testing.expectEqualStrings("a : b", n.output.data);
+}
+
+test "tmux message" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    const n = (try testLine(&c, "%message hello from display")).?;
+    try testing.expect(n == .message);
+    try testing.expectEqualStrings("hello from display", n.message);
+}
+
+test "tmux config-error" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    const n = (try testLine(
+        &c,
+        "%config-error /home/me/.tmux.conf:2: unknown command: nope",
+    )).?;
+    try testing.expect(n == .config_error);
+    try testing.expectEqualStrings(
+        "/home/me/.tmux.conf:2: unknown command: nope",
+        n.config_error,
+    );
+}
+
+test "tmux paste buffer notifications" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    const changed = (try testLine(&c, "%paste-buffer-changed buffer0")).?;
+    try testing.expect(changed == .paste_buffer_changed);
+    try testing.expectEqualStrings("buffer0", changed.paste_buffer_changed.name);
+
+    const deleted = (try testLine(&c, "%paste-buffer-deleted my buf")).?;
+    try testing.expect(deleted == .paste_buffer_deleted);
+    try testing.expectEqualStrings("my buf", deleted.paste_buffer_deleted.name);
+}
+
+test "tmux pane-mode-changed" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    const n = (try testLine(&c, "%pane-mode-changed %7")).?;
+    try testing.expect(n == .pane_mode_changed);
+    try testing.expectEqual(7, n.pane_mode_changed.pane_id);
+
+    // Malformed is dropped, not fatal.
+    try testing.expect(try testLine(&c, "%pane-mode-changed @7") == null);
+    try testing.expect((try testLine(&c, "%sessions-changed")).? == .sessions_changed);
+}
+
+test "tmux subscription-changed" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    const pane = (try testLine(&c, "%subscription-changed sub1 $0 @0 0 %0 : cat : x")).?;
+    try testing.expect(pane == .subscription_changed);
+    try testing.expectEqualStrings("sub1", pane.subscription_changed.name);
+    try testing.expectEqualStrings("cat : x", pane.subscription_changed.value);
+
+    const session = (try testLine(&c, "%subscription-changed s2 $1 - - - : ")).?;
+    try testing.expectEqualStrings("s2", session.subscription_changed.name);
+    try testing.expectEqualStrings("", session.subscription_changed.value);
+}
+
+test "tmux every 3.6 notification parses without breaking the parser" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    // A transcript of the notifications tmux 3.6 can send, as captured
+    // from a real server. Every one must leave the parser able to read
+    // the next, and all but the deliberately ignored unlinked add and
+    // rename must produce a notification.
+    const lines = [_][]const u8{
+        "%client-detached /dev/ttys004",
+        "%client-session-changed /dev/ttys004 $1 other",
+        "%config-error /tmp/bad.conf:2: unknown command: nope",
+        "%continue %0",
+        "%extended-output %0 5 : x",
+        "%layout-change @0 b25d,80x24,0,0,0 b25d,80x24,0,0,0 *",
+        "%message hi",
+        "%output %0 x",
+        "%pane-mode-changed %0",
+        "%paste-buffer-changed buffer0",
+        "%paste-buffer-deleted buffer0",
+        "%pause %0",
+        "%session-changed $0 0",
+        "%session-renamed $0 renamed sess",
+        "%session-window-changed $0 @0",
+        "%sessions-changed",
+        "%subscription-changed sub1 $0 @0 0 %0 : cat",
+        "%unlinked-window-add @1",
+        "%unlinked-window-close @1",
+        "%unlinked-window-renamed @1",
+        "%window-add @1",
+        "%window-close @1",
+        "%window-pane-changed @0 %3",
+        "%window-renamed @0 ",
+    };
+    for (lines) |line| {
+        const n = try testLine(&c, line);
+        try testing.expect(c.state == .idle);
+
+        const ignored = std.mem.startsWith(u8, line, "%unlinked-window-add") or
+            std.mem.startsWith(u8, line, "%unlinked-window-renamed");
+        try testing.expect(ignored == (n == null));
+    }
+
+    // And a block still works after all of that.
+    try testing.expect(try testLine(&c, "%begin 1 1 1") == null);
+    const n = (try testLine(&c, "%end 1 1 1")).?;
+    try testing.expect(n == .block_end);
 }

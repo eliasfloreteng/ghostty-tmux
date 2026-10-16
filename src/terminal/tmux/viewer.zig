@@ -218,6 +218,11 @@ pub const Viewer = struct {
     /// errors on single-action returns, especially those such as `.exit`.
     action_single: [1]Action,
 
+    /// The pre-allocated actions for a session ending with a reason: the
+    /// notice carrying it, then the exit. Pre-allocated for the same
+    /// reason as `action_single`.
+    action_exit: [2]Action,
+
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
@@ -231,6 +236,10 @@ pub const Viewer = struct {
         /// it is; just send it to tmux as-is. This will include the
         /// trailing newline so you can send it directly.
         command: []const u8,
+
+        /// tmux has something to say that a person should see. See
+        /// `Notice`.
+        notice: Notice,
 
         /// Windows changed. This may add, remove or change windows. The
         /// caller is responsible for diffing the new window list against
@@ -257,6 +266,10 @@ pub const Viewer = struct {
                             // Window embeds ArenaAllocator.State; dumping
                             // `{any}` walks freed/poisoned arena nodes.
                             []const Window => try writer.print("[{d} windows]", .{value.len}),
+                            Notice => try writer.print(
+                                "{t} \"{s}\"",
+                                .{ value.kind, value.text },
+                            ),
                             else => try writer.print("{any}", .{value}),
                         }
                     }
@@ -265,6 +278,42 @@ pub const Viewer = struct {
                 try writer.writeAll(" }");
             }
         }
+    };
+
+    /// Text from tmux meant for the user rather than for us.
+    ///
+    /// A normal tmux client shows these on its status line or in a pane;
+    /// a control client is only told about them, so unless whatever is
+    /// driving the viewer shows them, they are lost. They are all free
+    /// text written by tmux (or by whoever ran `display-message`) and are
+    /// not localized or structured beyond `kind`.
+    pub const Notice = struct {
+        kind: Kind,
+
+        /// Not NUL terminated, and never empty. Like everything in an
+        /// action, valid only until the next call to `next`.
+        text: []const u8,
+
+        /// Sync with: ghostty_tmux_notice_kind_e
+        pub const Kind = enum(c_int) {
+            /// `display-message` run against this client, which tmux
+            /// would show on the status line. Informational.
+            message,
+
+            /// An error from loading the tmux configuration. tmux
+            /// reports these to the first client that attaches after the
+            /// server started.
+            config_error,
+
+            /// A command sent on the user's behalf failed, such as a
+            /// split tmux has no room for. The text is tmux's error.
+            command_error,
+
+            /// The session ended, and this is tmux's reason (for example
+            /// "detached", "server exited" or "too far behind"). Always
+            /// immediately followed by the `exit` action.
+            exit,
+        };
     };
 
     pub const Input = union(enum) {
@@ -594,6 +643,7 @@ pub const Viewer = struct {
             .last_selected_pane = null,
             .action_arena = .{},
             .action_single = undefined,
+            .action_exit = undefined,
         };
     }
 
@@ -1617,25 +1667,31 @@ pub const Viewer = struct {
             // I don't think this is technically possible (reading the
             // tmux source code), but if we see an exit we can semantically
             // handle this without issue.
-            .exit => |reason| {
-                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
-                return self.defunct();
-            },
+            .exit => |reason| return self.exited(reason),
 
             // Any begin and end (even error) is fine! Now we wait for
             // session-changed to get the initial session ID. session-changed
             // is guaranteed to come after the initial command output
             // since if the initial command is `attach` tmux will run that,
             // queue the notification, then do notificatins.
-            .block_end, .block_err => {
+            inline .block_end, .block_err => |content, tag| {
                 self.state = .startup_session;
-                return &.{};
+                return self.startupNotices(
+                    content,
+                    tag == .block_err,
+                ) catch |err| {
+                    log.warn("failed to report startup notices err={}", .{err});
+                    return &.{};
+                };
             },
 
             // I don't like catch-all else branches but startup is such
             // a special case of looking for very specific things that
             // are unlikely to expand.
-            else => return &.{},
+            else => return if (notificationNotice(n)) |notice|
+                self.singleAction(.{ .notice = notice })
+            else
+                &.{},
         }
     }
 
@@ -1648,10 +1704,7 @@ pub const Viewer = struct {
         switch (n) {
             .enter => unreachable,
 
-            .exit => |reason| {
-                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
-                return self.defunct();
-            },
+            .exit => |reason| return self.exited(reason),
 
             .session_changed => |info| {
                 self.session_id = info.id;
@@ -1669,7 +1722,10 @@ pub const Viewer = struct {
                 };
             },
 
-            else => return &.{},
+            else => return if (notificationNotice(n)) |notice|
+                self.singleAction(.{ .notice = notice })
+            else
+                &.{},
         }
     }
 
@@ -1681,10 +1737,7 @@ pub const Viewer = struct {
 
         switch (n) {
             .enter => unreachable,
-            .exit => |reason| {
-                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
-                return self.defunct();
-            },
+            .exit => |reason| return self.exited(reason),
             else => return &.{},
         }
     }
@@ -1716,10 +1769,7 @@ pub const Viewer = struct {
 
         switch (n) {
             .enter => unreachable,
-            .exit => |reason| {
-                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
-                return self.defunct();
-            },
+            .exit => |reason| return self.exited(reason),
 
             inline .block_end,
             .block_err,
@@ -1855,6 +1905,37 @@ pub const Viewer = struct {
             .client_detached,
             .client_session_changed,
             => {},
+
+            // For the user, not for us.
+            .message,
+            .config_error,
+            => if (notificationNotice(n)) |notice| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(
+                    arena.allocator(),
+                    .{ .notice = notice },
+                ) catch log.warn("failed to report a tmux notice", .{});
+            },
+
+            // tmux's paste buffers are not mirrored anywhere yet, so a
+            // change to one is nothing to us.
+            .paste_buffer_changed,
+            .paste_buffer_deleted,
+            => {},
+
+            // A pane entering or leaving copy mode (or any other mode).
+            // tmux does not send a control client what the mode looks
+            // like, only its output once it leaves, so there is nothing
+            // to show either way yet.
+            .pane_mode_changed => |info| log.debug(
+                "tmux pane id={} changed mode",
+                .{info.pane_id},
+            ),
+
+            // We never subscribe, but another client can do it for us
+            // with `refresh-client -t <us> -B`.
+            .subscription_changed => {},
         }
 
         // After processing commands, we add our next command to
@@ -2214,7 +2295,17 @@ pub const Viewer = struct {
 
         // Process our command
         switch (command) {
-            .user => {},
+            // A command run on the user's behalf failing is something
+            // they should hear about: they asked for a split and none
+            // appeared. Ours failing is a bug, and is handled (or not) by
+            // whatever parses the reply below.
+            .user => if (is_err) {
+                const text = std.mem.trim(u8, content, " \t\r\n");
+                if (text.len > 0) try actions.append(arena_alloc, .{ .notice = .{
+                    .kind = .command_error,
+                    .text = text,
+                } });
+            },
 
             // Nothing to read: the flag is set or it is not, and tmux
             // says so by erroring the block, which is handled above.
@@ -2686,6 +2777,85 @@ pub const Viewer = struct {
         // Make our single action slice.
         self.action_single[0] = action;
         return &self.action_single;
+    }
+
+    /// tmux ended control mode, with the reason it gave if it gave one.
+    fn exited(self: *Viewer, reason: ?[]const u8) []const Action {
+        const actions = self.defunct();
+        const text = std.mem.trim(u8, reason orelse return actions, " \t\r\n");
+        if (text.len == 0) return actions;
+
+        log.info("tmux control mode exited: {s}", .{text});
+        self.action_exit = .{
+            .{ .notice = .{ .kind = .exit, .text = text } },
+            .exit,
+        };
+        return &self.action_exit;
+    }
+
+    /// The notice a notification amounts to, if any. Shared by every
+    /// state, since tmux can say these at any time.
+    fn notificationNotice(n: control.Notification) ?Notice {
+        const kind: Notice.Kind, const raw = switch (n) {
+            .message => |text| .{ .message, text },
+            .config_error => |text| .{ .config_error, text },
+            else => return null,
+        };
+        const text = std.mem.trim(u8, raw, " \t\r\n");
+        if (text.len == 0) return null;
+        return .{ .kind = kind, .text = text };
+    }
+
+    /// The reply to the command that started control mode, typically
+    /// `attach`.
+    ///
+    /// tmux writes the configuration file's errors into this reply as
+    /// `%config-error` lines rather than as notifications of their own:
+    /// they are part of what attaching printed. Nothing else we parse
+    /// arrives this way, and this reply is otherwise empty for a
+    /// successful attach, so these lines are picked out here. Anything
+    /// else in an error reply is why the command failed.
+    fn startupNotices(
+        self: *Viewer,
+        content: []const u8,
+        is_err: bool,
+    ) Allocator.Error![]const Action {
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        _ = arena.reset(.free_all);
+        const alloc = arena.allocator();
+
+        var actions: std.ArrayList(Action) = .empty;
+        var it = std.mem.splitScalar(u8, content, '\n');
+        var error_start: ?usize = null;
+        var error_end: usize = 0;
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            const prefix = "%config-error ";
+            if (std.mem.startsWith(u8, line, prefix)) {
+                const text = std.mem.trim(u8, line[prefix.len..], " \t");
+                if (text.len > 0) try actions.append(alloc, .{ .notice = .{
+                    .kind = .config_error,
+                    .text = text,
+                } });
+                continue;
+            }
+
+            if (!is_err or line.len == 0) continue;
+
+            // The rest of an error reply is the error, which is free text
+            // and may run over several lines: keep it in one piece.
+            const start = @intFromPtr(line.ptr) - @intFromPtr(content.ptr);
+            if (error_start == null) error_start = start;
+            error_end = start + line.len;
+        }
+
+        if (error_start) |start| try actions.append(alloc, .{ .notice = .{
+            .kind = .command_error,
+            .text = content[start..error_end],
+        } });
+
+        return actions.items;
     }
 
     fn defunct(self: *Viewer) []const Action {
@@ -4073,7 +4243,7 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
                         );
                         command_index += 1;
                     },
-                    .windows => {},
+                    .windows, .notice => {},
                     .exit => {
                         return error.UnexpectedViewerExit;
                     },
@@ -6209,4 +6379,197 @@ test "list-windows windows action outlives the parse" {
             }).check,
         },
     });
+}
+
+/// The notices in a list of actions, in order.
+fn testNotices(
+    actions: []const Viewer.Action,
+    buf: []Viewer.Notice,
+) []const Viewer.Notice {
+    var n: usize = 0;
+    for (actions) |action| switch (action) {
+        .notice => |notice| {
+            buf[n] = notice;
+            n += 1;
+        },
+        else => {},
+    };
+    return buf[0..n];
+}
+
+test "config errors in the attach reply are reported" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    // tmux writes these into the reply to `attach` rather than sending
+    // them on their own, exactly like this.
+    const actions = viewer.next(.{ .tmux = .{ .block_end =
+        \\%config-error /home/me/.tmux.conf:2: unknown command: nope
+        \\%config-error /home/me/.tmux.conf:5: invalid option: bogus
+    } });
+
+    var buf: [4]Viewer.Notice = undefined;
+    const notices = testNotices(actions, &buf);
+    try testing.expectEqual(2, notices.len);
+    try testing.expectEqual(.config_error, notices[0].kind);
+    try testing.expectEqualStrings(
+        "/home/me/.tmux.conf:2: unknown command: nope",
+        notices[0].text,
+    );
+    try testing.expectEqualStrings(
+        "/home/me/.tmux.conf:5: invalid option: bogus",
+        notices[1].text,
+    );
+
+    // And startup carries on as if the reply had been empty.
+    try testViewer(&viewer, &.{.{
+        .input = .{ .tmux = .{ .session_changed = .{ .id = 1, .name = "s" } } },
+        .contains_command = "display-message",
+    }});
+}
+
+test "a failed attach says why" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    const actions = viewer.next(.{ .tmux = .{
+        .block_err = "can't find session: nope",
+    } });
+    var buf: [4]Viewer.Notice = undefined;
+    const notices = testNotices(actions, &buf);
+    try testing.expectEqual(1, notices.len);
+    try testing.expectEqual(.command_error, notices[0].kind);
+    try testing.expectEqualStrings("can't find session: nope", notices[0].text);
+}
+
+test "an empty attach reply has nothing to say" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    const actions = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    try testing.expectEqual(0, actions.len);
+}
+
+test "messages and config errors are reported in any state" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var buf: [4]Viewer.Notice = undefined;
+
+    // Before startup...
+    {
+        const notices = testNotices(
+            viewer.next(.{ .tmux = .{ .message = "early" } }),
+            &buf,
+        );
+        try testing.expectEqual(1, notices.len);
+        try testing.expectEqual(.message, notices[0].kind);
+        try testing.expectEqualStrings("early", notices[0].text);
+    }
+
+    // ...and once running.
+    try testViewer(&viewer, testSinglePaneSteps());
+    {
+        const notices = testNotices(
+            viewer.next(.{ .tmux = .{ .message = "hello from display" } }),
+            &buf,
+        );
+        try testing.expectEqual(1, notices.len);
+        try testing.expectEqual(.message, notices[0].kind);
+        try testing.expectEqualStrings("hello from display", notices[0].text);
+    }
+    {
+        const notices = testNotices(
+            viewer.next(.{ .tmux = .{ .config_error = "bad.conf:1: oops" } }),
+            &buf,
+        );
+        try testing.expectEqual(1, notices.len);
+        try testing.expectEqual(.config_error, notices[0].kind);
+    }
+
+    // An empty message is not worth interrupting anyone for.
+    try testing.expectEqual(
+        0,
+        testNotices(viewer.next(.{ .tmux = .{ .message = "" } }), &buf).len,
+    );
+}
+
+test "a failed user command is reported" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+
+    var buf: [4]Viewer.Notice = undefined;
+
+    // Drain pane_state.
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    try testing.expect(viewer.command_queue.empty());
+
+    try testViewer(&viewer, &.{.{
+        .input = .{ .split = .{ .pane_id = 0, .direction = .right } },
+        .contains_command = "split-window",
+    }});
+    const notices = testNotices(
+        viewer.next(.{ .tmux = .{ .block_err = "create pane failed: pane too small\n" } }),
+        &buf,
+    );
+    try testing.expectEqual(1, notices.len);
+    try testing.expectEqual(.command_error, notices[0].kind);
+    try testing.expectEqualStrings("create pane failed: pane too small", notices[0].text);
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "an exit with a reason reports the reason, then exits" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+
+    const actions = viewer.next(.{ .tmux = .{ .exit = "too far behind" } });
+    try testing.expectEqual(2, actions.len);
+    try testing.expectEqual(.exit, actions[0].notice.kind);
+    try testing.expectEqualStrings("too far behind", actions[0].notice.text);
+    try testing.expect(actions[1] == .exit);
+}
+
+test "an exit without a reason only exits" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+
+    const actions = viewer.next(.{ .tmux = .{ .exit = null } });
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .exit);
+}
+
+test "notifications we do not act on change nothing" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    // Drain pane_state.
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+
+    const ignored = [_]control.Notification{
+        .{ .paste_buffer_changed = .{ .name = "buffer0" } },
+        .{ .paste_buffer_deleted = .{ .name = "buffer0" } },
+        .{ .pane_mode_changed = .{ .pane_id = 0 } },
+        .{ .subscription_changed = .{ .name = "s", .value = "v" } },
+        .{ .sessions_changed = {} },
+        .{ .session_renamed = .{ .id = 1, .name = "renamed" } },
+        .{ .client_detached = .{ .client = "/dev/ttys001" } },
+        .{ .client_session_changed = .{
+            .client = "/dev/ttys001",
+            .session_id = 2,
+            .name = "other",
+        } },
+    };
+    for (ignored) |n| {
+        try testing.expectEqual(0, viewer.next(.{ .tmux = n }).len);
+        try testing.expectEqual(.command_queue, viewer.state);
+        try testing.expect(viewer.command_queue.empty());
+        try testing.expectEqual(1, viewer.panes.count());
+    }
 }

@@ -518,28 +518,30 @@ pub const StreamHandler = struct {
                         break :tmux;
                     },
 
-                    .exit => {
-                        // Free our viewer state if we have one
-                        if (self.tmux_viewer) |viewer| {
-                            viewer.deinit();
-                            self.alloc.destroy(viewer);
-                            self.tmux_viewer = null;
-                        }
-
-                        // And always break since we assert below
-                        // that we're not handling an exit command.
-                        break :tmux;
-                    },
-
+                    // `.exit` is either tmux's `%exit` or the DCS ending,
+                    // whichever comes first. The viewer is told before it
+                    // is freed, below, so that it can say why.
                     else => {},
                 }
 
                 assert(tmux != .enter);
-                assert(tmux != .exit);
+
+                // Free the viewer once it has had its say, whichever
+                // way we leave this block.
+                defer if (tmux == .exit) {
+                    if (self.tmux_viewer) |viewer| {
+                        viewer.deinit();
+                        self.alloc.destroy(viewer);
+                        self.tmux_viewer = null;
+                    }
+                };
 
                 const viewer = self.tmux_viewer orelse {
-                    // This can only really happen if we failed to
-                    // initialize the viewer on enter.
+                    // The DCS ending after `%exit` already freed it.
+                    if (tmux == .exit) break :tmux;
+
+                    // Otherwise this can only really happen if we failed
+                    // to initialize the viewer on enter.
                     log.info(
                         "received tmux control mode command without viewer: {f}",
                         .{tmux},
@@ -551,11 +553,29 @@ pub const StreamHandler = struct {
                 for (viewer.next(.{ .tmux = tmux })) |action| {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
-                        .exit => {
-                            // We ignore this because we will fully exit when
-                            // our DCS connection ends. We may want to handle
-                            // this in the future to notify our GUI we're
-                            // disconnected though.
+                        // The viewer has already closed every pane's sink
+                        // and is freed at the end of this block.
+                        .exit => {},
+
+                        // The surface is on another thread, so the text
+                        // is copied out of the viewer's buffers. Losing
+                        // one to an allocation failure loses a message,
+                        // which is not worth ending the session over.
+                        .notice => |notice| {
+                            const text = apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                notice.text,
+                            ) catch |err| {
+                                log.warn(
+                                    "failed to report tmux notice err={}",
+                                    .{err},
+                                );
+                                continue;
+                            };
+                            self.surfaceMessageWriter(.{ .tmux_notice = .{
+                                .kind = notice.kind,
+                                .text = text,
+                            } });
                         },
 
                         .command => |command| {
@@ -614,7 +634,9 @@ pub const StreamHandler = struct {
 
                 // A pane we could not attach last time because it was
                 // mid-sequence may be back in ground state now.
-                if (self.tmux_attach_retry) self.tmuxAttachPanes(viewer);
+                if (tmux != .exit and self.tmux_attach_retry) {
+                    self.tmuxAttachPanes(viewer);
+                }
             },
 
             .xtgettcap => |*gettcap| {
