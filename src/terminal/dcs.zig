@@ -63,7 +63,11 @@ pub const Handler = struct {
                     break :tmux .{
                         .state = .{
                             .tmux = .{
-                                .max_bytes = self.max_bytes,
+                                // Per line rather than per DCS: control
+                                // mode is one DCS for the whole session,
+                                // so the parser bounds each line and
+                                // manages block payloads itself.
+                                .max_line_bytes = self.max_bytes,
                                 .buffer = try .initCapacity(
                                     alloc,
                                     128, // Arbitrary choice to limit initial reallocs

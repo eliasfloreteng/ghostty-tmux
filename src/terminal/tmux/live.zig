@@ -116,13 +116,27 @@ const Session = struct {
         return startWith(alloc, io, cols, rows, command, .{});
     }
 
+    const StartOptions = struct {
+        viewer: Viewer.Options = .{},
+
+        /// The server's `history-limit`, if not tmux's default. It only
+        /// applies to panes created after it is set, so it has to be set
+        /// before the session exists rather than by `ask` afterwards.
+        history_limit: ?u32 = null,
+
+        /// Wait until the pane holds at least this many lines of history
+        /// before attaching, so a test about the attach capture is not
+        /// racing the command that fills it.
+        min_history: usize = 0,
+    };
+
     fn startWith(
         alloc: Allocator,
         io: std.Io,
         cols: u16,
         rows: u16,
         command: []const u8,
-        opts: Viewer.Options,
+        opts: StartOptions,
     ) !Session {
         const socket = socket: {
             const dir = try osfile.allocTmpDir(alloc, global.environ());
@@ -147,14 +161,56 @@ const Session = struct {
         {
             var x_buf: [8]u8 = undefined;
             var y_buf: [8]u8 = undefined;
+            var h_buf: [16]u8 = undefined;
             const x = try std.fmt.bufPrint(&x_buf, "{d}", .{cols});
             const y = try std.fmt.bufPrint(&y_buf, "{d}", .{rows});
-            const out = try run(alloc, &.{
-                "tmux",        "-f",    "/dev/null", "-S", socket,
-                "new-session", "-d",    "-x",        x,    "-y",
-                y,             command,
+
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(alloc);
+            try argv.appendSlice(alloc, &.{
+                "tmux", "-f", "/dev/null", "-S", socket,
             });
+
+            // One invocation, so the option is set on the server that
+            // then creates the session rather than on one that exits in
+            // between for want of sessions.
+            if (opts.history_limit) |limit| {
+                const h = try std.fmt.bufPrint(&h_buf, "{d}", .{limit});
+                try argv.appendSlice(alloc, &.{
+                    "start-server",  ";",
+                    "set",           "-g",
+                    "history-limit", h,
+                    ";",
+                });
+            }
+
+            try argv.appendSlice(alloc, &.{
+                "new-session", "-d", "-x", x, "-y", y, command,
+            });
+            const out = try run(alloc, argv.items);
             alloc.free(out);
+        }
+
+        if (opts.min_history > 0) {
+            var rounds: usize = 0;
+            while (true) : (rounds += 1) {
+                if (rounds >= timeout_ms / poll_ms) {
+                    return error.TimedOutWaitingForTmux;
+                }
+
+                const out = try run(alloc, &.{
+                    "tmux",            "-f", "/dev/null",       "-S", socket,
+                    "display-message", "-p", "#{history_size}",
+                });
+                defer alloc.free(out);
+                const lines = std.fmt.parseInt(
+                    usize,
+                    std.mem.trim(u8, out, " \r\n"),
+                    10,
+                ) catch 0;
+                if (lines >= opts.min_history) break;
+                try std.Io.sleep(io, .fromMilliseconds(poll_ms), .awake);
+            }
         }
 
         // The status line steals a row from the client size and is one
@@ -186,7 +242,7 @@ const Session = struct {
             reap(pid);
         }
 
-        var viewer = try Viewer.init(io, alloc, opts);
+        var viewer = try Viewer.init(io, alloc, opts.viewer);
         errdefer viewer.deinit();
 
         return .{
@@ -1387,7 +1443,7 @@ test "live: tmux accepts the pause-after flag we send it" {
         80,
         24,
         "sleep 60",
-        .{ .pause_after = 30 },
+        .{ .viewer = .{ .pause_after = 30 } },
     );
     defer session.deinit();
 
@@ -1492,5 +1548,43 @@ test "live: a downward split stacks the panes" {
 
     const layout = session.viewer.windows.items[0].layout;
     try testing.expect(layout.content == .vertical);
+    try testing.expect(!session.exited);
+}
+
+test "live: a large styled history does not break the attach" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // Fifty thousand coloured lines, which the attach captures with
+    // `capture-pane -e -C -S -` as a single `%begin`/`%end` block of
+    // several megabytes. A block cap sized for one line breaks the
+    // parser part way through that reply, and from then on nothing from
+    // tmux is ever read again: the session is frozen, not exited.
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "seq 50000 | awk '{ printf \"\\033[3%dm%06d coloured history\\033[0m\\n\", $1 % 8, $1 }'; exec cat",
+        .{ .history_limit = 60000, .min_history = 49_000 },
+    );
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try testing.expect(!session.exited);
+
+    // Still talking to tmux, not merely un-exited.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "survived\r",
+    } });
+    try session.waitForPaneText(0, "survived");
+
+    // And the captures that follow the big one were paired with the
+    // right commands: the visible area is the visible area.
+    const text = try session.paneText(0);
+    defer alloc.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "050000 coloured history") != null);
     try testing.expect(!session.exited);
 }

@@ -23,11 +23,37 @@ pub const Parser = struct {
     /// The buffer used to store in-progress notifications, output, etc.
     buffer: std.Io.Writer.Allocating,
 
-    /// The maximum size in bytes of the buffer. This is used to limit
-    /// memory usage. If the buffer exceeds this size, the client will
-    /// enter a broken state (the control mode session will be forcibly
+    /// The maximum size in bytes of a single line: a notification, or one
+    /// line of a `%begin` block. A line longer than this puts the parser
+    /// into the broken state (the control mode session will be forcibly
     /// exited and future data dropped).
-    max_bytes: usize = 1024 * 1024,
+    ///
+    /// This is the limit that matters against hostile input. Anything
+    /// can print `ESC P 1000 p` and start "control mode", and a line
+    /// that never ends would otherwise grow the buffer until we run out
+    /// of memory. Nothing tmux sends legitimately comes close: `%output`
+    /// is chunked by the pty reads it came from, and the longest block
+    /// lines are captured rows, tens of bytes per cell at the very worst.
+    max_line_bytes: usize = 1024 * 1024,
+
+    /// The maximum size in bytes of a `%begin` block's payload.
+    ///
+    /// Unlike a line, a block can legitimately be very large: the
+    /// attach captures a pane's whole history with `capture-pane -e -S
+    /// -`, and a large `history-limit` full of styled output is many
+    /// megabytes. So exceeding this does not break the session. The
+    /// oldest lines of the payload are dropped instead, keeping the
+    /// newest (which, for a history capture, are the ones closest to
+    /// the screen), and the block still ends normally so the reply stays
+    /// paired with the command that asked for it. See `trimBlock`.
+    max_block_bytes: usize = 64 * 1024 * 1024,
+
+    /// Where the line currently being accumulated starts in the buffer.
+    /// Only meaningful in the `.notification` and `.block` states.
+    line_start: usize = 0,
+
+    /// Whether the current block has had lines dropped by `trimBlock`.
+    block_trimmed: bool = false,
 
     const State = enum {
         /// Outside of any active notifications. This should drop any output
@@ -84,9 +110,11 @@ pub const Parser = struct {
             // small provocation, so drop the line instead.
             .idle => if (byte == '%') {
                 self.buffer.clearRetainingCapacity();
+                self.line_start = 0;
                 self.state = .notification;
             } else if (byte != '\n') {
                 self.buffer.clearRetainingCapacity();
+                self.line_start = 0;
                 self.state = .skip_line;
             },
 
@@ -116,11 +144,7 @@ pub const Parser = struct {
             // and then we check to see if that line ended the block.
             .block => if (byte == '\n') {
                 const written = self.buffer.written();
-                const idx = if (std.mem.lastIndexOfScalar(
-                    u8,
-                    written,
-                    '\n',
-                )) |v| v + 1 else 0;
+                const idx = self.line_start;
                 const line = written[idx..];
 
                 if (parseBlockTerminator(line)) |terminator| {
@@ -128,6 +152,11 @@ pub const Parser = struct {
                         u8,
                         written[0..idx],
                         "\r\n",
+                    );
+
+                    if (self.block_trimmed) log.warn(
+                        "tmux control mode block exceeded {} bytes, kept the newest {} bytes",
+                        .{ self.max_block_bytes, output.len },
                     );
 
                     // Important: do not clear buffer since the notification
@@ -142,13 +171,20 @@ pub const Parser = struct {
                     }
                 }
 
-                // Didn't end the block, continue accumulating.
+                // Didn't end the block, continue accumulating. The newline
+                // is stored below, so the next line starts after it.
+                if (written.len + 1 > self.max_block_bytes) self.trimBlock();
+                self.line_start = self.buffer.written().len + 1;
             },
         }
 
-        // Only enforce the limit on bytes we actually store, so a line
-        // filling the buffer exactly can still be terminated.
-        if (self.buffer.written().len >= self.max_bytes) {
+        // Only enforce the limit on the bytes of a line, not on the
+        // newline ending it, so a line filling the limit exactly can still
+        // be terminated. A newline stored in a block is already counted
+        // as the start of the next line (`line_start` is past it).
+        if (byte != '\n' and
+            self.buffer.written().len - self.line_start >= self.max_line_bytes)
+        {
             self.broken();
             return error.OutOfMemory;
         }
@@ -158,6 +194,43 @@ pub const Parser = struct {
         };
 
         return null;
+    }
+
+    /// Drop the oldest whole lines of the block being accumulated so that
+    /// it fits in `max_block_bytes` with room to spare.
+    ///
+    /// Called just before the newline ending a block line is stored, so
+    /// the buffer is whole lines (the last one less that newline) and the
+    /// cut can land on a line boundary. `line_start` is still the start of
+    /// that last line; the caller moves it on afterwards.
+    ///
+    /// Trims to half the cap rather than to just under it. Each trim moves
+    /// what it keeps to the front of the buffer, and trimming a line at a
+    /// time would move the whole block again for every line that arrives;
+    /// trimming by half means each byte is moved a bounded number of times.
+    fn trimBlock(self: *Parser) void {
+        assert(self.state == .block);
+
+        const written = self.buffer.written();
+        const keep = self.max_block_bytes / 2;
+        if (written.len <= keep) return;
+
+        // The first line boundary leaving at most `keep` bytes behind it.
+        // There may be none if the line just completed is longer than
+        // that on its own, in which case keep exactly that line: it is
+        // bounded by `max_line_bytes`, not by us.
+        const cut: usize = if (std.mem.indexOfScalarPos(
+            u8,
+            written,
+            written.len - keep,
+            '\n',
+        )) |nl| nl + 1 else self.line_start;
+        if (cut == 0) return;
+
+        const kept = written.len - cut;
+        @memmove(written[0..kept], written[cut..]);
+        self.buffer.shrinkRetainingCapacity(kept);
+        self.block_trimmed = true;
     }
 
     const ParseError = error{RegexError};
@@ -223,6 +296,8 @@ pub const Parser = struct {
             // and want to accumulate the data.
             self.state = .block;
             self.buffer.clearRetainingCapacity();
+            self.line_start = 0;
+            self.block_trimmed = false;
             return null;
         } else if (std.mem.eql(u8, cmd, "%output")) cmd: {
             var re = oni.Regex.init(
@@ -800,7 +875,7 @@ pub const Notification = union(enum) {
     /// is the only explanation we ever get for a session ending, and
     /// "too far behind" reads very differently from a clean detach when
     /// something has gone wrong. It points into the parser's buffer and
-    /// so is bounded by `max_bytes` like every other line.
+    /// so is bounded by `max_line_bytes` like every other line.
     exit: ?[]const u8,
 
     /// Dispatched at the end of a begin/end block with the raw data.
@@ -965,12 +1040,12 @@ test "tmux begin/error empty" {
     try testing.expectEqualStrings("", n.block_err);
 }
 
-test "tmux notification exactly max_bytes" {
+test "tmux notification exactly max_line_bytes" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
     const line = "%sessions-changed";
-    var c: Parser = .{ .buffer = .init(alloc), .max_bytes = line.len };
+    var c: Parser = .{ .buffer = .init(alloc), .max_line_bytes = line.len };
     defer c.deinit();
 
     // Twice, because the second '%' arrives while the buffer is still
@@ -982,30 +1057,102 @@ test "tmux notification exactly max_bytes" {
     }
 }
 
-test "tmux block terminator exactly max_bytes" {
+test "tmux line limit applies per line of a block" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    const block = "hello\n%end 1578922740 269 1";
-    var c: Parser = .{ .buffer = .init(alloc), .max_bytes = block.len };
+    // Every line fits, the block as a whole does not.
+    const begin = "%begin 1 1 1";
+    var c: Parser = .{ .buffer = .init(alloc), .max_line_bytes = begin.len };
     defer c.deinit();
-    for ("%begin 1578922740 269 1\n") |byte| try testing.expect(try c.put(byte) == null);
-    for (block) |byte| try testing.expect(try c.put(byte) == null);
+    for (begin ++ "\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("hello\nworld\nagain\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("hello", n.block_end);
+    try testing.expectEqualStrings("hello\nworld\nagain", n.block_end);
 }
 
-test "tmux exceeding max_bytes" {
+test "tmux block line exceeding max_line_bytes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc), .max_line_bytes = 16 };
+    defer c.deinit();
+    for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("short\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("0123456789abcdef") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expectError(error.OutOfMemory, c.put('g'));
+    try testing.expect(try c.put('\n') == null);
+}
+
+test "tmux exceeding max_line_bytes" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
     const line = "%sessions-changed";
-    var c: Parser = .{ .buffer = .init(alloc), .max_bytes = line.len - 1 };
+    var c: Parser = .{ .buffer = .init(alloc), .max_line_bytes = line.len - 1 };
     defer c.deinit();
     for (line[0 .. line.len - 1]) |byte| try testing.expect(try c.put(byte) == null);
     try testing.expectError(error.OutOfMemory, c.put(line[line.len - 1]));
     try testing.expect(try c.put('\n') == null);
+}
+
+test "tmux block over max_block_bytes keeps its newest lines" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc), .max_block_bytes = 64 };
+    defer c.deinit();
+    for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
+
+    // 100 lines of 7 bytes each, far more than the cap.
+    var buf: [16]u8 = undefined;
+    for (0..100) |i| {
+        const line = try std.fmt.bufPrint(&buf, "line{d:0>2}\n", .{i});
+        for (line) |byte| try testing.expect(try c.put(byte) == null);
+    }
+
+    for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+
+    // Not broken: the block ends and is still paired with its command.
+    try testing.expect(n == .block_end);
+    const out = n.block_end;
+    try testing.expect(out.len <= 64);
+    try testing.expect(out.len > 0);
+
+    // Whole lines, newest last, with nothing missing in between.
+    try testing.expect(std.mem.endsWith(u8, out, "line99"));
+    try testing.expect(std.mem.startsWith(u8, out, "line"));
+    var it = std.mem.splitScalar(u8, out, '\n');
+    var prev: ?usize = null;
+    while (it.next()) |line| {
+        try testing.expectEqual(6, line.len);
+        const num = try std.fmt.parseInt(usize, line[4..], 10);
+        if (prev) |p_| try testing.expectEqual(p_ + 1, num);
+        prev = num;
+    }
+
+    // And the parser is fine afterwards.
+    for ("%sessions-changed") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect((try c.put('\n')).? == .sessions_changed);
+}
+
+test "tmux block over max_block_bytes with one long line" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A single line longer than half the block cap is kept whole; only
+    // the line limit can bound a line.
+    var c: Parser = .{ .buffer = .init(alloc), .max_block_bytes = 16 };
+    defer c.deinit();
+    for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("old\n" ++ "x" ** 20 ++ "\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings("x" ** 20, n.block_end);
 }
 
 test "tmux begin/end data" {
