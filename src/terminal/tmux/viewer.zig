@@ -1617,24 +1617,65 @@ pub const Viewer = struct {
         };
     }
 
+    /// The most input bytes one `send-keys` carries.
+    ///
+    /// tmux parses a command line with a yacc parser whose stack grows
+    /// with every argument, and `send-keys -H` takes one argument per
+    /// byte. tmux 3.6 fails a command of about ten thousand arguments
+    /// with "parse error: yacc stack overflow" and sends none of it, so a
+    /// large paste has to be split. This leaves a wide margin under that
+    /// while keeping the number of commands for a big paste small.
+    pub const max_send_keys_bytes = 2048;
+
     fn queueWrite(
         self: *Viewer,
         w: Input.Write,
     ) Allocator.Error![]const Action {
-        // `send-keys -H` takes each key as a hexadecimal number, so we can
-        // pass arbitrary encoded input through byte-for-byte without tmux
-        // attempting to interpret any of it as a key name.
-        var hex: std.Io.Writer.Allocating = .init(self.alloc);
-        defer hex.deinit();
-        for (w.data) |byte| hex.writer.print(
-            " {x:0>2}",
-            .{byte},
-        ) catch return error.OutOfMemory;
+        // One command per chunk, queued together so that nothing can be
+        // queued in between: tmux runs commands in the order it reads
+        // them, so the pane receives the chunks in order and whole. A
+        // bracketed paste's markers are bytes like any other, so a paste
+        // split across commands is still one paste to the program.
+        const count = std.math.divCeil(
+            usize,
+            w.data.len,
+            max_send_keys_bytes,
+        ) catch unreachable;
+        const commands = try self.alloc.alloc(Command, count);
+        defer self.alloc.free(commands);
 
-        return self.queueUserCommand("send-keys -H -t %{d}{s}\n", .{
-            w.pane_id,
-            hex.writer.buffered(),
-        });
+        {
+            var built: usize = 0;
+            errdefer for (commands[0..built]) |c| c.deinit(self.alloc);
+            var rest = w.data;
+            while (rest.len > 0) : (built += 1) {
+                const chunk = rest[0..@min(rest.len, max_send_keys_bytes)];
+                rest = rest[chunk.len..];
+                commands[built] = try self.sendKeysCommand(w.pane_id, chunk);
+            }
+            assert(built == count);
+        }
+
+        // Owns the commands from here, whether it succeeds or not.
+        return self.queueUserCommands(commands);
+    }
+
+    /// `send-keys -H` takes each key as a hexadecimal number, so we can
+    /// pass arbitrary encoded input through byte-for-byte without tmux
+    /// attempting to interpret any of it as a key name.
+    fn sendKeysCommand(
+        self: *Viewer,
+        pane_id: usize,
+        data: []const u8,
+    ) Allocator.Error!Command {
+        var builder: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer builder.deinit();
+        builder.writer.print("send-keys -H -t %{d}", .{pane_id}) catch
+            return error.OutOfMemory;
+        for (data) |byte| builder.writer.print(" {x:0>2}", .{byte}) catch
+            return error.OutOfMemory;
+        builder.writer.writeByte('\n') catch return error.OutOfMemory;
+        return .{ .user = try builder.toOwnedSlice() };
     }
 
     fn nextTmux(
@@ -6572,4 +6613,60 @@ test "notifications we do not act on change nothing" {
         try testing.expect(viewer.command_queue.empty());
         try testing.expectEqual(1, viewer.panes.count());
     }
+}
+
+test "a large write is split into bounded send-keys, in order" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    try testing.expect(viewer.command_queue.empty());
+
+    // Two full chunks and one byte over, each chunk a different byte so
+    // the order is visible.
+    const max = Viewer.max_send_keys_bytes;
+    var data: [2 * max + 1]u8 = undefined;
+    @memset(data[0..max], 'a');
+    @memset(data[max .. 2 * max], 'b');
+    data[2 * max] = 'c';
+
+    var sent: std.ArrayList(u8) = .empty;
+    defer sent.deinit(testing.allocator);
+
+    var actions = viewer.next(.{ .write = .{ .pane_id = 0, .data = &data } });
+    var commands: usize = 0;
+    while (true) {
+        var found = false;
+        for (actions) |action| switch (action) {
+            .command => |command| {
+                found = true;
+                commands += 1;
+                const prefix = "send-keys -H -t %0";
+                try testing.expect(std.mem.startsWith(u8, command, prefix));
+                var it = std.mem.tokenizeScalar(
+                    u8,
+                    command[prefix.len .. command.len - 1],
+                    ' ',
+                );
+                var keys: usize = 0;
+                while (it.next()) |hex| : (keys += 1) {
+                    try sent.append(
+                        testing.allocator,
+                        try std.fmt.parseInt(u8, hex, 16),
+                    );
+                }
+                try testing.expect(keys <= max);
+            },
+            else => {},
+        };
+        if (!found) break;
+
+        // tmux answers each in turn, which sends the next.
+        actions = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    }
+
+    try testing.expectEqual(3, commands);
+    try testing.expectEqualSlices(u8, &data, sent.items);
+    try testing.expect(viewer.command_queue.empty());
 }

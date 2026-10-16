@@ -1768,3 +1768,64 @@ test "live: tmux answers its panes' queries itself" {
     // `StreamHandler.answer_queries`.
     try testing.expect(!session.exited);
 }
+
+test "live: a large paste arrives whole and in order" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sh");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // Non-canonical, so the tty's line length limit does not apply, and
+    // no echo, so 200KB of it is not painted back at us. `cksum` reads
+    // exactly the paste and says what it got.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "stty -icanon -echo; head -c 204800 | cksum\r",
+    } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // Bracketed, as a paste from the GUI would be, though `cksum` sees
+    // the markers as data like everything else. Lines of a pattern that
+    // shows reordering: each one numbered.
+    var paste: std.ArrayList(u8) = .empty;
+    defer paste.deinit(alloc);
+    try paste.appendSlice(alloc, "\x1b[200~");
+    var i: usize = 0;
+    while (paste.items.len < 204800 - "\x1b[201~".len) : (i += 1) {
+        try paste.print(alloc, "line {d:0>8} of the paste\n", .{i});
+    }
+    paste.shrinkRetainingCapacity(204800 - "\x1b[201~".len);
+    try paste.appendSlice(alloc, "\x1b[201~");
+    try testing.expectEqual(204800, paste.items.len);
+
+    // What cksum should print for it, worked out by cksum itself.
+    const expected = expected: {
+        const out = try run(alloc, &.{
+            "sh", "-c", "printf '%s' \"$0\" | cksum", paste.items,
+        });
+        defer alloc.free(out);
+        break :expected try alloc.dupe(u8, std.mem.trim(u8, out, " \r\n"));
+    };
+    defer alloc.free(expected);
+
+    try session.input(.{ .write = .{ .pane_id = 0, .data = paste.items } });
+
+    // Give it the time a paste this size takes rather than the usual
+    // wait: every byte is three on the wire.
+    var rounds: usize = 0;
+    while (rounds < 3 * timeout_ms / poll_ms) : (rounds += 1) {
+        _ = try session.pump();
+        const text = try session.paneText(0);
+        defer alloc.free(text);
+        if (std.mem.indexOf(u8, text, expected) != null) break;
+    } else return error.TimedOutWaitingForTmux;
+
+    try testing.expect(!session.exited);
+    try testing.expectEqual(.command_queue, session.viewer.state);
+}
