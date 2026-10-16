@@ -1881,3 +1881,82 @@ test "live: switching session mid-attach pairs every reply correctly" {
     try session.input(.{ .write = .{ .pane_id = pane_id, .data = "switched\r" } });
     try session.waitForPaneText(pane_id, "switched");
 }
+
+test "live: the GUI is told which pane and window tmux is on" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // A second window that becomes the current one, split so that its
+    // active pane is not the first one listed.
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+    try session.waitFor(attached);
+    {
+        const out = try session.ask(&.{ "new-window", "sleep 60" });
+        alloc.free(out);
+    }
+    {
+        const out = try session.ask(&.{ "split-window", "sleep 60" });
+        alloc.free(out);
+    }
+    {
+        const out = try session.ask(&.{ "select-pane", "-t", ":.0" });
+        alloc.free(out);
+    }
+    {
+        const out = try session.ask(&.{ "split-window", "-h", "sleep 60" });
+        alloc.free(out);
+    }
+
+    // What tmux itself says, as the expectation.
+    const want = try session.ask(&.{ "display-message", "-p", "#{window_id} #{pane_id}" });
+    defer alloc.free(want);
+
+    // The window list, re-read for the new window exactly as it is read
+    // on attach, has to say where tmux is: not the first window, and not
+    // the first pane listed in it.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.panes.count() == 4 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const active: *const Viewer.Window = for (session.viewer.windows.items) |*w| {
+        if (w.active) break w;
+    } else return error.NoActiveWindow;
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings(
+        std.mem.trim(u8, want, " \r\n"),
+        try std.fmt.bufPrint(&buf, "@{d} %{d}", .{ active.id, active.active_pane_id.? }),
+    );
+
+    // And when tmux moves it, from another client here, the viewer
+    // follows.
+    const before = active.active_pane_id.?;
+    {
+        const out = try session.ask(&.{ "select-pane", "-t", ":.+" });
+        alloc.free(out);
+    }
+    const now = try session.ask(&.{ "display-message", "-p", "#{pane_id}" });
+    defer alloc.free(now);
+    const now_id = try std.fmt.parseInt(usize, std.mem.trim(u8, now, "% \r\n"), 10);
+    try testing.expect(now_id != before);
+
+    const Ctx = struct {
+        var want_window: usize = 0;
+        var want_pane: usize = 0;
+        fn pred(v: *Session) bool {
+            for (v.viewer.windows.items) |w| {
+                if (w.id == want_window) return w.active_pane_id == want_pane;
+            }
+            return false;
+        }
+    };
+    Ctx.want_window = active.id;
+    Ctx.want_pane = now_id;
+    try session.waitFor(Ctx.pred);
+    try testing.expect(!session.exited);
+}

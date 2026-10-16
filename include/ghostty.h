@@ -996,6 +996,12 @@ typedef struct {
   // kept alive.
   bool zoomed;
   size_t zoomed_pane_id;
+  // tmux's active pane in this window, if `has_active_pane`. A GUI should
+  // keep the window's focus on it, start there on the first snapshot, and
+  // move focus when it changes between snapshots (tmux moved it, from any
+  // client). Focusing it again is harmless: the core does not echo it back.
+  bool has_active_pane;
+  size_t active_pane_id;
   const ghostty_tmux_node_s* nodes;
   size_t nodes_len;
 } ghostty_tmux_window_s;

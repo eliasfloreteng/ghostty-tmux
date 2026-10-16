@@ -56,6 +56,17 @@ pub const WindowSet = struct {
         zoomed: bool,
         zoomed_pane_id: usize,
 
+        /// The window's active pane, and whether it is known. Two fields
+        /// for the same reason as `zoomed`.
+        ///
+        /// A GUI should keep this window's focus on this pane, and move
+        /// it when this changes between snapshots: tmux moved it, from
+        /// this client or any other. On the first snapshot it is where
+        /// the focus should start. Together with `active` it says where
+        /// the user would be if this were a normal tmux client.
+        has_active_pane: bool,
+        active_pane_id: usize,
+
         /// The layout tree, flattened. Index 0 is the root. This is never
         /// empty: a window always has at least one pane.
         nodes: [*]const Node,
@@ -161,6 +172,8 @@ pub const WindowSet = struct {
                 .height = src.height,
                 .zoomed = src.zoomed_pane_id != null,
                 .zoomed_pane_id = src.zoomed_pane_id orelse 0,
+                .has_active_pane = src.active_pane_id != null,
+                .active_pane_id = src.active_pane_id orelse 0,
                 .nodes = owned.ptr,
                 .nodes_len = owned.len,
             };
@@ -369,4 +382,22 @@ test "empty window list" {
     const set = try WindowSet.create(testing.allocator, &.{});
     defer set.destroy();
     try testing.expectEqual(0, set.windows.len);
+}
+
+test "active pane crosses as a flag and an id" {
+    const alloc = testing.allocator;
+
+    var known = try testWindow(alloc, 0, 83, 44, "83x44,0,0[83x22,0,0,0,83x21,0,23,2]");
+    defer known.deinit(alloc);
+    known.active_pane_id = 2;
+
+    var unknown = try testWindow(alloc, 1, 83, 44, "83x44,0,0,3");
+    defer unknown.deinit(alloc);
+
+    const set = try WindowSet.create(alloc, &.{ known, unknown });
+    defer set.destroy();
+
+    try testing.expect(set.windows[0].has_active_pane);
+    try testing.expectEqual(2, set.windows[0].active_pane_id);
+    try testing.expect(!set.windows[1].has_active_pane);
 }
