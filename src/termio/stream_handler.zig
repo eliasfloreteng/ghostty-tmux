@@ -63,6 +63,25 @@ pub const StreamHandler = struct {
     /// and XTCHECKSUM may change how it's calculated.
     xt_checksum_report: bool,
 
+    /// Whether this terminal answers the program writing to it: replies
+    /// to queries (DA, DSR, XTVERSION, color and clipboard reads, ...)
+    /// and the reports it sends unasked (size, color scheme, focus).
+    ///
+    /// Off for a terminal displaying a tmux control mode pane. The program
+    /// in that pane is not talking to us: it is talking to the terminal
+    /// tmux emulates for it, and tmux answers it. What reaches us is a
+    /// copy of the program's output, queries included, so a reply from
+    /// here would be a second one, delivered with `send-keys` -- where it
+    /// arrives as typed input, late, after the program has already read
+    /// tmux's answer. Queries tmux does not answer (a kitty keyboard
+    /// query, OSC 4 or OSC 52 reads) get no answer from any tmux client,
+    /// and answering them here would describe our terminal state rather
+    /// than the pane's, which is tmux's.
+    ///
+    /// Everything that is not a reply is unaffected: the display, titles,
+    /// bells, clipboard writes and so on.
+    answer_queries: bool = true,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -215,8 +234,48 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (!self.answer_queries and isReply(msg)) {
+            msg.deinit();
+            return;
+        }
+
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
+    }
+
+    /// Whether a message from us to termio ends up written back to the
+    /// program, as opposed to changing local state. Everything the stream
+    /// handler writes is in response to the program's output, so every
+    /// write is a reply. See `answer_queries`.
+    fn isReply(msg: termio.Message) bool {
+        return switch (msg) {
+            .write_small,
+            .write_stable,
+            .write_alloc,
+            .size_report,
+            .color_scheme_report,
+            .visibility_report,
+            // Sent when the program turns on focus reporting, so it is
+            // told the current state. It also tells the backend, which
+            // for a tmux pane would `select-pane` on the strength of the
+            // program asking rather than the user moving.
+            .focused,
+            => true,
+
+            .crash,
+            .change_config,
+            .inspector,
+            .resize,
+            .clear_screen,
+            .scroll_viewport,
+            .selection_scroll,
+            .jump_to_prompt,
+            .start_synchronized_output,
+            .linefeed_mode,
+            .kitty_clipboard_grant_read,
+            .kitty_clipboard_grant_write,
+            => false,
+        };
     }
 
     /// Send a renderer message and unlock the renderer state mutex
@@ -1204,9 +1263,12 @@ pub const StreamHandler = struct {
             else => .standard,
         };
 
-        // Get clipboard contents
+        // Get clipboard contents. The surface answers this one, by
+        // writing the clipboard back to the program.
         if (data.len == 1 and data[0] == '?') {
-            self.surfaceMessageWriter(.{ .clipboard_read = clipboard_type });
+            if (self.answer_queries) {
+                self.surfaceMessageWriter(.{ .clipboard_read = clipboard_type });
+            }
             return;
         }
 
@@ -1286,6 +1348,10 @@ pub const StreamHandler = struct {
         terminator: terminal.osc.Terminator,
     ) !void {
         const kitty_clipboard = terminal.kitty.clipboard;
+
+        // A read is answered by the surface, so it is a reply like any
+        // other. See `answer_queries`.
+        if (!self.answer_queries) return;
 
         // Everything about the request, including the request struct
         // itself, lives in a single arena that crosses to the surface
@@ -1996,7 +2062,10 @@ pub const StreamHandler = struct {
             .csi_16_t => self.messageWriter(.{ .size_report = .csi_16_t }),
             .csi_18_t => self.messageWriter(.{ .size_report = .csi_18_t }),
             .csi_19_t => self.messageWriter(.{ .size_report = .csi_19_t }),
-            .csi_21_t => self.surfaceMessageWriter(.{ .report_title = .csi_21_t }),
+            // Answered by the surface, which knows the title.
+            .csi_21_t => if (self.answer_queries) {
+                self.surfaceMessageWriter(.{ .report_title = .csi_21_t });
+            },
         }
     }
 
@@ -2171,4 +2240,51 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "a terminal that does not answer queries sends no replies" {
+    const testing = std.testing;
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = undefined,
+    };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.clipboard_write = .allow;
+    handler.termio_messaged = false;
+
+    // Long enough to need an allocation, so dropping it must free it.
+    handler.enquiry_response = "x" ** 64;
+
+    // An ordinary terminal answers.
+    handler.answer_queries = true;
+    try handler.deviceAttributes(.primary);
+    {
+        const msg = mailbox.spsc.queue.pop(global.io()).?;
+        defer msg.deinit();
+        try testing.expect(msg == .write_stable);
+    }
+
+    // One displaying a tmux pane leaves that to tmux, which has already
+    // answered the program by the time its output reaches us.
+    handler.answer_queries = false;
+    handler.termio_messaged = false;
+    try handler.deviceAttributes(.primary);
+    try handler.deviceAttributes(.secondary);
+    try handler.deviceStatusReport(.operating_status);
+    try handler.enquiry();
+    handler.messageWriter(.{ .size_report = .csi_18_t });
+    handler.messageWriter(.{ .color_scheme_report = .{ .force = true } });
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+    try testing.expect(!handler.termio_messaged);
 }

@@ -341,6 +341,9 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .enquiry_response = opts.config.enquiry_response,
         .xt_checksum_report = opts.config.xt_checksum_report,
         .tmux_host = if (comptime StreamHandler.tmux_enabled) self else {},
+
+        // tmux answers the program in a pane itself. See the field.
+        .answer_queries = backend != .tmux,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -410,7 +413,8 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
 
         for (ops) |op| switch (op) {
             // Through the full pipeline, so parser state persists across
-            // ops and anything the stream wants to reply to still works.
+            // ops. Replies the stream would send are dropped: tmux has
+            // already answered the pane. See `answer_queries`.
             .bytes => |b| self.processOutputLocked(b),
 
             .resize => |v| self.terminal.resize(self.alloc, .{

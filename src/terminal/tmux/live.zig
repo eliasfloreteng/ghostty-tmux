@@ -1738,3 +1738,33 @@ test "live: tmux's messages for the user reach the viewer" {
         }
     }.pred);
 }
+
+test "live: tmux answers its panes' queries itself" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // The premise of a tmux pane surface not answering queries: tmux
+    // already has. This harness never writes anything back on the pane's
+    // behalf, so the reply the program reads can only be tmux's.
+    var session = try Session.start(alloc, testing.io, 80, 24, "sh");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // Ask for primary device attributes and show the first three bytes
+    // of the reply, in hex so nothing in it is interpreted on the way
+    // back.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "stty -echo -icanon; printf '\\033[c'; " ++
+            "r=$(dd bs=1 count=3 2>/dev/null | od -An -tx1 | tr -d ' \\n'); " ++
+            "echo reply:$r\r",
+    } });
+    try session.waitForPaneText(0, "reply:1b5b3f");
+
+    // The query itself also reached us in %output, so a terminal
+    // displaying the pane sees it too, and would answer it a second
+    // time, as typed input, unless it knows not to. See
+    // `StreamHandler.answer_queries`.
+    try testing.expect(!session.exited);
+}
