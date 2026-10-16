@@ -183,10 +183,29 @@ pub const Viewer = struct {
         rows: usize,
     } = null,
 
-    /// The list of commands we've sent that we want to send and wait
-    /// for a response for. We only send one command at a time just
-    /// to avoid any possible confusion around ordering.
+    /// The commands waiting for tmux's reply, oldest first.
+    ///
+    /// Commands are pipelined: each is sent as soon as it is queued
+    /// rather than when the one ahead of it is answered. tmux runs a
+    /// control client's commands one at a time in the order it reads
+    /// them, and answers each with its own `%begin`/`%end` block in that
+    /// same order, so the oldest command here is always the one the next
+    /// block answers. Waiting for each reply before sending the next
+    /// bought nothing for that, and cost a round trip per command: a
+    /// keystroke typed while a pane's history was being captured waited
+    /// for the whole capture to cross the wire before it was even sent.
     command_queue: CommandQueue,
+
+    /// How many commands at the front of `command_queue` have been sent.
+    /// Everything after them is sent by the next `flushCommands`, which
+    /// every path that queues a command runs before returning.
+    commands_sent: usize = 0,
+
+    /// Replies still to come for commands sent before the session
+    /// changed under us. They answer questions about a session we no
+    /// longer show, and must not be mistaken for answers to the commands
+    /// queued since. See `sessionChanged`.
+    orphan_replies: usize = 0,
 
     /// The windows in the current session.
     windows: std.ArrayList(Window),
@@ -635,6 +654,8 @@ pub const Viewer = struct {
             .session_id = 0,
             .tmux_version = "",
             .command_queue = command_queue,
+            .commands_sent = 0,
+            .orphan_replies = 0,
             .windows = .empty,
             .panes = .empty,
             .pause_after = opts.pause_after,
@@ -1314,9 +1335,10 @@ pub const Viewer = struct {
     /// active pane" has nothing to do with where the user is typing.
     ///
     /// Deduplicated, and that is not an optimisation. Focus can flap
-    /// several times in a drag or a window switch, only one command is
-    /// ever in flight, and everything else the user does queues behind
-    /// it -- including the `send-keys` carrying their keystrokes.
+    /// several times in a drag or a window switch, and tmux runs our
+    /// commands strictly in order, so everything the user does after
+    /// that runs behind each repeat -- including the `send-keys` carrying
+    /// their keystrokes.
     fn nextSelectPane(self: *Viewer, req: Input.SelectPane) []const Action {
         if (self.state != .command_queue) return &.{};
         if (!self.panes.contains(req.pane_id)) {
@@ -1515,12 +1537,11 @@ pub const Viewer = struct {
         };
     }
 
-    /// Queue a command for tmux, returning the action that sends it if
-    /// nothing else is already in flight.
+    /// Queue a command for tmux, returning the action that sends it.
     ///
-    /// Everything the caller can ask tmux to do goes through here, so we
-    /// never have more than one command outstanding; tmux answers each
-    /// with a `%begin`/`%end` block that `receivedCommandOutput` discards.
+    /// Everything the caller can ask tmux to do goes through here; tmux
+    /// answers each with a `%begin`/`%end` block that
+    /// `receivedCommandOutput` pairs with it by order.
     fn queueUserCommand(
         self: *Viewer,
         comptime fmt: []const u8,
@@ -1543,16 +1564,14 @@ pub const Viewer = struct {
         return .{ .user = try builder.toOwnedSlice() };
     }
 
-    /// Queue commands, returning the action that sends the first of them
-    /// if nothing was already in flight. Ownership of `commands` passes to
-    /// the queue whether this succeeds or not.
+    /// Queue commands and return the actions that send them. Ownership
+    /// of `commands` passes to the queue whether this succeeds or not.
     fn queueUserCommands(
         self: *Viewer,
         commands: []const Command,
     ) Allocator.Error![]const Action {
         assert(self.state == .command_queue);
         assert(commands.len > 0);
-        errdefer for (commands) |c| c.deinit(self.alloc);
 
         // Clear our prior arena so it is ready to be used for any
         // actions immediately.
@@ -1560,28 +1579,22 @@ pub const Viewer = struct {
         defer self.action_arena = arena.state;
         _ = arena.reset(.free_all);
 
-        // If a command is already in flight then ours are sent later, as
-        // each one ahead completes (see the tail of `nextCommand`).
-        const was_empty = self.command_queue.empty();
-        const action: ?Action = if (was_empty) action: {
-            var builder: std.Io.Writer.Allocating = .init(arena.allocator());
-            commands[0].formatCommand(&builder.writer) catch
-                return error.OutOfMemory;
-            break :action .{ .command = builder.writer.buffered() };
-        } else null;
+        self.queueCommands(commands) catch |err| {
+            for (commands) |c| c.deinit(self.alloc);
+            return err;
+        };
 
-        // Must be the last fallible operation: past this point the queue
-        // owns the commands and our errdefer would double free them.
-        try self.queueCommands(commands);
-
-        return if (action) |a| self.singleAction(a) else &.{};
+        var actions: std.ArrayList(Action) = .empty;
+        try self.flushCommands(arena.allocator(), &actions);
+        return actions.items;
     }
 
     /// Send bytes to a pane as tmux `send-keys`.
     ///
-    /// This goes through the command queue like any other command so that
-    /// we never have more than one command in flight; tmux replies to it
-    /// with a `%begin`/`%end` block that `receivedCommandOutput` discards.
+    /// This goes through the command queue like any other command, so its
+    /// reply is paired with it by order; `receivedCommandOutput` discards
+    /// it unless it is an error. It is sent at once, not after whatever is
+    /// already in flight is answered: see `command_queue`.
     fn nextWrite(
         self: *Viewer,
         w: Input.Write,
@@ -1803,11 +1816,6 @@ pub const Viewer = struct {
         // Setup our empty actions list that commands can populate.
         var actions: std.ArrayList(Action) = .empty;
 
-        // Track whether the in-flight command slot is available. Starts true
-        // if queue is empty (no command in flight). Set to true when a command
-        // completes (block_end/block_err) or the queue is reset (session_changed).
-        var command_consumed = self.command_queue.empty();
-
         switch (n) {
             .enter => unreachable,
             .exit => |reason| return self.exited(reason),
@@ -1823,10 +1831,6 @@ pub const Viewer = struct {
                     log.warn("failed to process command output, becoming defunct", .{});
                     return self.defunct();
                 };
-
-                // Command is consumed since a block end/err is the output
-                // from a command.
-                command_consumed = true;
             },
 
             .output => |out| self.receivedOutput(
@@ -1850,10 +1854,6 @@ pub const Viewer = struct {
                     log.warn("failed to handle session change, becoming defunct", .{});
                     return self.defunct();
                 };
-
-                // Command is consumed because sessionChanged resets
-                // our entire viewer.
-                command_consumed = true;
             },
 
             // Layout changed of a single window.
@@ -1979,32 +1979,13 @@ pub const Viewer = struct {
             .subscription_changed => {},
         }
 
-        // After processing commands, we add our next command to
-        // execute if we have one. We do this last because command
-        // processing may itself queue more commands. We only emit a
-        // command if a prior command was consumed (or never existed).
-        if (self.state == .command_queue and command_consumed) {
-            if (self.command_queue.first()) |next_command| {
-                // We should not have any commands, because our nextCommand
-                // always queues them.
-                if (comptime std.debug.runtime_safety) {
-                    for (actions.items) |action| {
-                        if (action == .command) assert(false);
-                    }
-                }
-
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                const arena_alloc = arena.allocator();
-
-                var builder: std.Io.Writer.Allocating = .init(arena_alloc);
-                next_command.formatCommand(&builder.writer) catch
-                    return self.defunct();
-                actions.append(
-                    arena_alloc,
-                    .{ .command = builder.writer.buffered() },
-                ) catch return self.defunct();
-            }
+        // Send whatever handling this queued. Last, because any of the
+        // above may have queued something.
+        if (self.state == .command_queue) {
+            var arena = self.action_arena.promote(self.alloc);
+            defer self.action_arena = arena.state;
+            self.flushCommands(arena.allocator(), &actions) catch
+                return self.defunct();
         }
 
         return actions.items;
@@ -2278,9 +2259,14 @@ pub const Viewer = struct {
         try actions.append(arena_alloc, .{ .windows = &.{} });
 
         // Setup our command queue and put ourselves in the command queue
-        // state.
+        // state. The list is sent by the caller's flush.
         try replacement.queueCommands(&.{.list_windows});
         replacement.state = .command_queue;
+
+        // Everything we sent for the old session is still going to be
+        // answered, and those answers come before the answer to anything
+        // sent from here on: tmux answers in the order it was asked.
+        replacement.orphan_replies = self.orphan_replies + self.commands_sent;
 
         // Transfer preserved version to replacement
         replacement.tmux_version = try replacement.alloc.dupe(u8, self.tmux_version);
@@ -2305,6 +2291,14 @@ pub const Viewer = struct {
         content: []const u8,
         is_err: bool,
     ) !void {
+        // An answer to something we asked about the session before this
+        // one. Nothing still cares.
+        if (self.orphan_replies > 0) {
+            self.orphan_replies -= 1;
+            log.debug("discarding a reply from before the session changed", .{});
+            return;
+        }
+
         // Get the command we're expecting output for. We need to get the
         // non-pointer value because we are deleting it from the circular
         // buffer immediately. This shallow copy is all we need since
@@ -2325,7 +2319,16 @@ pub const Viewer = struct {
             log.info("unexpected block output err={}", .{is_err});
             return;
         };
+
+        // Only commands we sent can be answered. Anything else means we
+        // lost track of the pairing, and every reply from here on would
+        // be read as the answer to the wrong question.
+        if (self.commands_sent == 0) {
+            log.warn("block output for a command not yet sent", .{});
+            return error.UnexpectedReply;
+        }
         self.command_queue.deleteOldest(1);
+        self.commands_sent -= 1;
         defer command.deinit(self.alloc);
 
         // We'll use our arena for the return value here so we can
@@ -2771,7 +2774,7 @@ pub const Viewer = struct {
     }
 
     /// Enters the command queue state from any other state, queueing
-    /// the commands and returning an action to execute the first command.
+    /// the commands and returning the actions that send them.
     fn enterCommandQueue(
         self: *Viewer,
         arena_alloc: Allocator,
@@ -2780,25 +2783,39 @@ pub const Viewer = struct {
         assert(self.state != .command_queue);
         assert(commands.len > 0);
 
-        // Build our command string to send for the action.
-        var builder: std.Io.Writer.Allocating = .init(arena_alloc);
-        commands[0].formatCommand(&builder.writer) catch return error.OutOfMemory;
-        const action: Action = .{ .command = builder.writer.buffered() };
-
-        // Add our commands
-        try self.command_queue.ensureUnusedCapacity(self.alloc, commands.len);
-        for (commands) |cmd| self.command_queue.appendAssumeCapacity(cmd);
-
-        // Move into the command queue state
+        try self.queueCommands(commands);
         self.state = .command_queue;
 
-        return self.singleAction(action);
+        var actions: std.ArrayList(Action) = .empty;
+        try self.flushCommands(arena_alloc, &actions);
+        return actions.items;
+    }
+
+    /// Append an action sending each queued command that has not been
+    /// sent yet. See `command_queue` for why they need not wait for each
+    /// other.
+    fn flushCommands(
+        self: *Viewer,
+        alloc: Allocator,
+        actions: *std.ArrayList(Action),
+    ) Allocator.Error!void {
+        var it = self.command_queue.iterator(.forward);
+        var i: usize = 0;
+        while (it.next()) |command| : (i += 1) {
+            if (i < self.commands_sent) continue;
+
+            var builder: std.Io.Writer.Allocating = .init(alloc);
+            command.formatCommand(&builder.writer) catch
+                return error.OutOfMemory;
+            try actions.append(alloc, .{ .command = builder.writer.buffered() });
+        }
+        self.commands_sent = i;
     }
 
     /// Queue multiple commands to execute. This doesn't add anything
-    /// to the actions queue or return actions or anything because the
-    /// command_queue state will automatically send the next command when
-    /// it receives output.
+    /// to the actions queue or return actions or anything: the caller's
+    /// `flushCommands` sends them, which for anything handled inside
+    /// `nextCommand` happens automatically on the way out.
     fn queueCommands(
         self: *Viewer,
         commands: []const Command,
@@ -2937,13 +2954,14 @@ const State = enum {
     /// in the order provided in the `command_queue` field. This field
     /// isn't part of the state because it can be queued at any state.
     ///
-    /// Precondition: if self.command_queue.len > 0, then the first
-    /// command in the queue has already been sent to tmux (via a
-    /// `command` Action). The next output is assumed to be the result
-    /// of this command.
+    /// Precondition: the first `commands_sent` commands in the queue have
+    /// been sent to tmux (via `command` actions), and once a call to
+    /// `next` returns, that is all of them. The next output is assumed to
+    /// be the result of the oldest, unless `orphan_replies` says it
+    /// answers something from before a session change.
     ///
     /// To satisfy the above, any transitions INTO this state should
-    /// send a command Action for the first command in the queue.
+    /// send command actions for every command in the queue.
     command_queue,
 };
 
@@ -3151,6 +3169,12 @@ const TestStep = struct {
     input: Viewer.Input,
     contains_tags: []const std.meta.Tag(Viewer.Action) = &.{},
     contains_command: []const u8 = "",
+
+    /// If set, the step must send exactly these commands, in this order:
+    /// one per entry, each starting with that entry. Empty means the step
+    /// must send nothing.
+    commands: ?[]const []const u8 = null,
+
     check: ?*const fn (viewer: *Viewer, []const Viewer.Action) anyerror!void = null,
     check_command: ?*const fn (viewer: *Viewer, []const u8) anyerror!void = null,
 
@@ -3186,6 +3210,23 @@ const TestStep = struct {
                 }
             }
             try testing.expect(found);
+        }
+
+        if (self.commands) |expected| {
+            var i: usize = 0;
+            for (actions) |action| {
+                if (action != .command) continue;
+                try testing.expect(i < expected.len);
+                if (!std.mem.startsWith(u8, action.command, expected[i])) {
+                    log.warn(
+                        "command {} was {s}, expected {s}",
+                        .{ i, action.command, expected[i] },
+                    );
+                    return error.TestUnexpectedCommand;
+                }
+                i += 1;
+            }
+            try testing.expectEqual(expected.len, i);
         }
 
         if (self.check) |check_fn| {
@@ -3256,11 +3297,9 @@ test "session changed resets state" {
             } } },
             .contains_command = "display-message",
         },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // Receive window layout with two panes (same format as "initial flow" test)
         .{
             .input = .{ .tmux = .{
@@ -3317,9 +3356,22 @@ test "session changed resets state" {
                     try testing.expectEqual(0, v.panes.count());
                     // Version should still be preserved
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
+                    // The old session's eight captures and its pane
+                    // state are still on their way.
+                    try testing.expectEqual(9, v.orphan_replies);
                 }
             }).check,
         },
+    });
+
+    // Their replies are dropped rather than read as the new list.
+    for (0..9) |_| {
+        try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = "" } }).len);
+    }
+    try testing.expectEqual(0, viewer.orphan_replies);
+    try testing.expectEqual(1, viewer.command_queue.len());
+
+    try testViewer(&viewer, &.{
         // Receive new window layout for new session (same layout, different session/window)
         // Uses same pane IDs 0,1 - they should be re-created since old panes were cleared
         .{
@@ -3352,58 +3404,58 @@ test "initial flow" {
 
     try testViewer(&viewer, &.{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Both startup questions go out at once: tmux answers them in
+        // order, so neither has to wait for the other.
         .{
             .input = .{ .tmux = .{ .session_changed = .{
                 .id = 42,
                 .name = "main",
             } } },
-            .contains_command = "display-message",
+            .commands = &.{ "display-message", "list-windows" },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(42, v.session_id);
                 }
             }).check,
         },
-        // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
+            .commands = &.{},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
                 }
             }).check,
         },
+        // Every capture for both panes, then the pane state, all sent
+        // together and answered below in this order.
         .{
             .input = .{ .tmux = .{
                 .block_end =
                 \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
-            .contains_tags = &.{ .windows, .command },
-            .contains_command = "capture-pane",
-            // pane_history for pane 0 (primary)
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
+            .contains_tags = &.{.windows},
+            .commands = &.{
+                "capture-pane -p -e -C -q -S - -E -1 -t %0",
+                "capture-pane -p -e -C -q -t %0",
+                "capture-pane -p -e -C -q -a -S - -E -1 -t %0",
+                "capture-pane -p -e -C -q -a -t %0",
+                "capture-pane -p -e -C -q -S - -E -1 -t %1",
+                "capture-pane -p -e -C -q -t %1",
+                "capture-pane -p -e -C -q -a -S - -E -1 -t %1",
+                "capture-pane -p -e -C -q -a -t %1",
+                "list-panes",
+            },
         },
+        // pane_history for pane 0 (primary)
         .{
             .input = .{ .tmux = .{
                 .block_end =
                 \\Hello, world!
                 ,
             } },
-            // Moves on to pane_visible for pane 0 (primary)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
+            .commands = &.{},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
@@ -3427,74 +3479,22 @@ test "initial flow" {
                 }
             }).check,
         },
+        // The rest of the captures and the pane state.
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_history for pane 0 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                    try testing.expectEqual(0, v.commands_sent);
                 }
             }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_visible for pane 0 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %0"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_history for pane 1 (primary)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_visible for pane 1 (primary)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_history for pane 1 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            // Moves on to pane_visible for pane 1 (alternate)
-            .contains_command = "capture-pane",
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-t %1"));
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-a"));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
         },
         .{
             .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "new output" } } },
@@ -3549,19 +3549,14 @@ test "capture replay decodes escaped escape sequences" {
             } },
             .check_command = (struct {
                 fn check(_: *Viewer, command: []const u8) anyerror!void {
+                    if (!std.mem.startsWith(u8, command, "capture-pane")) return;
                     try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-C"));
                 }
             }).check,
         },
-        // The history response, escaped the same way. Moves us on to
-        // pane_visible.
+        // The history response, escaped the same way.
         .{
             .input = .{ .tmux = .{ .block_end = "\\033[32mOLD" } },
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-C"));
-                }
-            }).check,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
@@ -3608,11 +3603,9 @@ test "layout change" {
             } } },
             .contains_command = "display-message",
         },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -3665,7 +3658,7 @@ test "layout change" {
     });
 }
 
-test "layout_change does not return command when queue not empty" {
+test "layout_change does not wait for commands already in flight" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
@@ -3679,11 +3672,9 @@ test "layout_change does not return command when queue not empty" {
             } } },
             .contains_command = "display-message",
         },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -3699,8 +3690,8 @@ test "layout_change does not return command when queue not empty" {
             }).check,
         },
         // Do NOT complete capture-pane commands - queue still has commands.
-        // Send a layout_change that splits into two panes.
-        // This should NOT return a command action since queue was not empty.
+        // Send a layout_change that splits into two panes. Its captures
+        // go out at once, behind the ones still in flight.
         .{
             .input = .{ .tmux = .{ .layout_change = .{
                 .window_id = 0,
@@ -3709,13 +3700,19 @@ test "layout_change does not return command when queue not empty" {
                 .raw_flags = "*",
             } } },
             .contains_tags = &.{.windows},
+            .commands = &.{
+                "capture-pane -p -e -C -q -S - -E -1 -t %2",
+                "capture-pane -p -e -C -q -t %2",
+                "capture-pane -p -e -C -q -a -S - -E -1 -t %2",
+                "capture-pane -p -e -C -q -a -t %2",
+                "list-panes",
+            },
             .check = (struct {
-                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(2, v.panes.count());
-                    // Should not contain a command action
-                    for (actions) |action| {
-                        try testing.expect(action != .command);
-                    }
+                    // The first pane's five and the new pane's five.
+                    try testing.expectEqual(10, v.command_queue.len());
+                    try testing.expectEqual(10, v.commands_sent);
                 }
             }).check,
         },
@@ -3740,11 +3737,9 @@ test "layout_change returns command when queue was empty" {
             } } },
             .contains_command = "display-message",
         },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -3807,11 +3802,9 @@ test "window_add queues list_windows when queue empty" {
             } } },
             .contains_command = "display-message",
         },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -3868,11 +3861,9 @@ test "window_add queues list_windows when queue not empty" {
             } } },
             .contains_command = "display-message",
         },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -3889,17 +3880,14 @@ test "window_add queues list_windows when queue not empty" {
             }).check,
         },
         // Do NOT complete capture-pane commands - queue still has commands.
-        // Send window_add - should queue list-windows but NOT return command action
+        // Send window_add - list-windows goes out at once regardless.
         .{
             .input = .{ .tmux = .{ .window_add = .{ .id = 1 } } },
+            .commands = &.{"list-windows"},
             .check = (struct {
-                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    // Should not contain a command action since queue was not empty
-                    for (actions) |action| {
-                        try testing.expect(action != .command);
-                    }
-                    // But list_windows should be in the queue
-                    try testing.expect(!v.command_queue.empty());
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Behind the five already in flight.
+                    try testing.expectEqual(6, v.command_queue.len());
                 }
             }).check,
         },
@@ -3930,11 +3918,9 @@ test "two pane flow with pane state" {
                 }
             }).check,
         },
-        // Receive version response, which triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // list-windows output with 2 panes in a vertical split
         .{
             .input = .{ .tmux = .{
@@ -4146,10 +4132,9 @@ test "pane state ignores out of bounds scroll region" {
             } } },
             .contains_command = "display-message",
         },
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         .{
             .input = .{ .tmux = .{
                 .block_end = "$0 @0 1 80 24 b25d,80x24,0,0,0 0 b25d,80x24,0,0,0",
@@ -4352,10 +4337,9 @@ test "write sends keys to the target pane" {
             } } },
             .contains_command = "display-message",
         },
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // One window with a single pane, id 0.
         .{
             .input = .{ .tmux = .{
@@ -4394,7 +4378,7 @@ test "write sends keys to the target pane" {
     });
 }
 
-test "write waits for the in-flight command" {
+test "a write does not wait for commands in flight" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
@@ -4408,12 +4392,12 @@ test "write waits for the in-flight command" {
             } } },
             .contains_command = "display-message",
         },
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
-        // One window with a single pane, id 0. This leaves the pane setup
-        // commands queued with the first already in flight.
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        // One window with a single pane, id 0. This sends the pane setup
+        // commands, a history capture among them, which for a big pane
+        // can take a long time to come back.
         .{
             .input = .{ .tmux = .{
                 .block_end =
@@ -4422,36 +4406,49 @@ test "write waits for the in-flight command" {
             } },
             .contains_tags = &.{ .windows, .command },
         },
-        // A write now must not jump the queue: we only ever have one
-        // command in flight, so it produces no action yet and is appended
-        // behind the five pending pane setup commands.
+        // A keystroke now is sent now, not after those replies arrive.
+        // tmux still runs it after them, in the order it read them.
         .{
             .input = .{ .write = .{ .pane_id = 0, .data = "x" } },
+            .commands = &.{"send-keys -H -t %0 78\n"},
             .check = (struct {
-                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, actions.len);
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(6, v.command_queue.len());
+                    try testing.expectEqual(6, v.commands_sent);
                 }
             }).check,
         },
-        // Drain the pane setup commands. The write is sent as the last of
-        // them completes.
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // The replies then pair with their commands in order, the
+        // write's last.
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .check_command = (struct {
-                fn check(_: *Viewer, command: []const u8) anyerror!void {
-                    try testing.expectEqualStrings(
-                        "send-keys -H -t %0 78\n",
-                        command,
-                    );
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                    try testing.expectEqual(0, v.commands_sent);
                 }
             }).check,
         },
     });
+}
+
+test "a reply with nothing in flight is ignored" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    try testing.expect(viewer.command_queue.empty());
+
+    // Nothing is in flight, so this answers nothing: it is ignored, as
+    // before, rather than taken as the answer to whatever comes next.
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = "stray" } }).len);
+    try testing.expectEqual(.command_queue, viewer.state);
 }
 
 test "write to an unknown pane is dropped" {
@@ -4468,10 +4465,9 @@ test "write to an unknown pane is dropped" {
             } } },
             .contains_command = "display-message",
         },
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
-        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         // Only pane 0 exists.
         .{
             .input = .{ .tmux = .{
@@ -4925,29 +4921,22 @@ test "resizing a split pane sizes both the window and the pane" {
 
         // Pane 1 completes the set, so the whole window can go out at
         // once: 90x(25 + 30 + 1), then a command per pane.
+        //
+        // The window command goes first, because a pane can never grow
+        // past its window; tmux runs them in the order sent, so the
+        // pane commands find the window already grown.
         .{
             .input = .{ .resize = .{ .pane_id = 1, .cols = 90, .rows = 30 } },
-            .contains_command = "refresh-client -C @0:90x56\n",
+            .commands = &.{
+                "refresh-client -C @0:90x56\n",
+                "resize-pane -t %0 -x 90 -y 25\n",
+                "resize-pane -t %1 -x 90 -y 30\n",
+            },
             .check = (struct {
-                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    // The window command goes first, because a pane can
-                    // never grow past its window. Both pane commands are
-                    // queued behind it.
-                    try testing.expectEqual(1, actions.len);
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(3, v.command_queue.len());
                 }
             }).check,
-        },
-
-        // Each reply lets the next queued command go out, in layout
-        // order.
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "resize-pane -t %0 -x 90 -y 25\n",
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "resize-pane -t %1 -x 90 -y 30\n",
         },
     });
 }
@@ -5064,15 +5053,11 @@ test "a report from the layout tmux just replaced does not complete a set" {
         // panes follow behind it.
         .{
             .input = .{ .resize = .{ .pane_id = 1, .cols = 42, .rows = 44 } },
-            .contains_command = "refresh-client -C @0:83x44\n",
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "resize-pane -t %0 -x 40 -y 44\n",
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "resize-pane -t %1 -x 42 -y 44\n",
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "resize-pane -t %0 -x 40 -y 44\n",
+                "resize-pane -t %1 -x 42 -y 44\n",
+            },
         },
     });
 }
@@ -5091,16 +5076,14 @@ test "a window is only resized when its own size changes" {
         .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 83, .rows = 20 } } },
         .{
             .input = .{ .resize = .{ .pane_id = 1, .cols = 83, .rows = 23 } },
-            .contains_command = "refresh-client -C @0:83x44\n",
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "resize-pane -t %0 -x 83 -y 20\n",
+                "resize-pane -t %1 -x 83 -y 23\n",
+            },
         },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "resize-pane -t %0 -x 83 -y 20\n",
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "resize-pane -t %1 -x 83 -y 23\n",
-        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
 
         // A divider drag: pane 0 hands a row to pane 1. That composes to
@@ -5110,17 +5093,15 @@ test "a window is only resized when its own size changes" {
         .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 83, .rows = 21 } } },
         .{
             .input = .{ .resize = .{ .pane_id = 1, .cols = 83, .rows = 22 } },
-            .contains_command = "resize-pane -t %0 -x 83 -y 21\n",
+            .commands = &.{
+                "resize-pane -t %0 -x 83 -y 21\n",
+                "resize-pane -t %1 -x 83 -y 22\n",
+            },
             .check = (struct {
-                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(1, actions.len);
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(2, v.command_queue.len());
                 }
             }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "resize-pane -t %1 -x 83 -y 22\n",
         },
     });
 }
@@ -5168,8 +5149,8 @@ test "focusing a pane tells tmux, once" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
 
         // Focus can flap several times in one drag or window switch, and
-        // only one command is in flight at a time, so a repeat would put
-        // latency on the user's own keystrokes for nothing.
+        // tmux runs commands in order, so a repeat would put latency on
+        // the user's own keystrokes for nothing.
         .{
             .input = .{ .select_pane = .{ .pane_id = 1 } },
             .check = (struct {
@@ -6634,13 +6615,12 @@ test "a large write is split into bounded send-keys, in order" {
     var sent: std.ArrayList(u8) = .empty;
     defer sent.deinit(testing.allocator);
 
-    var actions = viewer.next(.{ .write = .{ .pane_id = 0, .data = &data } });
+    // All of them go out at once, in order.
+    const actions = viewer.next(.{ .write = .{ .pane_id = 0, .data = &data } });
     var commands: usize = 0;
-    while (true) {
-        var found = false;
+    {
         for (actions) |action| switch (action) {
             .command => |command| {
-                found = true;
                 commands += 1;
                 const prefix = "send-keys -H -t %0";
                 try testing.expect(std.mem.startsWith(u8, command, prefix));
@@ -6660,13 +6640,14 @@ test "a large write is split into bounded send-keys, in order" {
             },
             else => {},
         };
-        if (!found) break;
-
-        // tmux answers each in turn, which sends the next.
-        actions = viewer.next(.{ .tmux = .{ .block_end = "" } });
     }
 
     try testing.expectEqual(3, commands);
     try testing.expectEqualSlices(u8, &data, sent.items);
+
+    // tmux answers each in turn.
+    for (0..3) |_| {
+        try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = "" } }).len);
+    }
     try testing.expect(viewer.command_queue.empty());
 }

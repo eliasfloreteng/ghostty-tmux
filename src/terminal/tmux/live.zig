@@ -1829,3 +1829,55 @@ test "live: a large paste arrives whole and in order" {
     try testing.expect(!session.exited);
     try testing.expectEqual(.command_queue, session.viewer.state);
 }
+
+test "live: switching session mid-attach pairs every reply correctly" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // A second session with a different shape, so that reading one
+    // session's replies as the other's would show.
+    var session = try Session.start(alloc, testing.io, 80, 24, "cat");
+    defer session.deinit();
+    {
+        const out = try session.ask(&.{ "new-session", "-d", "-s", "other", "cat" });
+        alloc.free(out);
+    }
+    {
+        const out = try session.ask(&.{ "split-window", "-t", "other:", "cat" });
+        alloc.free(out);
+    }
+
+    // Switch as soon as the first window list arrives, while that
+    // window's captures are still on their way: their replies come after
+    // the switch and must not be taken for the new session's.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() > 0;
+        }
+    }.pred);
+    const client = try session.ask(&.{ "list-clients", "-F", "#{client_name}" });
+    defer alloc.free(client);
+    {
+        const out = try session.ask(&.{
+            "switch-client", "-c", std.mem.trim(u8, client, " \r\n"), "-t", "other",
+        });
+        alloc.free(out);
+    }
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty() and
+                v.viewer.orphan_replies == 0;
+        }
+    }.pred);
+    try testing.expectEqual(1, session.viewer.windows.items.len);
+    try testing.expect(!session.exited);
+
+    // And it works: the new session's panes take input.
+    var it = session.viewer.panes.iterator();
+    const pane_id = it.next().?.key_ptr.*;
+    try session.input(.{ .write = .{ .pane_id = pane_id, .data = "switched\r" } });
+    try session.waitForPaneText(pane_id, "switched");
+}

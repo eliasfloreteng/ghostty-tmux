@@ -466,9 +466,9 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
 
 /// Feed one input to the viewer and send whatever command it produces.
 ///
-/// The viewer returns at most one action for these inputs, and its arena
-/// is reset by the next call, so the command has to be copied before we
-/// let go of the lock. `Message.writeReq` does that copy.
+/// The viewer's actions for these inputs are commands (a large write is
+/// several), and its arena is reset by the next call, so each has to be
+/// copied before we let go of the lock. `Message.writeReq` does that copy.
 fn tmuxHostInput(self: *Termio, input: terminalpkg.tmux.Viewer.Input) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
 
