@@ -3153,8 +3153,9 @@ const Command = union(enum) {
     /// Capture the given pane's grid on display, whichever screen that is.
     pane_visible: usize,
 
-    /// Capture the pane terminal state as best we can. The pane ID(s)
-    /// are part of the output so we can map it back to our panes.
+    /// Capture the terminal state of every pane in the session as best
+    /// we can. The pane ID(s) are part of the output so we can map it
+    /// back to our panes.
     pane_state,
 
     /// Get the tmux server version.
@@ -3238,8 +3239,12 @@ const Command = union(enum) {
                 .{id},
             ),
 
+            // -s = every pane in the session. Without a target,
+            //   list-panes lists the panes of the client's current
+            //   window alone, and we keep a terminal for every pane of
+            //   every window.
             .pane_state => try writer.writeAll(std.fmt.comptimePrint(
-                "list-panes -F '{s}'\n",
+                "list-panes -s -F '{s}'\n",
                 .{comptime Format.list_panes.comptimeFormat()},
             )),
 
@@ -3617,7 +3622,7 @@ test "initial flow" {
                 "capture-pane -p -e -C -q -S - -E -1 -t %1",
                 "capture-pane -p -e -C -a -t %1",
                 "capture-pane -p -e -C -q -t %1",
-                "list-panes",
+                "list-panes -s -F",
             },
         },
         // pane_history for pane 0 (primary)

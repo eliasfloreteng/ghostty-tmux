@@ -140,6 +140,13 @@ const Session = struct {
         /// next to the socket and removed with it.
         config: ?[]const u8 = null,
 
+        /// Commands to run in further windows, created with `-d` before
+        /// the control client attaches so the session's first window
+        /// stays current. This is how a test puts a pane outside tmux's
+        /// current window into the attach, rather than adding it after,
+        /// where it would arrive through notifications instead.
+        extra_windows: []const []const u8 = &.{},
+
         /// Before attaching, wait until `display-message -p -t target
         /// format` prints `expect`. For state a command takes a moment
         /// to reach, which the attach should see rather than race.
@@ -220,6 +227,14 @@ const Session = struct {
                 "new-session", "-d", "-x", x, "-y", y, command,
             });
             const out = try run(alloc, argv.items);
+            alloc.free(out);
+        }
+
+        for (opts.extra_windows) |window_command| {
+            const out = try run(alloc, &.{
+                "tmux",       "-f", "/dev/null",    "-S", socket,
+                "new-window", "-d", window_command,
+            });
             alloc.free(out);
         }
 
@@ -1641,6 +1656,53 @@ test "live: a pane in the alternate screen keeps both screens" {
     defer alloc.free(primary);
     try testing.expect(std.mem.indexOf(u8, primary, "under") != null);
     try testing.expect(std.mem.indexOf(u8, primary, "on-alt") == null);
+    try testing.expect(!session.exited);
+}
+
+test "live: a pane outside tmux's current window gets its state too" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // The second window is not current when we attach, and its program
+    // has set modes and moved its cursor first. Only the pane-state
+    // reply carries those, never a capture, and `list-panes` without
+    // `-s` lists the current window alone.
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "sleep 60", .{
+        .extra_windows = &.{
+            "printf '\\033[?1h\\033[?1002h\\033[?1006h" ++
+                "\\033[?1049hon-alt\\033[3;5H'; sleep 60",
+        },
+        .ready = .{
+            .target = ":1",
+            .format = "#{alternate_on},#{keypad_cursor_flag}," ++
+                "#{mouse_button_flag},#{mouse_sgr_flag}," ++
+                "#{cursor_x},#{cursor_y}",
+            .expect = "1,1,1,1,4,2",
+        },
+    });
+    defer session.deinit();
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return attached(v) and
+                v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const pane = session.viewer.panes.get(1) orelse return error.NoSuchPane;
+    const t = &pane.terminal;
+    try testing.expectEqual(.alternate, t.screens.active_key);
+    try testing.expect(t.modes.get(.cursor_keys));
+    try testing.expect(t.modes.get(.mouse_event_button));
+    try testing.expect(t.modes.get(.mouse_format_sgr));
+    try testing.expectEqual(4, t.screens.active.cursor.x);
+    try testing.expectEqual(2, t.screens.active.cursor.y);
+
+    const text = try session.paneText(1);
+    defer alloc.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "on-alt") != null);
     try testing.expect(!session.exited);
 }
 
