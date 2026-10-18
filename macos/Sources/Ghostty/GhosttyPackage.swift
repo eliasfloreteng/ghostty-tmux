@@ -337,6 +337,11 @@ extension Notification.Name {
     static let ghosttyDidUpdateTmuxWindows = Notification.Name("com.mitchellh.ghostty.didUpdateTmuxWindows")
     static let TmuxWindowsKey = ghosttyDidUpdateTmuxWindows.rawValue + ".tmuxWindows"
 
+    /// A tmux control mode session has something to tell the user. The
+    /// object is the surface hosting the session.
+    static let ghosttyTmuxNotice = Notification.Name("com.mitchellh.ghostty.tmuxNotice")
+    static let TmuxNoticeKey = ghosttyTmuxNotice.rawValue + ".notice"
+
     /// Focus the search field
     static let ghosttySearchFocus = Notification.Name("com.mitchellh.ghostty.searchFocus")
 }

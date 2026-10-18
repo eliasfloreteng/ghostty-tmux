@@ -785,6 +785,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_TMUX_WINDOWS:
                 tmuxWindows(app, target: target, v: action.action.tmux_windows)
 
+            case GHOSTTY_ACTION_TMUX_NOTICE:
+                return tmuxNotice(app, target: target, v: action.action.tmux_notice)
+
             default:
                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue, privacy: .public)")
                 return false
@@ -2237,6 +2240,36 @@ extension Ghostty {
 
             default:
                 assertionFailure()
+            }
+        }
+
+        private static func tmuxNotice(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_tmux_notice_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("tmux notice does nothing with an app target")
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+
+                // The text is borrowed for the duration of this callback,
+                // so it is copied before it goes anywhere.
+                guard let notice = Ghostty.Action.TmuxNotice(c: v) else { return false }
+
+                NotificationCenter.default.post(
+                    name: .ghosttyTmuxNotice,
+                    object: surfaceView,
+                    userInfo: [SwiftUI.Notification.Name.TmuxNoticeKey: notice]
+                )
+                return true
+
+            default:
+                assertionFailure()
+                return false
             }
         }
 

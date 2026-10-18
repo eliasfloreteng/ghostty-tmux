@@ -55,6 +55,11 @@ extension Ghostty {
         /// A message sent from `ghostty_surface_t` when a child process exited
         @Published private(set) var childExitedMessage: ChildExitedMessage?
 
+        /// A short message shown over the bottom of the surface for a few
+        /// seconds. See `showTransientNotice`.
+        @Published private(set) var transientNotice: TransientNotice?
+        private var transientNoticeTimer: Timer?
+
         /// The tmux control mode session this surface is the host of,
         /// i.e. the one it ran `tmux -CC` for, while it is attached. Nil
         /// otherwise. An unnamed session is an empty string.
@@ -84,6 +89,7 @@ extension Ghostty {
         }
 
         deinit {
+            transientNoticeTimer?.invalidate()
             NotificationCenter.default
                 .removeObserver(self)
         }
@@ -103,6 +109,28 @@ extension Ghostty {
 
         func setChildExitedMessage(_ message: ChildExitedMessage) {
             self.childExitedMessage = message
+        }
+
+        /// Show `text` over the bottom of the surface for `duration`
+        /// seconds, replacing any notice already showing. For things that
+        /// are worth seeing but not worth interrupting anyone for, such as
+        /// what tmux would have put on its status line.
+        func showTransientNotice(
+            _ text: String,
+            level: TransientNotice.Level = .info,
+            duration: TimeInterval = 5
+        ) {
+            let notice = TransientNotice(text: text, level: level)
+            transientNotice = notice
+
+            transientNoticeTimer?.invalidate()
+            transientNoticeTimer = Timer.scheduledTimer(
+                withTimeInterval: duration,
+                repeats: false
+            ) { [weak self] _ in
+                guard let self, self.transientNotice?.id == notice.id else { return }
+                self.transientNotice = nil
+            }
         }
 
         @MainActor
@@ -192,5 +220,19 @@ extension Ghostty.OSSurfaceView {
             return false
         }
         return true
+    }
+}
+
+// MARK: Transient Notice
+
+extension Ghostty.OSSurfaceView {
+    struct TransientNotice: Identifiable, Equatable {
+        enum Level {
+            case info, error
+        }
+
+        let id = UUID()
+        let text: String
+        let level: Level
     }
 }

@@ -60,6 +60,14 @@ class TmuxWindowManager {
     /// last snapshot. See `sessionEmptied`.
     private var closedWhileKey: Set<ObjectIdentifier> = []
 
+    /// tmux.conf errors waiting to be shown together. See `tmuxConfigError`.
+    private struct ConfigErrors {
+        weak var host: Ghostty.SurfaceView?
+        var errors: [String] = []
+        var presentation: DispatchWorkItem?
+    }
+    private var configErrors: [ObjectIdentifier: ConfigErrors] = [:]
+
     init() {
         NotificationCenter.default.addObserver(
             self,
@@ -75,6 +83,11 @@ class TmuxWindowManager {
             self,
             selector: #selector(windowWillClose(_:)),
             name: NSWindow.willCloseNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttyTmuxNotice(_:)),
+            name: .ghosttyTmuxNotice,
             object: nil)
     }
 
@@ -236,6 +249,114 @@ class TmuxWindowManager {
         guard let controller = hostView.window?.windowController as? BaseTerminalController else { return }
         controller.focusSurface(hostView)
     }
+
+    // MARK: Notices
+
+    /// Show what tmux has to tell the user.
+    ///
+    /// A normal tmux client puts these on its status line, which we do
+    /// not have, and nothing else would show them: a mistake in tmux.conf,
+    /// a split tmux refused, the reason a session ended would all go
+    /// unseen. Each is shown the way it deserves:
+    ///
+    /// - A message or a failed command is a passing notice over the pane
+    ///   the user is in, which is where the status line would have been
+    ///   and where they just did whatever failed.
+    /// - Configuration errors are collected and shown together in one
+    ///   alert: they arrive in a burst while the session attaches, one
+    ///   per error, and say the session may not be set up as intended.
+    /// - The reason a session ended goes on the host, since the session's
+    ///   own windows are about to close.
+    @objc private func ghosttyTmuxNotice(_ notification: Notification) {
+        guard let hostView = notification.object as? Ghostty.SurfaceView else { return }
+        guard let notice = notification.userInfo?[
+            Notification.Name.TmuxNoticeKey
+        ] as? Ghostty.Action.TmuxNotice else { return }
+
+        switch notice.kind {
+        case .message:
+            noticeTarget(hostedBy: hostView).showTransientNotice("tmux: \(notice.text)")
+
+        case .commandError:
+            noticeTarget(hostedBy: hostView).showTransientNotice(
+                "tmux: \(notice.text)",
+                level: .error,
+                duration: 8)
+
+        case .exit:
+            hostView.showTransientNotice("tmux: \(notice.text)", duration: 8)
+
+        case .configError:
+            tmuxConfigError(notice.text, hostedBy: hostView)
+        }
+    }
+
+    /// Where a notice for the session hosted by `hostView` goes: the pane
+    /// the user is in if they are in the session, else the pane in the
+    /// window tmux is on, else the host.
+    private func noticeTarget(hostedBy hostView: Ghostty.SurfaceView) -> Ghostty.SurfaceView {
+        let host = ObjectIdentifier(hostView)
+        let entries = windows.filter { $0.key.host == host }.map(\.value)
+        let entry = entries.first { $0.controller?.window?.isKeyWindow ?? false }
+            ?? entries.first { $0.isActive }
+        guard let controller = entry?.controller else { return hostView }
+
+        if let focused = controller.focusedSurface, controller.surfaceTree.contains(focused) {
+            return focused
+        }
+        return controller.surfaceTree.first ?? hostView
+    }
+
+    /// Collect a tmux.conf error, and show what has been collected once
+    /// they stop arriving.
+    private func tmuxConfigError(_ text: String, hostedBy hostView: Ghostty.SurfaceView) {
+        let host = ObjectIdentifier(hostView)
+        var pending = configErrors[host] ?? ConfigErrors(host: hostView)
+        pending.errors.append(text)
+        pending.presentation?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.presentConfigErrors(host: host)
+        }
+        pending.presentation = work
+        configErrors[host] = pending
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func presentConfigErrors(host: ObjectIdentifier) {
+        guard let pending = configErrors.removeValue(forKey: host),
+              let hostView = pending.host,
+              !pending.errors.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = pending.errors.count == 1
+            ? "tmux Configuration Error"
+            : "tmux Configuration Errors"
+        alert.informativeText = """
+            tmux reported a problem loading its configuration, so the \
+            session may not be set up as intended.
+
+            \(pending.errors.joined(separator: "\n"))
+            """
+        alert.addButton(withTitle: "OK")
+
+        // A sheet on a window of the session if the user is in one, which
+        // after attaching they usually are, otherwise on the host's.
+        let window = noticeTarget(hostedBy: hostView).window ?? hostView.window
+        if let window, window.attachedSheet == nil {
+            alert.beginSheetModal(for: window)
+        } else {
+            // Busy with a sheet of its own, or nowhere to go. Not worth
+            // an app modal alert over.
+            hostView.showTransientNotice(
+                "tmux: \(pending.errors.joined(separator: "; "))",
+                level: .error,
+                duration: 10)
+        }
+    }
+
+    // MARK: Host
 
     /// Tell the host which session it is hosting, or that it is not any
     /// more. It shows that in place of its terminal.

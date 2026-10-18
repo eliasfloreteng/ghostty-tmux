@@ -108,6 +108,11 @@ extension Ghostty {
                         ChildExitedMessageBar(msg: msg)
                             .font(.system(size: min(surfaceView.cellSize.height * 0.8, 30)))
                     }
+
+                    if let notice = surfaceView.transientNotice {
+                        TransientNoticeBar(notice: notice)
+                            .font(.system(size: min(surfaceView.cellSize.height * 0.8, 30)))
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 
