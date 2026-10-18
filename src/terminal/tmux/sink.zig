@@ -73,6 +73,20 @@ pub const Op = union(enum) {
     /// Clear the display and home the cursor, ahead of a visible replay.
     erase_and_home,
 
+    /// Clear the display and the scrollback, and home the cursor, ahead
+    /// of a history replay.
+    ///
+    /// A history capture is all of the pane's history, not what is new
+    /// since we last looked, and a pane can be read more than once: a
+    /// paused pane is read again when it resumes, and a session switch
+    /// can land on a pane whose display is still up. So the replay
+    /// replaces what the terminal holds rather than adding to it.
+    ///
+    /// Only content goes. Modes, colors, the title and the like stay,
+    /// because a capture does not carry them and some (bracketed paste,
+    /// the kitty keyboard flags) tmux has no way to tell us again.
+    erase_all,
+
     /// Cursor position, modes, scroll region and tab stops, as tmux
     /// reported them.
     pane_state: PaneStateData,
@@ -116,6 +130,7 @@ pub const Op = union(enum) {
             .switch_screen,
             .scroll_into_history,
             .erase_and_home,
+            .erase_all,
             .resize,
             => self,
         };
@@ -199,6 +214,12 @@ pub fn applyOp(
 
         .erase_and_home => {
             t.eraseDisplay(.complete, false);
+            t.setCursorPos(1, 1);
+        },
+
+        .erase_all => {
+            t.eraseDisplay(.complete, false);
+            t.eraseDisplay(.scrollback, false);
             t.setCursorPos(1, 1);
         },
 
@@ -385,6 +406,7 @@ test "cloning a payload-free op copies it as-is" {
         .{ .switch_screen = .alternate },
         .scroll_into_history,
         .erase_and_home,
+        .erase_all,
         .{ .resize = .{ .cols = 80, .rows = 24 } },
     };
 
@@ -396,4 +418,29 @@ test "cloning a payload-free op copies it as-is" {
             std.meta.activeTag(copy),
         );
     }
+}
+
+test "erase_all clears the scrollback as well as the display" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // More lines than rows, so some are in scrollback.
+    for ("abcde") |c| {
+        try t.print(c);
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    t.modes.set(.bracketed_paste, true);
+
+    try applyOp(alloc, &t, .erase_all);
+
+    const text = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(text);
+    try testing.expectEqualStrings("", text);
+    try testing.expectEqual(0, t.screens.active.cursor.x);
+    try testing.expectEqual(0, t.screens.active.cursor.y);
+
+    // Content only: modes are left alone.
+    try testing.expect(t.modes.get(.bracketed_paste));
 }

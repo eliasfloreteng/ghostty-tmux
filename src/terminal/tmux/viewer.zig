@@ -2749,6 +2749,10 @@ pub const Viewer = struct {
         // correct, but scrolling it into history leaves only the scrollback
         // we were after and we'll get the active contents soon.
         //
+        // It replaces whatever the primary screen held, scrollback and
+        // all: this is the pane's whole history, and a pane read again
+        // (resumed from a pause, say) already has the older part of it.
+        //
         // The captures ask tmux to escape everything non-printable so that
         // no raw ESC ever reaches the DCS carrying control mode, so the
         // escape sequences `-e` asked for arrive as text and have to be
@@ -2759,6 +2763,7 @@ pub const Viewer = struct {
         defer self.alloc.free(buf);
         try self.paneOps(pane, &.{
             .{ .switch_screen = .primary },
+            .erase_all,
             .{ .bytes = control.unescape(buf, content) },
             .scroll_into_history,
         });

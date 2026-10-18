@@ -1026,6 +1026,15 @@ test "live: a paused pane is resumed and re-read" {
     } });
     try session.waitForPaneText(0, "before-pause");
 
+    // And enough lines before it that some are in scrollback. The
+    // re-read replays the pane's history, and it has to replace what
+    // the shadow terminal already holds rather than land on top of it.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "seq -f 'hist-%g' 1 40\r",
+    } });
+    try session.waitForPaneText(0, "hist-40");
+
     // Pause the pane outright rather than provoking tmux's own
     // pause-after timer. Falling behind on purpose does reach the same
     // code, but whether tmux decides we are late enough is a race, and it
@@ -1086,13 +1095,36 @@ test "live: a paused pane is resumed and re-read" {
     // recovery that merely resumed would leave a permanent hole here.
     try session.waitForPaneText(0, "during-pause");
 
-    // And the re-read did not cost us what was already there.
+    // And the re-read neither cost us what was already there, by now
+    // in scrollback, nor duplicated it: every line `seq` printed is in
+    // the pane's history or on screen exactly once, as it is in tmux.
     {
-        const text = try session.paneText(0);
+        const pane = session.viewer.panes.get(0) orelse
+            return error.NoSuchPane;
+        const text = try pane.terminal.screens.get(.primary).?.dumpStringAlloc(
+            alloc,
+            .{ .screen = .{} },
+        );
         defer alloc.free(text);
         try testing.expect(
             std.mem.indexOf(u8, text, "before-pause") != null,
         );
+        var counts: [40]usize = @splat(0);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const n_str = std.mem.trimEnd(u8, line, " ");
+            if (!std.mem.startsWith(u8, n_str, "hist-")) continue;
+            const n = std.fmt.parseInt(usize, n_str["hist-".len..], 10) catch
+                continue;
+            if (n >= 1 and n <= 40) counts[n - 1] += 1;
+        }
+        for (counts, 1..) |count, n| {
+            if (count != 1) log.err(
+                "hist-{d} appears {d} times in:\n{s}",
+                .{ n, count, text },
+            );
+            try testing.expectEqual(1, count);
+        }
     }
 
     // Output reaches us again, which it would not if the pane were still
