@@ -485,7 +485,7 @@ class BaseTerminalController: NSWindowController,
 
         // If the child process is not alive, then we exit immediately
         guard withConfirmation else {
-            removeSurfaceNode(node)
+            if !closeViaTmux(node) { removeSurfaceNode(node) }
             return
         }
 
@@ -498,10 +498,31 @@ class BaseTerminalController: NSWindowController,
             messageText: "Close Terminal?",
             informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
         ) { [weak self] in
-            if let self {
+            if let self, !self.closeViaTmux(node) {
                 self.removeSurfaceNode(node)
             }
         }
+    }
+
+    /// Ask tmux to close the panes in `node`, if they are tmux panes that
+    /// tmux still has.
+    ///
+    /// Removing a tmux pane from the tree tells tmux nothing: the pane is
+    /// still in tmux's layout, so the next notification puts the very same
+    /// view back. tmux has to close it, and the split goes when tmux's
+    /// layout drops the pane.
+    ///
+    /// Returns true if tmux was asked, and the caller must then leave the
+    /// tree alone. False for ordinary surfaces, and for panes tmux has
+    /// already closed -- which is why their surfaces are closing -- and
+    /// those are removed here as before.
+    func closeViaTmux(_ node: SplitTree<Ghostty.SurfaceView>.Node) -> Bool {
+        var asked = false
+        for view in node.leaves() {
+            guard let surface = view.surface else { continue }
+            if ghostty_surface_tmux_close_pane(surface) { asked = true }
+        }
+        return asked
     }
 
     // MARK: Split Tree Management

@@ -1293,6 +1293,13 @@ GHOSTTY_API void* ghostty_surface_tmux_router(ghostty_surface_t);
 // when tmux stops listing the window. Returns false for anything that
 // is not a tmux pane (the session host included); close it as usual.
 GHOSTTY_API bool ghostty_surface_tmux_close_tab(ghostty_surface_t);
+// Close the tmux pane this surface displays, if tmux still has it.
+//
+// Returns true if the kill was sent; the caller must NOT also remove the
+// split, which goes when tmux's layout drops the pane. Returns false for
+// anything that is not a tmux pane, and for a pane tmux already closed;
+// remove it as usual.
+GHOSTTY_API bool ghostty_surface_tmux_close_pane(ghostty_surface_t);
 GHOSTTY_API void ghostty_tmux_router_free(void*);
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,

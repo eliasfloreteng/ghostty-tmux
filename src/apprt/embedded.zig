@@ -1910,6 +1910,23 @@ pub const CAPI = struct {
         return surface.core_surface.tmuxCloseTab(.this);
     }
 
+    /// Close the tmux pane this surface displays, if it is one that tmux
+    /// still has.
+    ///
+    /// For the split counterpart of `ghostty_surface_tmux_close_tab`:
+    /// closing a split on macOS removes it from the split tree, which
+    /// tells tmux nothing, and tmux's next layout puts it back.
+    ///
+    /// Returns true if the kill was sent. tmux owns the close from that
+    /// point and the caller must not remove the split itself; it goes
+    /// when tmux's layout drops the pane. Returns false for anything that
+    /// is not a tmux pane, and for a pane tmux has already closed, which
+    /// is when the split has to be removed locally.
+    export fn ghostty_surface_tmux_close_pane(surface: *Surface) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxClosePane();
+    }
+
     /// Release a reference from ghostty_surface_tmux_router that was not
     /// handed to a surface config.
     export fn ghostty_tmux_router_free(router_: ?*anyopaque) void {

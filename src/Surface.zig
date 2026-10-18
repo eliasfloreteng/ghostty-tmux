@@ -2293,6 +2293,26 @@ pub fn tmuxCloseTab(
     return true;
 }
 
+/// Ask tmux to close this surface's pane, if it is a tmux pane that is
+/// still open.
+///
+/// Public for the same reason as `tmuxCloseTab`: macOS closes a split
+/// from AppKit (its scripting, App Intents, the confirmation of the
+/// `close_surface` binding) by removing it from the split tree, which
+/// tells tmux nothing. The pane is still in tmux's layout, so the next
+/// notification puts the very same view back.
+///
+/// Returns false for anything that is not a tmux pane, and for a pane
+/// tmux has already closed -- which is how its own display comes to be
+/// closing, and must then be closed locally.
+pub fn tmuxClosePane(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    return pane.router.closePane(pane.id);
+}
+
 /// Ask tmux for a new window, if this surface is a tmux pane.
 ///
 /// Returns false for an ordinary surface, which is the caller's signal to

@@ -524,6 +524,20 @@ pub const Router = struct {
         self.host.vtable.kill(self.host.ctx, pane_id);
     }
 
+    /// Ask tmux to close a pane the user closed, if it is still open.
+    ///
+    /// Returns false when the pane's channel is already closed: the pane
+    /// is gone in tmux (or the whole session is), and closing its display
+    /// is the right thing to do locally. Returns true when the kill was
+    /// sent, and then the display goes away when tmux stops listing it.
+    pub fn closePane(self: *Router, pane_id: usize) bool {
+        if (!self.paneOpen(pane_id)) return false;
+        if (!self.hostAcquire()) return false;
+        defer self.hostRelease();
+        self.host.vtable.kill(self.host.ctx, pane_id);
+        return true;
+    }
+
     // ---------------------------------------------------------------
     // Host teardown.
     // ---------------------------------------------------------------
@@ -977,6 +991,30 @@ test "kill reaches the host while it is alive" {
     tr.router.killPane(8);
     try testing.expectEqual(1, tr.host.kills.items.len);
     try testing.expectEqual(8, tr.host.kills.items[0]);
+}
+
+test "closing a pane asks tmux only while tmux still has it" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    const sink = try tr.router.createChannel(8);
+
+    // Open: the user closed it, and tmux has to be told.
+    try testing.expect(tr.router.closePane(8));
+    try testing.expectEqual(1, tr.host.kills.items.len);
+    try testing.expectEqual(8, tr.host.kills.items[0]);
+
+    // Closed by tmux: its display is closing because the pane is gone,
+    // and a kill would be aimed at nothing.
+    sink.close();
+    try testing.expect(!tr.router.closePane(8));
+    try testing.expectEqual(1, tr.host.kills.items.len);
+
+    // Never ours.
+    try testing.expect(!tr.router.closePane(1234));
+    try testing.expectEqual(1, tr.host.kills.items.len);
 }
 
 test "a pane nothing claims stops buffering rather than growing forever" {

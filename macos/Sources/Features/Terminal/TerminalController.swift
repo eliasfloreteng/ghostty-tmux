@@ -738,6 +738,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return
         }
 
+        // The last panes of a tmux window: tmux closes the window when they
+        // go, and then so does the tab. Closing the tab here as well is
+        // what brings it back. With confirmation, closeTab and closeWindow
+        // route through tmux themselves.
+        if !withConfirmation && closeViaTmux(node) { return }
+
         // More than 1 window means we have tabs and we're closing a tab
         if window?.tabGroup?.windows.count ?? 0 > 1 {
             if withConfirmation {
