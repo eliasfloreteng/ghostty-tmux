@@ -53,6 +53,10 @@ class TmuxWindowManager {
     private var windows: [Key: WindowEntry] = [:]
     private var panes: [Key: WeakSurface] = [:]
 
+    /// Hosts one of whose windows closed while it was key, since their
+    /// last snapshot. See `sessionEmptied`.
+    private var closedWhileKey: Set<ObjectIdentifier> = []
+
     init() {
         NotificationCenter.default.addObserver(
             self,
@@ -63,6 +67,11 @@ class TmuxWindowManager {
             self,
             selector: #selector(windowDidBecomeKey(_:)),
             name: NSWindow.didBecomeKeyNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
             object: nil)
     }
 
@@ -75,12 +84,21 @@ class TmuxWindowManager {
         guard let action = notification.userInfo?[
             Notification.Name.TmuxWindowsKey
         ] as? Ghostty.Action.TmuxWindows else { return }
+
+        let host = ObjectIdentifier(hostView)
+
+        // Before anything that needs the host to still be alive: a
+        // session ending is often why it is not.
+        if action.windows.isEmpty {
+            sessionEmptied(hostView, ended: action.sessionName.isEmpty)
+            return
+        }
+
         guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
         let ghostty = appDelegate.ghostty
         guard let app = ghostty.app else { return }
         guard let hostSurface = hostView.surface else { return }
 
-        let host = ObjectIdentifier(hostView)
         var liveWindows: Set<Key> = []
         var livePanes: Set<Key> = []
 
@@ -175,6 +193,40 @@ class TmuxWindowManager {
 
         prune(liveWindows: liveWindows, livePanes: livePanes, host: host)
         selectActiveWindow(action.windows, host: host)
+
+        // The session is still going, so whatever closed was not it.
+        closedWhileKey.remove(host)
+    }
+
+    /// A snapshot with no windows: the session changed or ended.
+    ///
+    /// Either way, every window of the session goes. tmux has already
+    /// let go of them -- they are another session's, or nobody's -- so
+    /// this is not the user closing anything, and nothing asks. The
+    /// panes' own surfaces are closing too, without asking, since the
+    /// core marks them exited; whichever gets there first wins.
+    ///
+    /// When the session ended and the user was in it, they are taken back
+    /// to where they started it: the host is the one surface of theirs
+    /// that is still about this session, and otherwise AppKit picks
+    /// whatever window happens to be next. A session change instead
+    /// opens the new session's windows straight away, which is where
+    /// they should be.
+    private func sessionEmptied(_ hostView: Ghostty.SurfaceView, ended: Bool) {
+        let host = ObjectIdentifier(hostView)
+
+        // The panes close themselves when the session ends, and that can
+        // reach us before this does, taking a key window with it.
+        let wasInSession = closedWhileKey.remove(host) != nil || windows.contains { key, entry in
+            key.host == host && (entry.controller?.window?.isKeyWindow ?? false)
+        }
+
+        prune(liveWindows: [], livePanes: [], host: host)
+        closedWhileKey.remove(host)
+
+        guard ended, wasInSession else { return }
+        guard let controller = hostView.window?.windowController as? BaseTerminalController else { return }
+        controller.focusSurface(hostView)
     }
 
     /// Bring forward the tab for the window tmux is currently on.
@@ -300,6 +352,12 @@ class TmuxWindowManager {
         entry.pendingFocus = nil
         guard window.firstResponder !== view else { return }
         window.makeFirstResponder(view)
+    }
+
+    @objc private func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window.isKeyWindow else { return }
+        guard let key = windows.first(where: { $0.value.controller?.window === window })?.key else { return }
+        closedWhileKey.insert(key.host)
     }
 
     /// Apply a focus change that was waiting for its window to be key.

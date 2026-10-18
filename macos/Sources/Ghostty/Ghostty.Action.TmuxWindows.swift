@@ -8,6 +8,11 @@ extension Ghostty.Action {
     struct TmuxWindows {
         let windows: [Window]
 
+        /// The session's name. Empty only when the session has ended,
+        /// which is what tells that apart from a session change: both
+        /// start with a snapshot that has no windows.
+        let sessionName: String
+
         /// A single tmux window and its flattened layout tree. Node index 0
         /// is the root of the tree.
         struct Window {
@@ -94,6 +99,8 @@ extension Ghostty.Action {
         }
 
         init(c: ghostty_action_tmux_windows_s) {
+            self.sessionName = c.session_name.map { String(cString: $0) } ?? ""
+
             guard c.len > 0, let cWindows = c.windows else {
                 self.windows = []
                 return
