@@ -2233,11 +2233,12 @@ pub const Viewer = struct {
             // care.
             .sessions_changed => {},
 
-            // We don't use window names for anything, currently.
             // Update the name in place rather than re-listing: a rename
             // changes nothing else, and a round trip per keystroke of
-            // someone's rename prompt would be absurd.
+            // someone's rename prompt would be absurd. The GUI still
+            // hears of it, through the window list it already diffs.
             .window_renamed => |info| self.windowRenamed(
+                &actions,
                 info.id,
                 info.name,
             ) catch {
@@ -2424,19 +2425,32 @@ pub const Viewer = struct {
     }
 
     /// Record a window's new name.
-    fn windowRenamed(self: *Viewer, window_id: usize, name: []const u8) !void {
+    fn windowRenamed(
+        self: *Viewer,
+        actions: *std.ArrayList(Action),
+        window_id: usize,
+        name: []const u8,
+    ) !void {
         const window: *Window = for (self.windows.items) |*w| {
             if (w.id == window_id) break w;
         } else {
             log.info("rename for unknown window id={}", .{window_id});
             return;
         };
+        if (std.mem.eql(u8, window.name, name)) return;
 
         // Allocated before the old one is released, so a failure here
         // leaves the window with the name it already had.
         const copy = try self.alloc.dupe(u8, name);
         self.alloc.free(window.name);
         window.name = copy;
+
+        // Re-send the window list, as for the current window: the name is
+        // what the GUI shows on the tab, and it has no other way to learn
+        // it changed. No round trip; the notification carried the name.
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        try actions.append(arena.allocator(), .{ .windows = self.windows.items });
     }
 
     /// A window we were showing is gone.
@@ -6454,7 +6468,7 @@ test "a layout change keeps the window name" {
 /// land on top of it, rather than happening to stop short.
 const long_window_name = "a" ** 512;
 
-test "a window rename does not cost a round trip" {
+test "a window rename reaches the GUI without a round trip" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
@@ -6467,6 +6481,7 @@ test "a window rename does not cost a round trip" {
                 .id = 0,
                 .name = "a new name",
             } } },
+            .contains_tags = &.{.windows},
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqualStrings(
@@ -6474,10 +6489,29 @@ test "a window rename does not cost a round trip" {
                         v.windows.items[0].name,
                     );
 
-                    // Nothing asked, nothing queued: the notification
+                    // The GUI hears of it through the window list, which
+                    // carries the new name...
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqualStrings(
+                        "a new name",
+                        actions[0].windows[0].name,
+                    );
+
+                    // ...but nothing is asked or queued: the notification
                     // already carried everything a rename changes.
-                    try testing.expectEqual(0, actions.len);
                     try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // The same name again is tmux repeating itself, not news.
+        .{
+            .input = .{ .tmux = .{ .window_renamed = .{
+                .id = 0,
+                .name = "a new name",
+            } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
                 }
             }).check,
         },
