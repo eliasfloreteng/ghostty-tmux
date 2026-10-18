@@ -139,6 +139,15 @@ const Session = struct {
         /// A tmux.conf for the server, instead of none at all. Written
         /// next to the socket and removed with it.
         config: ?[]const u8 = null,
+
+        /// Before attaching, wait until `display-message -p -t target
+        /// format` prints `expect`. For state a command takes a moment
+        /// to reach, which the attach should see rather than race.
+        ready: ?struct {
+            target: []const u8,
+            format: []const u8,
+            expect: []const u8,
+        } = null,
     };
 
     fn startWith(
@@ -212,6 +221,23 @@ const Session = struct {
             });
             const out = try run(alloc, argv.items);
             alloc.free(out);
+        }
+
+        if (opts.ready) |ready| {
+            var rounds: usize = 0;
+            while (true) : (rounds += 1) {
+                if (rounds >= timeout_ms / poll_ms) {
+                    return error.TimedOutWaitingForTmux;
+                }
+
+                const out = try run(alloc, &.{
+                    "tmux",            "-f", "/dev/null", "-S",         socket,
+                    "display-message", "-p", "-t",        ready.target, ready.format,
+                });
+                defer alloc.free(out);
+                if (std.mem.eql(u8, std.mem.trim(u8, out, " \r\n"), ready.expect)) break;
+                try std.Io.sleep(io, .fromMilliseconds(poll_ms), .awake);
+            }
         }
 
         if (opts.min_history > 0) {
@@ -1569,6 +1595,52 @@ test "live: a split makes a second pane in the same window" {
     // opinion and not ours: two panes at the same y, different x.
     const layout = session.viewer.windows.items[0].layout;
     try testing.expect(layout.content == .horizontal);
+    try testing.expect(!session.exited);
+}
+
+test "live: a pane in the alternate screen keeps both screens" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // tmux has no "alternate screen capture". A plain capture-pane reads
+    // the grid on display, which here is the alternate screen, and `-a`
+    // reads the primary grid tmux put aside when 1049 came on.
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "printf 'under'; printf '\\033[?1049hon-alt'; sleep 60",
+        .{ .ready = .{
+            .target = ":0",
+            .format = "#{alternate_on}",
+            .expect = "1",
+        } },
+    );
+    defer session.deinit();
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return attached(v) and v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const pane = session.viewer.panes.get(0) orelse return error.NoSuchPane;
+    try testing.expectEqual(.alternate, pane.terminal.screens.active_key);
+
+    const text = try session.paneText(0);
+    defer alloc.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "on-alt") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "under") == null);
+
+    const primary = try pane.terminal.screens.get(.primary).?.dumpStringAlloc(
+        alloc,
+        .{ .active = .{} },
+    );
+    defer alloc.free(primary);
+    try testing.expect(std.mem.indexOf(u8, primary, "under") != null);
+    try testing.expect(std.mem.indexOf(u8, primary, "on-alt") == null);
     try testing.expect(!session.exited);
 }
 

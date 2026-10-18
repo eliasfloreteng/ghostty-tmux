@@ -107,24 +107,25 @@ const COMMAND_QUEUE_INITIAL = 8;
 ///                              │  panes. New panes trigger capture commands. │
 ///                              └─────────────────┬───────────────────────────┘
 ///                                                │
-///                    ┌───────────────────────────┴───────────────────────────┐
-///                    │                  For each new pane:                   │
-///                    ▼                                                       ▼
-///     ┌──────────────────────────┐                            ┌──────────────────────────┐
-///     │     pane_history         │                            │     pane_visible         │
-///     │     (primary screen)     │                            │     (primary screen)     │
-///     │                          │                            │                          │
-///     │  Capture scrollback      │                            │  Capture visible area    │
-///     │  history into terminal.  │                            │  into terminal.          │
-///     └──────────────────────────┘                            └──────────────────────────┘
-///                    │                                                       │
-///                    ▼                                                       ▼
-///     ┌──────────────────────────┐                            ┌──────────────────────────┐
-///     │     pane_history         │                            │     pane_visible         │
-///     │     (alternate screen)   │                            │     (alternate screen)   │
-///     └──────────────────────────┘                            └──────────────────────────┘
-///                    │                                                       │
-///                    └───────────────────────────┬───────────────────────────┘
+///                                                │  For each new pane
+///                                                ▼
+///                              ┌─────────────────────────────────────────────┐
+///                              │     pane_history                            │
+///                              │  Scrollback, always the primary screen's.   │
+///                              └─────────────────┬───────────────────────────┘
+///                                                ▼
+///                              ┌─────────────────────────────────────────────┐
+///                              │     pane_saved (capture-pane -a)            │
+///                              │  The primary grid tmux put aside while the  │
+///                              │  pane is in the alternate screen. Failing   │
+///                              │  means the pane is on its primary screen.   │
+///                              └─────────────────┬───────────────────────────┘
+///                                                ▼
+///                              ┌─────────────────────────────────────────────┐
+///                              │     pane_visible                            │
+///                              │  The grid on display, into whichever screen │
+///                              │  pane_saved said that is.                   │
+///                              └─────────────────┬───────────────────────────┘
 ///                                                ▼
 ///                              ┌─────────────────────────────────────────────┐
 ///                              │          pane_state                         │
@@ -595,6 +596,18 @@ pub const Viewer = struct {
             rows: usize,
         } = null,
 
+        /// Which of our screens tmux's visible grid is, as learned from
+        /// the saved-grid capture that precedes each visible capture.
+        ///
+        /// tmux keeps one grid per pane on display and, while the pane
+        /// is in the alternate screen, a copy of the primary one put
+        /// aside (`saved_grid`). A plain `capture-pane` reads the grid
+        /// on display, whichever screen that is, and `-a` reads the one
+        /// put aside, failing when there is none. So the saved-grid
+        /// reply tells us whether the visible reply after it belongs to
+        /// the alternate screen or the primary. See `paneCaptures`.
+        visible_screen: ScreenSet.Key = .primary,
+
         pub fn create(
             io: std.Io,
             alloc: Allocator,
@@ -620,6 +633,7 @@ pub const Viewer = struct {
             self.last_resize_request = null;
             self.last_resize_sent = null;
             self.stale_size = null;
+            self.visible_screen = .primary;
 
             return self;
         }
@@ -2174,14 +2188,42 @@ pub const Viewer = struct {
         );
         errdefer resume_cmd.deinit(self.alloc);
 
-        try self.queueCommands(&.{
-            resume_cmd,
-            .{ .pane_history = .{ .id = pane_id, .screen_key = .primary } },
-            .{ .pane_visible = .{ .id = pane_id, .screen_key = .primary } },
-            .{ .pane_history = .{ .id = pane_id, .screen_key = .alternate } },
-            .{ .pane_visible = .{ .id = pane_id, .screen_key = .alternate } },
-            .pane_state,
-        });
+        try self.queueCommands(&([_]Command{resume_cmd} ++
+            paneCaptures(pane_id) ++
+            [_]Command{.pane_state}));
+    }
+
+    /// The captures that read a pane's content from scratch, in the order
+    /// their replies have to be applied.
+    ///
+    /// tmux has one grid on display per pane plus, only while the pane
+    /// is in the alternate screen, the primary grid put aside
+    /// (`saved_grid`). `capture-pane` reads the grid on display and
+    /// `capture-pane -a` the one put aside. Neither is "the primary" or
+    /// "the alternate" screen as such:
+    ///
+    ///   - On the primary screen, the grid on display is the primary
+    ///     and `-a` fails with "no alternate screen".
+    ///   - On the alternate screen, the grid on display is the
+    ///     alternate and `-a` gives the primary.
+    ///
+    /// History only ever belongs to the primary screen. tmux stops
+    /// collecting it while the alternate screen is up, but keeps what
+    /// the primary had, and a history capture of the grid on display
+    /// returns that either way. The saved grid has no history: asked
+    /// for `-a -S - -E -1` tmux returns its first visible line instead.
+    ///
+    /// So: history, which always goes to the primary; then the saved
+    /// grid, whose success or failure says which screen is up; then the
+    /// grid on display, written to that screen. tmux runs commands that
+    /// arrive together back to back, without reading pane output in
+    /// between, so the screen cannot flip between the last two.
+    fn paneCaptures(pane_id: usize) [3]Command {
+        return .{
+            .{ .pane_history = pane_id },
+            .{ .pane_saved = pane_id },
+            .{ .pane_visible = pane_id },
+        };
     }
 
     /// Record a window's new name.
@@ -2277,12 +2319,7 @@ pub const Viewer = struct {
                 const pane_id: usize = kv.key_ptr.*;
                 if (self.panes.contains(pane_id)) continue;
                 added = true;
-                try self.queueCommands(&.{
-                    .{ .pane_history = .{ .id = pane_id, .screen_key = .primary } },
-                    .{ .pane_visible = .{ .id = pane_id, .screen_key = .primary } },
-                    .{ .pane_history = .{ .id = pane_id, .screen_key = .alternate } },
-                    .{ .pane_visible = .{ .id = pane_id, .screen_key = .alternate } },
-                });
+                try self.queueCommands(&paneCaptures(pane_id));
             }
 
             // If we added any panes, then we also want to resync the pane
@@ -2455,17 +2492,22 @@ pub const Viewer = struct {
                 content,
             ),
 
-            .pane_history => |cap| try self.receivedPaneHistory(
-                cap.screen_key,
-                cap.id,
-                content,
+            // These only fail for a pane that has gone, and the error
+            // text is not content.
+            .pane_history => |id| if (!is_err) {
+                try self.receivedPaneHistory(id, content);
+            },
+
+            // Failing is the answer here: no saved grid means the pane
+            // is on its primary screen.
+            .pane_saved => |id| try self.receivedPaneSaved(
+                id,
+                if (is_err) null else content,
             ),
 
-            .pane_visible => |cap| try self.receivedPaneVisible(
-                cap.screen_key,
-                cap.id,
-                content,
-            ),
+            .pane_visible => |id| if (!is_err) {
+                try self.receivedPaneVisible(id, content);
+            },
 
             .tmux_version => try self.receivedTmuxVersion(content),
         }
@@ -2693,7 +2735,6 @@ pub const Viewer = struct {
 
     fn receivedPaneHistory(
         self: *Viewer,
-        screen_key: ScreenSet.Key,
         id: usize,
         content: []const u8,
     ) !void {
@@ -2717,7 +2758,7 @@ pub const Viewer = struct {
         const buf = try self.alloc.alloc(u8, content.len);
         defer self.alloc.free(buf);
         try self.paneOps(pane, &.{
-            .{ .switch_screen = screen_key },
+            .{ .switch_screen = .primary },
             .{ .bytes = control.unescape(buf, content) },
             .scroll_into_history,
         });
@@ -2734,9 +2775,46 @@ pub const Viewer = struct {
         }
     }
 
+    /// The saved grid: the primary screen's content while the pane is
+    /// in the alternate screen, or null when tmux said there is none,
+    /// which means the pane is on its primary screen.
+    fn receivedPaneSaved(
+        self: *Viewer,
+        id: usize,
+        content: ?[]const u8,
+    ) !void {
+        const entry = self.panes.getEntry(id) orelse {
+            log.info("received pane saved grid for untracked pane id={}", .{id});
+            return;
+        };
+        const pane: *Pane = entry.value_ptr.*;
+
+        const saved = content orelse {
+            // tmux has no alternate screen to show us, so whatever ours
+            // holds is stale: a re-read can find a pane that has left
+            // the alternate screen since we last looked.
+            pane.visible_screen = .primary;
+            try self.paneOps(pane, &.{
+                .{ .switch_screen = .alternate },
+                .erase_and_home,
+            });
+            return;
+        };
+
+        pane.visible_screen = .alternate;
+        const buf = try self.alloc.alloc(u8, saved.len);
+        defer self.alloc.free(buf);
+        try self.paneOps(pane, &.{
+            .{ .switch_screen = .primary },
+            .erase_and_home,
+            .{ .bytes = control.unescape(buf, saved) },
+        });
+    }
+
+    /// The grid on display, for whichever screen the saved-grid capture
+    /// before it said that is.
     fn receivedPaneVisible(
         self: *Viewer,
-        screen_key: ScreenSet.Key,
         id: usize,
         content: []const u8,
     ) !void {
@@ -2746,6 +2824,7 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
+        const screen_key = pane.visible_screen;
 
         // Erase the active area and reset the cursor to the top-left
         // before writing the visible content.
@@ -3062,11 +3141,17 @@ const Command = union(enum) {
     /// List all windows so we can sync our window state.
     list_windows,
 
-    /// Capture history for the given pane ID.
-    pane_history: CapturePane,
+    /// Capture the given pane's history, which is always the primary
+    /// screen's. See `Viewer.paneCaptures` for how the three captures
+    /// fit together.
+    pane_history: usize,
 
-    /// Capture visible area for the given pane ID.
-    pane_visible: CapturePane,
+    /// Capture the given pane's saved grid: its primary screen while it
+    /// is in the alternate screen. Fails when it is not.
+    pane_saved: usize,
+
+    /// Capture the given pane's grid on display, whichever screen that is.
+    pane_visible: usize,
 
     /// Capture the pane terminal state as best we can. The pane ID(s)
     /// are part of the output so we can map it back to our panes.
@@ -3083,15 +3168,11 @@ const Command = union(enum) {
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
 
-    const CapturePane = struct {
-        id: usize,
-        screen_key: ScreenSet.Key,
-    };
-
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
             .list_windows,
             .pane_history,
+            .pane_saved,
             .pane_visible,
             .pane_state,
             .tmux_version,
@@ -3123,7 +3204,7 @@ const Command = union(enum) {
                 .{comptime Format.list_windows.comptimeFormat()},
             )),
 
-            .pane_history => |cap| try writer.print(
+            .pane_history => |id| try writer.print(
                 // -p = output to stdout instead of buffer
                 // -e = output escape sequences for SGR
                 // -C = escape non-printable bytes as octal. Mandatory
@@ -3131,32 +3212,30 @@ const Command = union(enum) {
                 //   block, and unlike %output tmux does not escape block
                 //   payloads, so a raw ESC would terminate the DCS that
                 //   carries control mode and drop us out of the session.
-                // -a = capture alternate screen (only valid for alternate)
-                // -q = quiet, don't error if alternate screen doesn't exist
+                // -q = quiet, don't error on a bad range
                 // -S - = start at the top of history ("-")
                 // -E -1 = end at the last line of history (1 before the
                 //   visible area is -1).
                 // -t %{d} = target a specific pane ID
-                "capture-pane -p -e -C -q {s}-S - -E -1 -t %{d}\n",
-                .{
-                    if (cap.screen_key == .alternate) "-a " else "",
-                    cap.id,
-                },
+                // (no -a: the saved grid has no history to capture)
+                "capture-pane -p -e -C -q -S - -E -1 -t %{d}\n",
+                .{id},
             ),
 
-            .pane_visible => |cap| try writer.print(
-                // -p = output to stdout instead of buffer
-                // -e = output escape sequences for SGR
-                // -C = escape non-printable bytes as octal (see above)
-                // -a = capture alternate screen (only valid for alternate)
-                // -q = quiet, don't error if alternate screen doesn't exist
-                // -t %{d} = target a specific pane ID
+            .pane_saved => |id| try writer.print(
+                // -a = the saved grid, which only exists while the pane
+                //   is in the alternate screen and holds the primary
+                // (no -q: "no alternate screen" is the answer we want)
+                // The rest as above.
+                "capture-pane -p -e -C -a -t %{d}\n",
+                .{id},
+            ),
+
+            .pane_visible => |id| try writer.print(
+                // The grid on display, as above.
                 // (no -S/-E = capture visible area only)
-                "capture-pane -p -e -C -q {s}-t %{d}\n",
-                .{
-                    if (cap.screen_key == .alternate) "-a " else "",
-                    cap.id,
-                },
+                "capture-pane -p -e -C -q -t %{d}\n",
+                .{id},
             ),
 
             .pane_state => try writer.writeAll(std.fmt.comptimePrint(
@@ -3451,16 +3530,16 @@ test "session changed resets state" {
                     try testing.expectEqual(0, v.panes.count());
                     // Version should still be preserved
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
-                    // The old session's eight captures and its pane
+                    // The old session's six captures and its pane
                     // state are still on their way.
-                    try testing.expectEqual(9, v.orphan_replies);
+                    try testing.expectEqual(7, v.orphan_replies);
                 }
             }).check,
         },
     });
 
     // Their replies are dropped rather than read as the new list.
-    for (0..9) |_| {
+    for (0..7) |_| {
         try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = "" } }).len);
     }
     try testing.expectEqual(0, viewer.orphan_replies);
@@ -3533,13 +3612,11 @@ test "initial flow" {
             .contains_tags = &.{.windows},
             .commands = &.{
                 "capture-pane -p -e -C -q -S - -E -1 -t %0",
+                "capture-pane -p -e -C -a -t %0",
                 "capture-pane -p -e -C -q -t %0",
-                "capture-pane -p -e -C -q -a -S - -E -1 -t %0",
-                "capture-pane -p -e -C -q -a -t %0",
                 "capture-pane -p -e -C -q -S - -E -1 -t %1",
+                "capture-pane -p -e -C -a -t %1",
                 "capture-pane -p -e -C -q -t %1",
-                "capture-pane -p -e -C -q -a -S - -E -1 -t %1",
-                "capture-pane -p -e -C -q -a -t %1",
                 "list-panes",
             },
         },
@@ -3574,13 +3651,13 @@ test "initial flow" {
                 }
             }).check,
         },
-        // The rest of the captures and the pane state.
+        // The rest of the captures and the pane state. Neither pane is
+        // in the alternate screen, so tmux has no saved grid for either
+        // and says so.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
-        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
-        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
-        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
-        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
@@ -3665,6 +3742,8 @@ test "capture replay decodes escaped escape sequences" {
                 }
             }).check,
         },
+        // No saved grid: the pane is on its primary screen.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
         // The visible response, as tmux escapes it under `-e -C`.
         .{
             .input = .{ .tmux = .{ .block_end = "\\033[31mRED" } },
@@ -3717,11 +3796,10 @@ test "layout change" {
                 }
             }).check,
         },
-        // Complete all capture-pane commands for pane 0 (primary and alternate)
-        // plus pane_state
+        // Complete the capture-pane commands for pane 0, on its primary
+        // screen, plus pane_state
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         // Now send a layout_change that splits into two panes
@@ -3741,8 +3819,8 @@ test "layout change" {
                     try testing.expectEqual(2, v.panes.count());
                     try testing.expect(v.panes.contains(0));
                     try testing.expect(v.panes.contains(2));
-                    // Commands should be queued for the new pane (4 capture-pane + 1 pane_state)
-                    try testing.expectEqual(5, v.command_queue.len());
+                    // Commands should be queued for the new pane (3 capture-pane + 1 pane_state)
+                    try testing.expectEqual(4, v.command_queue.len());
                 }
             }).check,
         },
@@ -3797,17 +3875,16 @@ test "layout_change does not wait for commands already in flight" {
             .contains_tags = &.{.windows},
             .commands = &.{
                 "capture-pane -p -e -C -q -S - -E -1 -t %2",
+                "capture-pane -p -e -C -a -t %2",
                 "capture-pane -p -e -C -q -t %2",
-                "capture-pane -p -e -C -q -a -S - -E -1 -t %2",
-                "capture-pane -p -e -C -q -a -t %2",
                 "list-panes",
             },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(2, v.panes.count());
-                    // The first pane's five and the new pane's five.
-                    try testing.expectEqual(10, v.command_queue.len());
-                    try testing.expectEqual(10, v.commands_sent);
+                    // The first pane's four and the new pane's four.
+                    try testing.expectEqual(8, v.command_queue.len());
+                    try testing.expectEqual(8, v.commands_sent);
                 }
             }).check,
         },
@@ -3844,10 +3921,10 @@ test "layout_change returns command when queue was empty" {
             } },
             .contains_tags = &.{ .windows, .command },
         },
-        // Complete all capture-pane commands for pane 0
+        // Complete the capture-pane commands for pane 0, which is on
+        // its primary screen and so has no saved grid
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         // Queue should now be empty
         .{
@@ -3909,10 +3986,10 @@ test "window_add queues list_windows when queue empty" {
             } },
             .contains_tags = &.{ .windows, .command },
         },
-        // Complete all capture-pane commands for pane 0
+        // Complete the capture-pane commands for pane 0, which is on
+        // its primary screen and so has no saved grid
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         // Queue should now be empty
         .{
@@ -3981,8 +4058,8 @@ test "window_add queues list_windows when queue not empty" {
             .commands = &.{"list-windows"},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    // Behind the five already in flight.
-                    try testing.expectEqual(6, v.command_queue.len());
+                    // Behind the four already in flight.
+                    try testing.expectEqual(5, v.command_queue.len());
                 }
             }).check,
         },
@@ -4046,7 +4123,10 @@ test "two pane flow with pane state" {
                 ,
             } },
         },
-        // capture-pane pane 0 primary visible
+        // capture-pane -a: pane 0 is on its primary screen, so there
+        // is no saved grid
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        // capture-pane pane 0 visible, which is the primary
         .{
             .input = .{ .tmux = .{
                 .block_end =
@@ -4077,10 +4157,6 @@ test "two pane flow with pane state" {
                 }
             }).check,
         },
-        // capture-pane pane 0 alternate history (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // capture-pane pane 0 alternate visible (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
         // capture-pane pane 4 primary history
         .{
             .input = .{ .tmux = .{
@@ -4089,7 +4165,10 @@ test "two pane flow with pane state" {
                 ,
             } },
         },
-        // capture-pane pane 4 primary visible
+        // capture-pane -a: pane 4 is on its primary screen, so there
+        // is no saved grid
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        // capture-pane pane 4 visible, which is the primary
         .{
             .input = .{ .tmux = .{
                 .block_end =
@@ -4120,10 +4199,6 @@ test "two pane flow with pane state" {
                 }
             }).check,
         },
-        // capture-pane pane 4 alternate history (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // capture-pane pane 4 alternate visible (empty)
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
         // list-panes output with terminal state
         .{
             .input = .{ .tmux = .{
@@ -4236,10 +4311,9 @@ test "pane state ignores out of bounds scroll region" {
             } },
             .contains_tags = &.{ .windows, .command },
         },
-        // capture-pane primary/alternate history/visible
+        // capture-pane history, saved grid (none) and visible
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         // list-panes with a scroll region bottom far past the screen
         .{
@@ -4306,30 +4380,35 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
         "$42 @0 1 80 24 d962,80x24,0,0,42 0 d962,80x24,0,0,42 %42\n" ++
         "%end 3 3 0\n" ++
 
-        // Primary screen history.
+        // History, which is always the primary screen's.
         "%begin 4 4 0\n" ++
         "%end 4 4 0\n" ++
 
-        // Primary screen visible contents.
-        "%begin 5 5 0\n" ++
-        "%end 5 5 0\n" ++
+        // `capture-pane -a`, the saved grid. tmux only has one while
+        // the pane is in the alternate screen, and it holds the
+        // *primary* screen, put aside. Without one, tmux errors.
+        (if (alternate_on)
+            "%begin 5 5 0\n" ++
+                "under\n" ++
+                "%end 5 5 0\n"
+        else
+            "%begin 5 5 0\n" ++
+                "no alternate screen\n" ++
+                "%error 5 5 0\n") ++
 
-        // Alternate screen history.
+        // Plain `capture-pane`, the grid on display: the alternate
+        // screen if the pane is in it, the primary otherwise.
         "%begin 6 6 0\n" ++
         "%end 6 6 0\n" ++
 
-        // Alternate screen visible contents.
-        "%begin 7 7 0\n" ++
-        "%end 7 7 0\n" ++
-
         // Cursor position and terminal modes.
-        "%begin 8 8 0\n" ++
+        "%begin 7 7 0\n" ++
         "%42;0;0;1;block;default;0;" ++
         (if (alternate_on) "1;0;0;" else "0;0;0;") ++
         "0;1;0;0;0;" ++
         "0;0;0;0;0;" ++
         "0;0;0;23;8,16,24,32,40,48,56,64,72\n" ++
-        "%end 8 8 0\n" ++
+        "%end 7 7 0\n" ++
 
         // Live output after initialization.
         "%output %42 hello\n";
@@ -4338,9 +4417,8 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
         "display-message",
         "list-windows",
         "capture-pane -p -e -C -q -S - -E -1 -t %42\n",
+        "capture-pane -p -e -C -a -t %42\n",
         "capture-pane -p -e -C -q -t %42\n",
-        "capture-pane -p -e -C -q -a -S - -E -1 -t %42\n",
-        "capture-pane -p -e -C -q -a -t %42\n",
         "list-panes",
     };
 
@@ -4415,7 +4493,11 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
     );
     defer testing.allocator.free(other_text);
 
-    try testing.expectEqualStrings("", other_text);
+    // In the alternate screen, the primary is what tmux had put aside.
+    try testing.expectEqualStrings(
+        if (alternate_on) "under" else "",
+        other_text,
+    );
 }
 
 test "write sends keys to the target pane" {
@@ -4508,16 +4590,15 @@ test "a write does not wait for commands in flight" {
             .commands = &.{"send-keys -H -t %0 78\n"},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(6, v.command_queue.len());
-                    try testing.expectEqual(6, v.commands_sent);
+                    try testing.expectEqual(5, v.command_queue.len());
+                    try testing.expectEqual(5, v.commands_sent);
                 }
             }).check,
         },
         // The replies then pair with their commands in order, the
         // write's last.
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
-        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
-        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{
@@ -4696,13 +4777,15 @@ fn expectMirrored(expected: *Terminal, actual: *Terminal) !void {
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(want, got);
     }
-    {
-        const want = try expected.screens.active.dumpStringAlloc(
+    // History is the primary screen's alone: the alternate screen has
+    // none, and asking it for its history is an error.
+    if (expected.screens.get(.primary)) |want_screen| {
+        const want = try want_screen.dumpStringAlloc(
             testing.allocator,
             .{ .history = .{} },
         );
         defer testing.allocator.free(want);
-        const got = try actual.screens.active.dumpStringAlloc(
+        const got = try actual.screens.get(.primary).?.dumpStringAlloc(
             testing.allocator,
             .{ .history = .{} },
         );
@@ -4722,6 +4805,26 @@ fn expectMirrored(expected: *Terminal, actual: *Terminal) !void {
             const got = got_screen.?;
             try testing.expectEqual(want.cursor.x, got.cursor.x);
             try testing.expectEqual(want.cursor.y, got.cursor.y);
+            try testing.expectEqual(
+                want.saved_cursor == null,
+                got.saved_cursor == null,
+            );
+            if (want.saved_cursor) |sc| {
+                try testing.expectEqual(sc.x, got.saved_cursor.?.x);
+                try testing.expectEqual(sc.y, got.saved_cursor.?.y);
+            }
+
+            const want_text = try want.dumpStringAlloc(
+                testing.allocator,
+                .{ .active = .{} },
+            );
+            defer testing.allocator.free(want_text);
+            const got_text = try got.dumpStringAlloc(
+                testing.allocator,
+                .{ .active = .{} },
+            );
+            defer testing.allocator.free(got_text);
+            try testing.expectEqualStrings(want_text, got_text);
             try testing.expectEqual(
                 want.cursor.cursor_style,
                 got.cursor.cursor_style,
@@ -4764,7 +4867,7 @@ fn expectMirrored(expected: *Terminal, actual: *Terminal) !void {
 
 /// Drive a viewer to steady state with a single 83x44 pane (id 0).
 fn testSinglePaneSteps() []const TestStep {
-    return &.{
+    return comptime &([_]TestStep{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .session_changed = .{
             .id = 1,
@@ -4776,11 +4879,22 @@ fn testSinglePaneSteps() []const TestStep {
             \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
             ,
         } } },
-        // Four capture-pane replies plus pane_state.
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // The three capture replies, for a blank pane on its primary
+        // screen. pane_state is left for the test to answer.
+    } ++ testPrimaryCaptureSteps("", ""));
+}
+
+/// The capture replies tmux sends for a pane on its primary screen:
+/// its history, the saved-grid capture failing because there is no
+/// alternate screen, then what is on display.
+fn testPrimaryCaptureSteps(
+    comptime history: []const u8,
+    comptime visible: []const u8,
+) [3]TestStep {
+    return .{
+        .{ .input = .{ .tmux = .{ .block_end = history } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = visible } } },
     };
 }
 
@@ -4793,7 +4907,7 @@ const two_panes_horizontal = "1c1b,83x44,0,0{41x44,0,0,0,41x44,42,0,1}";
 /// `horizontal` puts panes 0 and 1 (41x44 each) side by side. Either way
 /// the divider between them makes the window 83x44.
 fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
-    return &.{
+    return comptime &([_]TestStep{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .session_changed = .{
             .id = 1,
@@ -4803,16 +4917,9 @@ fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
         .{ .input = .{ .tmux = .{
             .block_end = "$0 @0 1 83 44 " ++ layout ++ " 0 " ++ layout ++ " %0",
         } } },
-        // Four capture-pane replies per pane.
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-    };
+        // The capture replies for each pane, both blank and on their
+        // primary screens.
+    } ++ testPrimaryCaptureSteps("", "") ++ testPrimaryCaptureSteps("", ""));
 }
 
 test "pane state maps tmux mouse flags to the right modes" {
@@ -4859,18 +4966,21 @@ test "attached sink mirrors the pane terminal" {
     try viewer.attachPane(0, mirror.sink());
 
     try testViewer(&viewer, &.{
-        // Primary history, then primary visible, then the alternate pair.
+        // The pane is in the alternate screen. History, which is the
+        // primary's; then the saved grid, which tmux only has while the
+        // alternate screen is up and which holds the primary; then the
+        // grid on display, which is the alternate.
         .{ .input = .{ .tmux = .{ .block_end = "scrollback line" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "visible line" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // pane_state: the pane is on the primary screen with its cursor
-        // at (7,2), and the *alternate* screen has a saved cursor at
-        // (5,3). That alternate cursor is the case a byte stream cannot
-        // express, since bytes only ever reach the active screen.
+        .{ .input = .{ .tmux = .{ .block_end = "primary line" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "alternate line" } } },
+        // pane_state: on the alternate screen with its cursor at (7,2).
+        // The alternate screen's "saved cursor" is where 1049 put the
+        // *primary* cursor aside, (5,3). That primary cursor is the
+        // case a byte stream cannot express, since bytes only ever
+        // reach the active screen.
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;7;2;1;bar;;;0;5;3;1;1;0;0;1;0;0;0;0;0;;;1;40;8,16,24
+            \\%0;7;2;1;bar;;;1;5;3;1;1;0;0;1;0;0;0;0;0;;;1;40;8,16,24
             ,
         } } },
         // Then live output, including a sequence split across two
@@ -4889,10 +4999,22 @@ test "attached sink mirrors the pane terminal" {
 
     // Pin the inactive screen's cursor to a distinctive value first, so
     // the mirror comparison below is not two zeroes agreeing.
-    try testing.expectEqual(.primary, pane.terminal.screens.active_key);
-    const alt = pane.terminal.screens.get(.alternate).?;
-    try testing.expectEqual(5, alt.cursor.x);
-    try testing.expectEqual(3, alt.cursor.y);
+    try testing.expectEqual(.alternate, pane.terminal.screens.active_key);
+    const primary = pane.terminal.screens.get(.primary).?;
+    try testing.expectEqual(5, primary.cursor.x);
+    try testing.expectEqual(3, primary.cursor.y);
+
+    // And it is where leaving 1049 will put the primary cursor back.
+    try testing.expectEqual(5, primary.saved_cursor.?.x);
+    try testing.expectEqual(3, primary.saved_cursor.?.y);
+    {
+        const str = try primary.dumpStringAlloc(
+            testing.allocator,
+            .{ .active = .{} },
+        );
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("primary line", str);
+    }
 
     try expectMirrored(&pane.terminal, &mirror.terminal);
 
@@ -5424,7 +5546,7 @@ const zoomed_to_pane_1 = "b7de,83x44,0,0,1";
 /// @0, @5 and @9, in that order. Real sessions look like this as soon as
 /// a window in the middle is killed.
 fn testThreeWindowSteps() []const TestStep {
-    return &.{
+    return comptime &([_]TestStep{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .session_changed = .{
             .id = 1,
@@ -5438,21 +5560,12 @@ fn testThreeWindowSteps() []const TestStep {
             \\$0 @9 0 83 44 b7df,83x44,0,0,2 0 b7df,83x44,0,0,2 %2
             ,
         } } },
-        // Four capture-pane replies per pane, plus pane_state.
+        // The capture replies for each pane, then pane_state.
+    } ++ testPrimaryCaptureSteps("", "") ++
+        testPrimaryCaptureSteps("", "") ++
+        testPrimaryCaptureSteps("", "") ++ [_]TestStep{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-    };
+    });
 }
 
 test "a window name cannot become a second command" {
@@ -6053,10 +6166,10 @@ test "a paused pane is resumed and re-read" {
             .contains_command = "refresh-client -A '%0:continue'\n",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    // Resume, then four captures and a pane state: what
+                    // Resume, then three captures and a pane state: what
                     // tmux discarded while paused is not coming back, so
                     // the pane has to be read again from scratch.
-                    try testing.expectEqual(6, v.command_queue.len());
+                    try testing.expectEqual(5, v.command_queue.len());
                 }
             }).check,
         },
@@ -6065,7 +6178,7 @@ test "a paused pane is resumed and re-read" {
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 9 } } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(6, v.command_queue.len());
+                    try testing.expectEqual(5, v.command_queue.len());
                 }
             }).check,
         },
@@ -6369,11 +6482,16 @@ test "pane state restores the active screen" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
-    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, testSinglePaneSteps()[0..4]);
     try testViewer(&viewer, &.{
-        // The last capture replayed was the alternate screen, so the
-        // active screen is left on alternate. pane_state says this pane
-        // is not in the alternate screen, so it has to switch back.
+        // The captures find the pane in the alternate screen, so the
+        // last one replayed, of the grid on display, leaves the active
+        // screen on alternate.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // By the time of pane_state the pane has left the alternate
+        // screen. pane_state is the later word, so it has to switch back.
         .{
             .input = .{ .tmux = .{
                 .block_end =

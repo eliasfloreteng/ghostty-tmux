@@ -252,13 +252,23 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) !void {
         // "default" or unknown: leave as-is
     }
 
-    // Set alternate screen saved cursor position
-    if (t.screens.get(.alternate)) |alt_screen| cursor: {
-        const alt_x = std.math.cast(
+    // The alternate screen's saved cursor is, despite its name, the
+    // primary screen's: tmux records where the primary cursor was when
+    // DECSET 1049 entered the alternate screen, and puts it back there
+    // when 1049 leaves (screen_alternate_on/off in tmux's screen.c).
+    // Only meaningful while the alternate screen is up: tmux never
+    // clears it, so on the primary screen it is whatever an earlier
+    // 1049 left behind, and MAX_INT if there was none.
+    //
+    // Ghostty keeps the same thing as the primary screen's saved cursor,
+    // which 1049 restores on the way out. The cursor itself is left
+    // where it was, which is where tmux saved it from.
+    if (data.alternate_on) if (t.screens.get(.primary)) |primary| cursor: {
+        const saved_x = std.math.cast(
             size.CellCountInt,
             data.alternate_saved_x,
         ) orelse break :cursor;
-        const alt_y = std.math.cast(
+        const saved_y = std.math.cast(
             size.CellCountInt,
             data.alternate_saved_y,
         ) orelse break :cursor;
@@ -266,11 +276,23 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) !void {
         // If our coordinates are outside our screen we ignore it.
         // tmux actually sends MAX_INT for when there isn't a set
         // cursor position, so this isn't theoretical.
-        if (alt_x >= alt_screen.pages.cols or
-            alt_y >= alt_screen.pages.rows) break :cursor;
+        if (saved_x >= primary.pages.cols or
+            saved_y >= primary.pages.rows) break :cursor;
 
-        alt_screen.cursorAbsolute(alt_x, alt_y);
-    }
+        primary.cursorAbsolute(saved_x, saved_y);
+        if (primary.saved_cursor) |*saved| {
+            saved.x = saved_x;
+            saved.y = saved_y;
+        } else primary.saved_cursor = .{
+            .x = saved_x,
+            .y = saved_y,
+            .style = .{},
+            .protected = false,
+            .pending_wrap = false,
+            .origin = false,
+            .charset = .{},
+        };
+    };
 
     // Set cursor visibility
     t.modes.set(.cursor_visible, data.cursor_flag);
