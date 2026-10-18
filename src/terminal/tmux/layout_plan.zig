@@ -174,7 +174,7 @@ fn testSet(alloc: Allocator, layout_str: []const u8) !*WindowSet {
     };
     defer window.deinit(alloc);
 
-    return try WindowSet.create(alloc, &.{window});
+    return try WindowSet.create(alloc, "", &.{window});
 }
 
 test "a single pane is the whole plan" {

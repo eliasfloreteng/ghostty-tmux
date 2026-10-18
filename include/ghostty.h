@@ -1007,9 +1007,15 @@ typedef struct {
 } ghostty_tmux_window_s;
 
 // apprt.action.TmuxWindows.C
+//
+// `session_name` is NUL terminated, never null, and owned by the action.
+// It is empty only when control mode has ended. An empty window list
+// with an empty name means the session is gone; with a name, the session
+// changed to that one and its windows follow in the next action.
 typedef struct {
   const ghostty_tmux_window_s* windows;
   size_t len;
+  const char* session_name;
 } ghostty_action_tmux_windows_s;
 
 // apprt.action.TmuxNotice.Kind

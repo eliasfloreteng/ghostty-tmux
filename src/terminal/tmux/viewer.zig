@@ -170,6 +170,11 @@ pub const Viewer = struct {
     /// The current session ID we're attached to.
     session_id: usize,
 
+    /// The current session's name, as tmux last reported it. Owned, and
+    /// empty only until the first `%session-changed`: tmux refuses an
+    /// empty session name.
+    session_name: []const u8 = "",
+
     /// The tmux server version string (e.g., "3.5a"). We capture this
     /// on startup because it will allow us to change behavior between
     /// versions as necessary.
@@ -743,7 +748,17 @@ pub const Viewer = struct {
         if (self.tmux_version.len > 0) {
             self.alloc.free(self.tmux_version);
         }
+        if (self.session_name.len > 0) {
+            self.alloc.free(self.session_name);
+        }
         self.action_arena.promote(self.alloc).deinit();
+    }
+
+    /// Remember the session's name, replacing the one we had.
+    fn setSessionName(self: *Viewer, name: []const u8) Allocator.Error!void {
+        const owned = try self.alloc.dupe(u8, name);
+        if (self.session_name.len > 0) self.alloc.free(self.session_name);
+        self.session_name = owned;
     }
 
     /// Send in an input event (such as a tmux protocol notification,
@@ -2040,6 +2055,10 @@ pub const Viewer = struct {
 
             .session_changed => |info| {
                 self.session_id = info.id;
+                self.setSessionName(info.name) catch {
+                    log.warn("failed to record the session name, becoming defunct", .{});
+                    return self.defunct();
+                };
 
                 var arena = self.action_arena.promote(self.alloc);
                 defer self.action_arena = arena.state;
@@ -2128,6 +2147,7 @@ pub const Viewer = struct {
                 self.sessionChanged(
                     &actions,
                     info.id,
+                    info.name,
                 ) catch {
                     log.warn("failed to handle session change, becoming defunct", .{});
                     return self.defunct();
@@ -2177,9 +2197,15 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
-            // Our session was renamed. Nothing shows the session name,
-            // so there is nothing to do but not treat it as unknown.
-            .session_renamed => {},
+            // A session was renamed. tmux tells every control client
+            // about every session, so most of these are not ours.
+            .session_renamed => |info| self.sessionRenamed(
+                &actions,
+                info.id,
+                info.name,
+            ) catch {
+                log.warn("failed to record a session rename", .{});
+            },
 
             // tmux moved a window's active pane, and the GUI follows.
             .window_pane_changed => |info| self.windowPaneChanged(
@@ -2540,6 +2566,7 @@ pub const Viewer = struct {
         self: *Viewer,
         actions: *std.ArrayList(Action),
         session_id: usize,
+        session_name: []const u8,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
         // Options carry over: they came from the user's config, not from
@@ -2571,6 +2598,10 @@ pub const Viewer = struct {
         // Transfer preserved version to replacement
         replacement.tmux_version = try replacement.alloc.dupe(u8, self.tmux_version);
 
+        // Before the swap, so the empty window list going out first
+        // already names the session it is the start of.
+        try replacement.setSessionName(session_name);
+
         // Save arena state back before swap
         replacement.action_arena = arena.state;
 
@@ -2583,6 +2614,23 @@ pub const Viewer = struct {
         self.session_id = session_id;
 
         assert(self.state == .command_queue);
+    }
+
+    /// A session was renamed. If it is ours, re-send the window list so
+    /// the GUI sees the new name: the name is a fact about the set.
+    fn sessionRenamed(
+        self: *Viewer,
+        actions: *std.ArrayList(Action),
+        session_id: usize,
+        name: []const u8,
+    ) Allocator.Error!void {
+        if (session_id != self.session_id) return;
+        if (std.mem.eql(u8, self.session_name, name)) return;
+        try self.setSessionName(name);
+
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        try actions.append(arena.allocator(), .{ .windows = self.windows.items });
     }
 
     fn receivedCommandOutput(
@@ -6451,6 +6499,65 @@ test "a window rename does not cost a round trip" {
     });
 }
 
+test "the session name follows tmux" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testing.expectEqualStrings("test", viewer.session_name);
+
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // tmux tells every control client about every session. Someone
+        // else's is nothing to us.
+        .{
+            .input = .{ .tmux = .{ .session_renamed = .{
+                .id = 7,
+                .name = "elsewhere",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expectEqualStrings("test", v.session_name);
+                }
+            }).check,
+        },
+        // Ours is re-sent with the window list, which is how the GUI
+        // learns of it, and costs no round trip.
+        .{
+            .input = .{ .tmux = .{ .session_renamed = .{
+                .id = 1,
+                .name = "renamed",
+            } } },
+            .contains_tags = &.{.windows},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqualStrings("renamed", v.session_name);
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqual(1, actions[0].windows.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // A session change names the new session before its windows
+        // arrive, so the empty list that starts it already says which.
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 2,
+                .name = "second",
+            } } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(2, v.session_id);
+                    try testing.expectEqualStrings("second", v.session_name);
+                }
+            }).check,
+        },
+    });
+}
+
 test "client size is reported to tmux once" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
@@ -6975,7 +7082,8 @@ test "notifications we do not act on change nothing" {
         .{ .pane_mode_changed = .{ .pane_id = 0 } },
         .{ .subscription_changed = .{ .name = "s", .value = "v" } },
         .{ .sessions_changed = {} },
-        .{ .session_renamed = .{ .id = 1, .name = "renamed" } },
+        // Another session's; ours is re-sent with the window list.
+        .{ .session_renamed = .{ .id = 3, .name = "renamed" } },
         .{ .client_detached = .{ .client = "/dev/ttys001" } },
         .{ .client_session_changed = .{
             .client = "/dev/ttys001",

@@ -1194,7 +1194,10 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .tmux_windows,
-                .{ .windows = windows.set.windows },
+                .{
+                    .session_name = windows.set.session_name,
+                    .windows = windows.set.windows,
+                },
             );
         },
 

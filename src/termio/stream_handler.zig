@@ -198,8 +198,10 @@ pub const StreamHandler = struct {
     }
 
     /// Hand the surface a snapshot of the session's windows.
+    /// `session_name` is empty when the session has ended.
     fn tmuxWindows(
         self: *StreamHandler,
+        session_name: []const u8,
         windows: []const terminal.tmux.Viewer.Window,
     ) void {
         if (comptime !tmux_enabled) return;
@@ -211,6 +213,7 @@ pub const StreamHandler = struct {
         // on a full mailbox.
         const set = terminal.tmux.WindowSet.create(
             self.alloc,
+            session_name,
             windows,
         ) catch |err| {
             log.warn("failed to snapshot tmux windows: {}", .{err});
@@ -674,7 +677,7 @@ pub const StreamHandler = struct {
                         // and is freed at the end of this block. The GUI
                         // is told the session has no windows any more,
                         // the same way a session change starts over.
-                        .exit => self.tmuxWindows(&.{}),
+                        .exit => self.tmuxWindows("", &.{}),
 
                         // The surface is on another thread, so the text
                         // is copied out of the viewer's buffers. Losing
@@ -715,7 +718,7 @@ pub const StreamHandler = struct {
                             // this action is emitted, so their replies
                             // arrive after we are attached.
                             self.tmuxAttachPanes(viewer);
-                            self.tmuxWindows(windows);
+                            self.tmuxWindows(viewer.session_name, windows);
                         },
                     }
                 }

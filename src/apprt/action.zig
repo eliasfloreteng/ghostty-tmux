@@ -1076,18 +1076,25 @@ pub const SearchTotal = struct {
 ///
 /// The windows are only valid for the duration of the action callback.
 pub const TmuxWindows = struct {
+    /// The session's name. Empty when control mode has ended, which is
+    /// also the only time a set with no windows means there is nothing
+    /// left: no windows and a name is the start of a session change, the
+    /// new session's windows following in the next action.
+    session_name: [:0]const u8,
     windows: []const terminal.tmux.WindowSet.Window,
 
     // Sync with: ghostty_action_tmux_windows_s
     pub const C = extern struct {
         windows: [*]const terminal.tmux.WindowSet.Window,
         len: usize,
+        session_name: [*:0]const u8,
     };
 
     pub fn cval(self: TmuxWindows) C {
         return .{
             .windows = self.windows.ptr,
             .len = self.windows.len,
+            .session_name = self.session_name.ptr,
         };
     }
 
