@@ -3144,7 +3144,18 @@ pub const Viewer = struct {
                         // it still in flight was computed against the old
                         // layout and must not complete a sibling's fresh
                         // set. See `Pane.stale_size` and `nextResize`.
-                        pane.stale_size = .{
+                        //
+                        // Unless this is tmux granting the size we last
+                        // asked for: the surface asked because it is
+                        // already that size, so it owes no report that
+                        // would clear the hold, and the hold would then
+                        // swallow the next honest request for the old
+                        // size -- however much later it comes.
+                        const granted = if (pane.last_resize_sent) |sent|
+                            sent.cols == cols and sent.rows == rows
+                        else
+                            false;
+                        pane.stale_size = if (granted) null else .{
                             .cols = pane.terminal.cols,
                             .rows = pane.terminal.rows,
                         };
@@ -5517,6 +5528,57 @@ test "a report from the layout tmux just replaced does not complete a set" {
                 "refresh-client -C @0:83x44\n",
                 "resize-pane -t %0 -x 40 -y 44\n",
                 "resize-pane -t %1 -x 42 -y 44\n",
+            },
+        },
+    });
+}
+
+test "a layout granting what a pane asked for leaves nothing stale" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+
+    // Exactly what the two reports below compose: 90x(25 + 30 + 1).
+    const granted = "aab4,90x56,0,0[90x25,0,0,0,90x30,0,26,1]";
+
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // The GUI grew the window, and both panes ask for more.
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 90, .rows = 25 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 90, .rows = 30 } },
+            .contains_command = "refresh-client -C @0:90x56\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // tmux gives the panes exactly what they asked for. Their
+        // surfaces are already that size, so they owe no report, and
+        // the sizes this layout replaced are nothing that can come back
+        // as an echo.
+        .{ .input = .{ .tmux = .{ .layout_change = .{
+            .window_id = 0,
+            .layout = granted,
+            .visible_layout = granted,
+            .raw_flags = "*",
+        } } } },
+
+        // Much later, the window goes back to the size it started at
+        // -- in a background tab, say, that the user switches to after
+        // the group was resized. That is a fresh request, not an echo,
+        // and holding it would leave tmux sizing this window wrong for
+        // as long as the GUI stays this size.
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 83, .rows = 20 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 83, .rows = 23 } },
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "resize-pane -t %0 -x 83 -y 20\n",
+                "resize-pane -t %1 -x 83 -y 23\n",
             },
         },
     });
