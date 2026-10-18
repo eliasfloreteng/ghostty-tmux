@@ -630,6 +630,7 @@ pub const StreamHandler = struct {
                         }
 
                         self.tmux_viewer = viewer;
+                        self.tmux_host.tmux_attached.store(true, .release);
                         break :tmux;
                     },
 
@@ -649,6 +650,7 @@ pub const StreamHandler = struct {
                         self.alloc.destroy(viewer);
                         self.tmux_viewer = null;
                     }
+                    self.tmux_host.tmux_attached.store(false, .release);
                 };
 
                 const viewer = self.tmux_viewer orelse {

@@ -909,22 +909,33 @@ fn queueIo(
     msg: termio.Message,
     mutex: termio.Termio.MutexState,
 ) void {
-    // In readonly mode, we don't allow any writes through to the pty.
-    if (self.readonly) {
-        switch (msg) {
-            .write_small,
-            .write_stable,
-            .write_alloc,
-            => {
+    switch (msg) {
+        .write_small,
+        .write_stable,
+        .write_alloc,
+        => {
+            // In readonly mode, we don't allow any writes through to
+            // the pty. While we host a tmux control mode session, tmux
+            // reads everything written to the pty as a command: a key
+            // typed here would run as one, and its reply would be taken
+            // for the answer to whatever the viewer asked next. The
+            // session's panes are where typing goes.
+            if (self.readonly or self.tmuxHosting()) {
                 msg.deinit();
                 return;
-            },
+            }
+        },
 
-            else => {},
-        }
+        else => {},
     }
 
     self.io.queueMessage(msg, mutex);
+}
+
+/// True while a tmux control mode session is attached through our pty.
+fn tmuxHosting(self: *const Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+    return self.io.tmux_attached.load(.acquire);
 }
 
 /// Forces the surface to render. This is useful for when the surface
@@ -2325,12 +2336,22 @@ fn tmuxZoom(self: *Surface) bool {
 /// Leave the tmux session this surface belongs to, if it belongs to one.
 ///
 /// The pane is only how we reach the session; detaching is not about it.
+/// That is also why the surface hosting the session can detach: it is
+/// the session's client, and the one place left to act from when every
+/// pane is in a window of its own.
 fn tmuxDetach(self: *Surface) bool {
     if (comptime !terminal.options.tmux_control_mode) return false;
 
-    const pane = self.tmuxPane() orelse return false;
-    defer pane.router.unref();
-    pane.router.detach();
+    if (self.tmuxPane()) |pane| {
+        defer pane.router.unref();
+        pane.router.detach();
+        return true;
+    }
+
+    if (!self.tmuxHosting()) return false;
+    const router = self.tmuxRouter() orelse return false;
+    defer router.unref();
+    router.detach();
     return true;
 }
 
@@ -6967,6 +6988,24 @@ test "queueIo frees allocated writes in readonly mode" {
 
     // queueIo must free allocated writes in read-only mode.
     const data = try testing.allocator.dupe(u8, "\x1b]lGhostty\x1b\\");
+    surface.queueIo(.{ .write_alloc = .{
+        .alloc = testing.allocator,
+        .data = data,
+    } }, .unlocked);
+}
+
+test "queueIo drops writes while hosting a tmux session" {
+    if (comptime !terminal.options.tmux_control_mode) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.readonly = false;
+    surface.io.tmux_attached = .init(true);
+
+    // Dropped, and freed: the testing allocator fails the test on a leak.
+    // Reaching the io mailbox instead would touch undefined memory.
+    const data = try testing.allocator.dupe(u8, "kill-server\n");
     surface.queueIo(.{ .write_alloc = .{
         .alloc = testing.allocator,
         .data = data,

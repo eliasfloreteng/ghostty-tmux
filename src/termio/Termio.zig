@@ -82,6 +82,21 @@ else
     .init(0)
 else {},
 
+/// Whether a tmux control mode session is attached through our pty,
+/// which makes this termio the session's host (the surface that ran
+/// `tmux -CC`). Set by the io thread when control mode starts and
+/// cleared when it ends; read by the main thread.
+///
+/// While it is set, whatever is written to the pty is read by tmux as a
+/// control mode command, so the surface must not write to it: see
+/// `Surface.queueIo`.
+tmux_attached: if (terminalpkg.options.tmux_control_mode)
+    std.atomic.Value(bool)
+else
+    void = if (terminalpkg.options.tmux_control_mode)
+    .init(false)
+else {},
+
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
