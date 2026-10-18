@@ -28,17 +28,29 @@ class TmuxWindowManager {
         let id: Int
     }
 
-    /// Weakly held: the user can close one of these windows themselves,
-    /// and we should not keep it alive or resurrect it.
-    private struct WeakController {
-        weak var value: TerminalController?
+    /// What we keep for each tmux window on screen.
+    private final class WindowEntry {
+        /// Weakly held: the user can close one of these windows
+        /// themselves, and we should not keep it alive or resurrect it.
+        weak var controller: TerminalController?
+
+        /// tmux's active pane in this window as of the last snapshot, so
+        /// a change can be told from tmux repeating itself.
+        var activePaneId: Int?
+
+        /// A pane to focus once the window is key. See `focus(_:in:)`.
+        weak var pendingFocus: Ghostty.SurfaceView?
+
+        init(controller: TerminalController) {
+            self.controller = controller
+        }
     }
 
     private struct WeakSurface {
         weak var value: Ghostty.SurfaceView?
     }
 
-    private var windows: [Key: WeakController] = [:]
+    private var windows: [Key: WindowEntry] = [:]
     private var panes: [Key: WeakSurface] = [:]
 
     init() {
@@ -46,6 +58,11 @@ class TmuxWindowManager {
             self,
             selector: #selector(ghosttyDidUpdateTmuxWindows(_:)),
             name: .ghosttyDidUpdateTmuxWindows,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidBecomeKey(_:)),
+            name: NSWindow.didBecomeKeyNotification,
             object: nil)
     }
 
@@ -64,7 +81,6 @@ class TmuxWindowManager {
         guard let hostSurface = hostView.surface else { return }
 
         let host = ObjectIdentifier(hostView)
-        let panesBefore = Set(panes.keys)
         var liveWindows: Set<Key> = []
         var livePanes: Set<Key> = []
 
@@ -105,7 +121,7 @@ class TmuxWindowManager {
             let tree = SplitTree<Ghostty.SurfaceView>(root: root, zoomed: zoomed)
             let key = Key(host: host, id: window.id)
 
-            if let controller = windows[key]?.value {
+            if let entry = windows[key], let controller = entry.controller {
                 // Only touch the window if the arrangement actually
                 // changed. tmux reports the layout on every notification,
                 // including ones that changed nothing, and reassigning the
@@ -119,10 +135,10 @@ class TmuxWindowManager {
                 if controller.surfaceTree.root != tree.root ||
                     controller.surfaceTree.zoomed != tree.zoomed {
                     controller.surfaceTree = tree
-                    keepFocusInWindow(window, of: controller, host: host)
+                    keepFocusInWindow(window, of: entry, host: host)
                 }
                 setTitle(controller, window.name)
-                focusNewPane(in: window, of: controller, host: host, seen: panesBefore)
+                followActivePane(window, of: entry, host: host)
                 continue
             }
 
@@ -149,7 +165,12 @@ class TmuxWindowManager {
                 parent: tabParent(action.windows, before: index, host: host))
             controller.isTmuxWindow = true
             setTitle(controller, window.name)
-            windows[key] = .init(value: controller)
+            let entry = WindowEntry(controller: controller)
+            windows[key] = entry
+
+            // Where the user left the session, rather than whichever pane
+            // AppKit happens to focus first.
+            followActivePane(window, of: entry, host: host)
         }
 
         prune(liveWindows: liveWindows, livePanes: livePanes, host: host)
@@ -176,7 +197,7 @@ class TmuxWindowManager {
         host: ObjectIdentifier
     ) {
         guard let active = windows.first(where: { $0.active }) else { return }
-        guard let controller = self.windows[Key(host: host, id: active.id)]?.value,
+        guard let controller = self.windows[Key(host: host, id: active.id)]?.controller,
               let window = controller.window else { return }
         guard let group = window.tabGroup else { return }
         guard group.selectedWindow !== window else { return }
@@ -192,27 +213,115 @@ class TmuxWindowManager {
     /// so nothing runs that logic and the window is left focused on a
     /// view that is no longer in it.
     ///
-    /// Which survivor gets it is the first pane tmux lists, not the
-    /// neighbour of the one that went. tmux knows which pane is active
-    /// and we do not ask yet; until we do, the distinction only shows up
-    /// with three panes or more, and having focus somewhere in the window
-    /// beats having it nowhere.
-    ///
-    /// Only for the key window, so a pane closing somewhere in the
-    /// background cannot pull the user out of what they are typing into.
+    /// The survivor is tmux's active pane, which is where tmux itself
+    /// moves to when a pane goes; the first pane listed only stands in
+    /// when tmux has not said.
     private func keepFocusInWindow(
         _ window: Ghostty.Action.TmuxWindows.Window,
-        of controller: TerminalController,
+        of entry: WindowEntry,
         host: ObjectIdentifier
     ) {
-        guard controller.window?.isKeyWindow ?? false else { return }
+        guard let controller = entry.controller else { return }
         if let focused = controller.focusedSurface,
            controller.surfaceTree.contains(focused) { return }
 
-        for node in window.nodes where node.kind == .pane {
-            guard let view = panes[Key(host: host, id: node.paneId)]?.value else { continue }
-            controller.focusSurface(view)
+        let candidates = [window.activePaneId].compactMap { $0 } +
+            window.nodes.filter { $0.kind == .pane }.map(\.paneId)
+        for paneId in candidates {
+            guard let view = panes[Key(host: host, id: paneId)]?.value,
+                  controller.surfaceTree.contains(view) else { continue }
+            focus(view, in: entry)
             return
+        }
+    }
+
+    /// Move focus to tmux's active pane when tmux moves it, or when the
+    /// window is new.
+    ///
+    /// tmux tracks an active pane per window, and it moves when anyone
+    /// moves it: another client, a binding typed in a pane, a split
+    /// (the new pane is made active), a pane closing. A repeat of the
+    /// same pane is not a move, and is left alone so the user can be
+    /// elsewhere in the window until tmux has heard about it; our own
+    /// focus changes are told to tmux, and the core does not echo them.
+    private func followActivePane(
+        _ window: Ghostty.Action.TmuxWindows.Window,
+        of entry: WindowEntry,
+        host: ObjectIdentifier
+    ) {
+        let previous = entry.activePaneId
+        entry.activePaneId = window.activePaneId
+        guard let paneId = window.activePaneId, paneId != previous else { return }
+        guard let view = panes[Key(host: host, id: paneId)]?.value else { return }
+        focus(view, in: entry)
+    }
+
+    /// Focus a pane of a tmux window, now if the window is key and
+    /// otherwise once it becomes key.
+    ///
+    /// Waiting matters. A surface reports focus to the core as soon as it
+    /// becomes first responder, key window or not, and focusing a tmux
+    /// pane selects its window in tmux as well. Doing that in a
+    /// background tab would make it tmux's current window, which we then
+    /// follow by bringing the tab forward: a pane moving in another
+    /// window would pull the user over to it. That includes a window
+    /// that was key when this was asked and is not any more by the time
+    /// the view is in it, which is every tab but the last when several
+    /// are created together.
+    private func focus(_ view: Ghostty.SurfaceView, in entry: WindowEntry) {
+        entry.pendingFocus = view
+        DispatchQueue.main.async { [weak self, weak entry] in
+            guard let self, let entry else { return }
+            self.applyPendingFocus(entry)
+        }
+    }
+
+    private func applyPendingFocus(_ entry: WindowEntry, attempt: Int = 0) {
+        guard let view = entry.pendingFocus, let controller = entry.controller else { return }
+        guard controller.surfaceTree.contains(view) else {
+            entry.pendingFocus = nil
+            return
+        }
+
+        // Not key: it stays pending until windowDidBecomeKey.
+        guard let window = controller.window, window.isKeyWindow else { return }
+
+        // A tree that was only just assigned is not in the window until
+        // SwiftUI has laid it out.
+        guard view.window === window else {
+            guard attempt < 10 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak entry] in
+                guard let self, let entry else { return }
+                self.applyPendingFocus(entry, attempt: attempt + 1)
+            }
+            return
+        }
+
+        entry.pendingFocus = nil
+        guard window.firstResponder !== view else { return }
+        window.makeFirstResponder(view)
+    }
+
+    /// Apply a focus change that was waiting for its window to be key.
+    @objc private func windowDidBecomeKey(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        guard let entry = windows.values.first(where: { $0.controller?.window === window }),
+              entry.pendingFocus != nil else { return }
+
+        // A click in the window is the user choosing where to be, and it
+        // is what made the window key. tmux hears about that choice as
+        // soon as the click lands, so it wins over what tmux said before.
+        if let event = NSApp.currentEvent,
+           [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type) {
+            entry.pendingFocus = nil
+            return
+        }
+
+        // After the controller's own handling of becoming key, which may
+        // put focus back on whatever the window last had.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak entry] in
+            guard let self, let entry else { return }
+            self.applyPendingFocus(entry)
         }
     }
 
@@ -274,36 +383,9 @@ class TmuxWindowManager {
     }
 
     private func liveWindow(id: Int, host: ObjectIdentifier) -> NSWindow? {
-        guard let window = windows[Key(host: host, id: id)]?.value?.window,
+        guard let window = windows[Key(host: host, id: id)]?.controller?.window,
               window.isVisible else { return nil }
         return window
-    }
-
-    /// Move focus to a pane that has just appeared in a window that was
-    /// already on screen.
-    ///
-    /// That is what a split is from here: tmux answers `split-window`
-    /// with a layout, and the pane arrives with everything else. A local
-    /// split leaves the new surface focused, so this one should too.
-    ///
-    /// Only when the window is the key one. tmux tells every client about
-    /// every change, so without that a split someone else made in another
-    /// window would pull the user out of what they were typing into.
-    private func focusNewPane(
-        in window: Ghostty.Action.TmuxWindows.Window,
-        of controller: TerminalController,
-        host: ObjectIdentifier,
-        seen: Set<Key>
-    ) {
-        guard controller.window?.isKeyWindow ?? false else { return }
-
-        for node in window.nodes where node.kind == .pane {
-            let key = Key(host: host, id: node.paneId)
-            guard !seen.contains(key) else { continue }
-            guard let view = panes[key]?.value else { continue }
-            controller.focusSurface(view)
-            return
-        }
     }
 
     /// Show the tmux window's name as the window title.
@@ -333,7 +415,7 @@ class TmuxWindowManager {
             if liveWindows.contains(key) {
                 // Drop entries whose window the user closed themselves, so
                 // a later layout can build a fresh one.
-                if entry.value == nil { windows.removeValue(forKey: key) }
+                if entry.controller == nil { windows.removeValue(forKey: key) }
                 continue
             }
 
@@ -342,7 +424,7 @@ class TmuxWindowManager {
             // so closing one tmux window would have closed every other
             // one along with it. Nothing is registered for undo: a tmux
             // window has no undo manager (see `isTmuxWindow`).
-            entry.value?.closeTabImmediately()
+            entry.controller?.closeTabImmediately()
             windows.removeValue(forKey: key)
         }
 

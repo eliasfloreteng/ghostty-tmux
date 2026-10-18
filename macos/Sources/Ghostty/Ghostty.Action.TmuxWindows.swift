@@ -29,6 +29,10 @@ extension Ghostty.Action {
             /// is. Every other pane in `nodes` still exists; zoom only
             /// decides what is rendered.
             let zoomedPaneId: Int?
+
+            /// tmux's active pane in this window, if it is known. Focus
+            /// starts here and follows it when it changes.
+            let activePaneId: Int?
             let nodes: [Node]
 
             /// The first pane in tree order. Children of a split are
@@ -113,6 +117,7 @@ extension Ghostty.Action {
                     width: cWindow.width,
                     height: cWindow.height,
                     zoomedPaneId: cWindow.zoomed ? cWindow.zoomed_pane_id : nil,
+                    activePaneId: cWindow.has_active_pane ? cWindow.active_pane_id : nil,
                     nodes: nodes)
             }
         }
