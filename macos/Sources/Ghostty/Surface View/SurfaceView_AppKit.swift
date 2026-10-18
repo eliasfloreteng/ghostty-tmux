@@ -219,6 +219,29 @@ extension Ghostty {
         // by the user, this is set to the prior value (which may be empty, but non-nil).
         private var titleFromTerminal: String?
 
+        // The terminal's title from before this surface started hosting a
+        // tmux session, to go back to when it stops.
+        private var titleBeforeTmux: String?
+
+        // While hosting a tmux session, the surface is titled after it.
+        // Nothing else would change the title in the meantime: whatever
+        // tmux says is control mode, so no title escape reaches us.
+        //
+        // Through setTitle, so a title the user set by hand still wins and
+        // is only told what the terminal's title is now.
+        override var hostedTmuxSession: String? {
+            didSet {
+                guard hostedTmuxSession != oldValue else { return }
+                if let session = hostedTmuxSession {
+                    if oldValue == nil { titleBeforeTmux = titleFromTerminal ?? title }
+                    setTitle(session.isEmpty ? "tmux" : "tmux: \(session)")
+                } else if let previous = titleBeforeTmux {
+                    titleBeforeTmux = nil
+                    setTitle(previous)
+                }
+            }
+        }
+
         // The cached contents of the screen.
         private(set) var cachedScreenContents: CachedValue<String>
         private(set) var cachedVisibleContents: CachedValue<String>
@@ -1711,6 +1734,16 @@ extension Ghostty {
         @IBAction func findHide(_ sender: Any?) {
             guard let surface = self.surface else { return }
             let action = "end_search"
+            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
+            }
+        }
+
+        /// Leave the tmux session this surface is a pane or the host of.
+        /// The session carries on without us.
+        @IBAction func tmuxDetach(_ sender: Any?) {
+            guard let surface = self.surface else { return }
+            let action = "tmux_detach"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
                 AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }

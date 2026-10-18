@@ -55,6 +55,11 @@ extension Ghostty {
         /// A message sent from `ghostty_surface_t` when a child process exited
         @Published private(set) var childExitedMessage: ChildExitedMessage?
 
+        /// The tmux control mode session this surface is the host of,
+        /// i.e. the one it ran `tmux -CC` for, while it is attached. Nil
+        /// otherwise. An unnamed session is an empty string.
+        @Published var hostedTmuxSession: String?
+
         var surface: ghostty_surface_t? {
             nil
         }

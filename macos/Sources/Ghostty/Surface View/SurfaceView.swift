@@ -139,6 +139,12 @@ extension Ghostty {
                 // Show a highlight effect when this surface needs attention
                 HighlightOverlay(highlighted: surfaceView.highlighted)
 
+                // A surface hosting a tmux session says so, in place of a
+                // terminal that nothing can be typed into.
+                if let session = surfaceView.hostedTmuxSession {
+                    TmuxHostOverlay(surfaceView: surfaceView, session: session)
+                }
+
                 // If our surface is not healthy, then we render an error view over it.
                 if !surfaceView.healthy {
                     Rectangle().fill(ghostty.config.backgroundColor)

@@ -41,6 +41,9 @@ class TmuxWindowManager {
         /// A pane to focus once the window is key. See `focus(_:in:)`.
         weak var pendingFocus: Ghostty.SurfaceView?
 
+        /// Whether tmux is on this window, as of the last snapshot.
+        var isActive: Bool = false
+
         init(controller: TerminalController) {
             self.controller = controller
         }
@@ -90,7 +93,7 @@ class TmuxWindowManager {
         // Before anything that needs the host to still be alive: a
         // session ending is often why it is not.
         if action.windows.isEmpty {
-            sessionEmptied(hostView, ended: action.sessionName.isEmpty)
+            sessionEmptied(hostView, sessionName: action.sessionName)
             return
         }
 
@@ -156,6 +159,7 @@ class TmuxWindowManager {
                     keepFocusInWindow(window, of: entry, host: host)
                 }
                 setTitle(controller, window.name)
+                entry.isActive = window.active
                 followActivePane(window, of: entry, host: host)
                 continue
             }
@@ -184,6 +188,7 @@ class TmuxWindowManager {
             controller.isTmuxWindow = true
             setTitle(controller, window.name)
             let entry = WindowEntry(controller: controller)
+            entry.isActive = window.active
             windows[key] = entry
 
             // Where the user left the session, rather than whichever pane
@@ -193,6 +198,7 @@ class TmuxWindowManager {
 
         prune(liveWindows: liveWindows, livePanes: livePanes, host: host)
         selectActiveWindow(action.windows, host: host)
+        setHostedSession(hostView, action.sessionName)
 
         // The session is still going, so whatever closed was not it.
         closedWhileKey.remove(host)
@@ -212,7 +218,8 @@ class TmuxWindowManager {
     /// whatever window happens to be next. A session change instead
     /// opens the new session's windows straight away, which is where
     /// they should be.
-    private func sessionEmptied(_ hostView: Ghostty.SurfaceView, ended: Bool) {
+    private func sessionEmptied(_ hostView: Ghostty.SurfaceView, sessionName: String) {
+        let ended = sessionName.isEmpty
         let host = ObjectIdentifier(hostView)
 
         // The panes close themselves when the session ends, and that can
@@ -223,10 +230,27 @@ class TmuxWindowManager {
 
         prune(liveWindows: [], livePanes: [], host: host)
         closedWhileKey.remove(host)
+        setHostedSession(hostView, ended ? nil : sessionName)
 
         guard ended, wasInSession else { return }
         guard let controller = hostView.window?.windowController as? BaseTerminalController else { return }
         controller.focusSurface(hostView)
+    }
+
+    /// Tell the host which session it is hosting, or that it is not any
+    /// more. It shows that in place of its terminal.
+    private func setHostedSession(_ hostView: Ghostty.SurfaceView, _ name: String?) {
+        if hostView.hostedTmuxSession != name { hostView.hostedTmuxSession = name }
+    }
+
+    /// Bring the session hosted by `hostView` forward: the window tmux is
+    /// on, or failing that any of the session's windows.
+    func showWindows(hostedBy hostView: Ghostty.SurfaceView) {
+        let host = ObjectIdentifier(hostView)
+        let candidates = windows.filter { $0.key.host == host }
+        let entry = candidates.first { $0.value.isActive }?.value ?? candidates.first?.value
+        guard let window = entry?.controller?.window else { return }
+        window.makeKeyAndOrderFront(nil)
     }
 
     /// Bring forward the tab for the window tmux is currently on.
