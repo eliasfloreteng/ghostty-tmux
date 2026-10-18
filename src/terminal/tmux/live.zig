@@ -1137,6 +1137,136 @@ test "live: a paused pane is resumed and re-read" {
     try testing.expect(!session.exited);
 }
 
+/// A session whose one pane copies its input, byte for byte, into a file
+/// the test can read: a raw-mode `cat`, so the tty changes nothing.
+/// With `bracketed`, the pane asks for bracketed paste first, and the
+/// session attaches only once it has, so the request is something tmux
+/// saw and we never did.
+const PasteTarget = struct {
+    session: Session,
+    path: []u8,
+
+    fn start(alloc: Allocator, bracketed: bool) !PasteTarget {
+        const out = try run(alloc, &.{ "mktemp", "-t", "ghostty-tmux-paste" });
+        defer alloc.free(out);
+        const path = try alloc.dupe(u8, std.mem.trim(u8, out, " \r\n"));
+        errdefer alloc.free(path);
+
+        const command = try std.fmt.allocPrint(
+            alloc,
+            "{s}stty raw -echo; exec cat > '{s}'",
+            .{ if (bracketed) "printf '\\033[?2004h'; " else "", path },
+        );
+        defer alloc.free(command);
+
+        var session = try Session.startWith(alloc, testing.io, 80, 24, command, .{
+            .ready = .{
+                .target = ":0",
+                .format = "#{pane_current_command}",
+                .expect = "cat",
+            },
+        });
+        errdefer session.deinit();
+        try session.waitFor(attached);
+
+        return .{ .session = session, .path = path };
+    }
+
+    fn deinit(self: *PasteTarget) void {
+        const alloc = self.session.alloc;
+        self.session.deinit();
+        if (run(alloc, &.{ "rm", "-f", self.path })) |out| alloc.free(out) else |_| {}
+        alloc.free(self.path);
+    }
+
+    /// Pump until the pane has received exactly `expected`, or fail
+    /// with what it did receive.
+    fn expectReceived(self: *PasteTarget, expected: []const u8) !void {
+        const alloc = self.session.alloc;
+        var rounds: usize = 0;
+        while (rounds < timeout_ms / poll_ms) : (rounds += 1) {
+            _ = try self.session.pump();
+            const got = try run(alloc, &.{ "cat", self.path });
+            defer alloc.free(got);
+            if (got.len < expected.len) continue;
+            if (!std.mem.eql(u8, got, expected)) {
+                log.err("pane received {d} bytes: {f}", .{
+                    got.len,
+                    std.zig.fmtString(got[0..@min(got.len, 512)]),
+                });
+                return error.TestUnexpectedResult;
+            }
+            return;
+        }
+        return error.TimedOutWaitingForTmux;
+    }
+};
+
+test "live: a paste into a program that asked for bracketed paste is bracketed" {
+    if (!enabled()) return error.SkipZigTest;
+
+    var target = try PasteTarget.start(testing.allocator, true);
+    defer target.deinit();
+
+    // The program asked before we attached, and tmux has no format for
+    // it, so our terminal does not know. This is the case a paste
+    // framed by our own idea of the mode gets wrong.
+    {
+        const pane = target.session.viewer.panes.get(0) orelse
+            return error.NoSuchPane;
+        try testing.expect(!pane.terminal.modes.get(.bracketed_paste));
+    }
+
+    try target.session.input(.{ .paste = .{
+        .pane_id = 0,
+        .data = "if x:\r    y\r",
+    } });
+    try target.expectReceived("\x1b[200~if x:\r    y\r\x1b[201~");
+    try testing.expect(!target.session.exited);
+}
+
+test "live: a paste into a program that did not ask is not bracketed" {
+    if (!enabled()) return error.SkipZigTest;
+
+    var target = try PasteTarget.start(testing.allocator, false);
+    defer target.deinit();
+
+    // And it lands between the keys typed either side of it, in order:
+    // the paste and the keys are separate commands in the same queue.
+    try target.session.input(.{ .write = .{ .pane_id = 0, .data = "before " } });
+    try target.session.input(.{ .paste = .{
+        .pane_id = 0,
+        .data = "-pasted \"$HOME\" #{pane_id} \\ \xc3\xa9\r",
+    } });
+    try target.session.input(.{ .write = .{ .pane_id = 0, .data = " after" } });
+    try target.expectReceived(
+        "before -pasted \"$HOME\" #{pane_id} \\ \xc3\xa9\r after",
+    );
+    try testing.expect(!target.session.exited);
+}
+
+test "live: a large paste through a paste buffer arrives whole and in order" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var target = try PasteTarget.start(alloc, false);
+    defer target.deinit();
+
+    // About 200KB of numbered lines, each with a two-byte character in
+    // it, so that the chunks the paste is set in split some of them.
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(alloc);
+    var i: usize = 0;
+    while (data.items.len < 200 * 1024) : (i += 1) {
+        try data.print(alloc, "line-{d:0>6} \xc3\xa9\r", .{i});
+    }
+    try testing.expect(data.items.len > 4 * Viewer.max_set_buffer_bytes);
+
+    try target.session.input(.{ .paste = .{ .pane_id = 0, .data = data.items } });
+    try target.expectReceived(data.items);
+    try testing.expect(!target.session.exited);
+}
+
 test "live: window names arrive and follow renames" {
     if (!enabled()) return error.SkipZigTest;
 

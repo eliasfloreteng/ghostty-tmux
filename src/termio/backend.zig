@@ -97,6 +97,37 @@ pub const Backend = union(Kind) {
         }
     }
 
+    /// Whether pastes go to this backend as `termio.Message.paste`, for
+    /// it to frame, rather than framed by the surface and written.
+    ///
+    /// A pty has no notion of a paste: the program sees bytes, so the
+    /// surface frames them itself from the terminal's bracketed paste
+    /// mode. A tmux pane's program is on the tmux server, and our
+    /// terminal's copy of that mode can be wrong (tmux cannot report it,
+    /// so one set before we attached is unknown to us). tmux knows it,
+    /// and frames a paste correctly if it is told it is one.
+    pub fn pastes(self: *const Backend) bool {
+        return switch (self.*) {
+            .exec => false,
+            .tmux => true,
+        };
+    }
+
+    pub fn queuePaste(
+        self: *Backend,
+        alloc: Allocator,
+        td: *termio.Termio.ThreadData,
+        data: []const u8,
+        linefeed: bool,
+    ) !void {
+        switch (self.*) {
+            // Never sent one: see `pastes`. Were it sent one, the text
+            // is still what was pasted, so write it rather than lose it.
+            .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
+            .tmux => |*t| try t.queuePaste(alloc, td, data, linefeed),
+        }
+    }
+
     pub fn childExitedAbnormally(
         self: *Backend,
         gpa: Allocator,

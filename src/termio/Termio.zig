@@ -452,6 +452,7 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
 /// router guarantees we are not called after `detachHost` returns.
 pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .write = tmuxHostWrite,
+    .paste = tmuxHostPaste,
     .resize = tmuxHostResize,
     .kill = tmuxHostKill,
     .newWindow = tmuxHostNewWindow,
@@ -497,6 +498,11 @@ fn tmuxHostInput(self: *Termio, input: terminalpkg.tmux.Viewer.Input) void {
 fn tmuxHostWrite(ctx: *anyopaque, pane_id: usize, data: []const u8) void {
     const self: *Termio = @ptrCast(@alignCast(ctx));
     self.tmuxHostInput(.{ .write = .{ .pane_id = pane_id, .data = data } });
+}
+
+fn tmuxHostPaste(ctx: *anyopaque, pane_id: usize, data: []const u8) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .paste = .{ .pane_id = pane_id, .data = data } });
 }
 
 fn tmuxHostResize(
@@ -707,6 +713,17 @@ pub inline fn queueWrite(
     linefeed: bool,
 ) !void {
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
+}
+
+/// Deliver a paste to a backend that frames pastes itself. See
+/// `termio.Message.paste`.
+pub inline fn queuePaste(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+    linefeed: bool,
+) !void {
+    try self.backend.queuePaste(self.alloc, td, data, linefeed);
 }
 
 /// Update the configuration.

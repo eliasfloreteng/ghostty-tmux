@@ -307,6 +307,7 @@ pub const StreamHandler = struct {
             .write_small,
             .write_stable,
             .write_alloc,
+            .paste,
             .size_report,
             .color_scheme_report,
             .visibility_report,

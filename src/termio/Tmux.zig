@@ -113,6 +113,20 @@ pub fn focusGained(
     // Exec uses this to poll the pty's termios for password prompts,
     // which needs a pty. The focus escape sequences themselves are
     // emitted above the backend.
+    //
+    // Those go out as keys, by our terminal's focus reporting mode
+    // (1004), which has the same gap as bracketed paste: tmux has no
+    // format for it, so a program that turned it on before we attached
+    // gets no focus events from us until it turns it on again. Unlike a
+    // paste there is nothing to hand tmux instead. tmux sends focus
+    // events itself, by the mode it does know, but only as its own
+    // active pane changes and only with its `focus-events` option on:
+    // a control client counts as focused for good (it has no tty to
+    // report focus, and no client flag or command sets it), so ghostty
+    // as a whole losing focus is something tmux cannot be told. With
+    // that option on, a pane switch reaches the program twice, once
+    // from tmux and once from us, which programs take in their stride:
+    // a focus event says what the focus is, not that it changed.
 
     // Tell tmux which pane the user is in, so that anything it does with
     // its own notion of the active pane -- a `split-window` typed in
@@ -166,6 +180,36 @@ pub fn queueWrite(
         i = chunk.next;
         self.router.writeInput(self.pane_id, buf[0..chunk.len]);
     }
+}
+
+/// Deliver a paste. It goes to tmux as a paste rather than as keys, so
+/// that tmux frames it if the pane's program asked for bracketed paste:
+/// tmux knows that and we may not. See `Viewer.nextPaste`.
+pub fn queuePaste(
+    self: *Tmux,
+    alloc: Allocator,
+    td: *termio.Termio.ThreadData,
+    data: []const u8,
+    linefeed: bool,
+) !void {
+    _ = td;
+
+    // One paste has to stay one paste, so linefeed mode expands it into
+    // a single buffer rather than in chunks the way `queueWrite` does.
+    if (!linefeed or std.mem.indexOfScalar(u8, data, '\r') == null) {
+        self.router.writePaste(self.pane_id, data);
+        return;
+    }
+
+    // One byte over what the expansion needs, because `expandLinefeed`
+    // only copies a byte while there is room for two.
+    const crs = std.mem.count(u8, data, "\r");
+    const buf = try alloc.alloc(u8, data.len + crs + 1);
+    defer alloc.free(buf);
+    const out = expandLinefeed(data, 0, buf);
+    assert(out.next == data.len);
+    assert(out.len == data.len + crs);
+    self.router.writePaste(self.pane_id, buf[0..out.len]);
 }
 
 /// Copy from `data[start]` into `out`, turning each carriage return into

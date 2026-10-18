@@ -6571,6 +6571,29 @@ fn completeClipboardPaste(
         break :encode_opts opts;
     };
 
+    // A backend that frames pastes itself gets the text as a paste,
+    // encoded as for an unbracketed one: unsafe bytes replaced and
+    // newlines turned into carriage returns, as for any paste, but no
+    // frame. Whether there is to be one is the backend's call, because
+    // our terminal's bracketed paste mode may not be the program's. See
+    // `termio.Backend.pastes`.
+    //
+    // The safety check above went by our terminal's mode all the same.
+    // It is the best we know, and where it is wrong it is wrong in the
+    // safe direction: a mode set before tmux attached us is one we have
+    // not seen, so we ask about a paste that will in fact be framed.
+    if (self.io.backend.pastes()) {
+        const buf: []u8 = try self.alloc.dupe(u8, data);
+        errdefer self.alloc.free(buf);
+        const vecs = input.paste.encode(buf, .{ .bracketed = false });
+        assert(vecs[0].len == 0 and vecs[2].len == 0);
+        self.queueIo(.{ .paste = .{
+            .alloc = self.alloc,
+            .data = buf,
+        } }, .unlocked);
+        return;
+    }
+
     // Encode the data. In most cases this doesn't require any
     // copies, so we optimize for that case.
     var data_duped: ?[]u8 = null;

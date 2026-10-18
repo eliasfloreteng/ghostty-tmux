@@ -216,6 +216,14 @@ pub const Viewer = struct {
     /// 0 for tmux's own behaviour. See `Options.pause_after`.
     pause_after: u32 = 0,
 
+    /// The tmux paste buffer our pastes go through. See `nextPaste`.
+    ///
+    /// Random per viewer because buffers belong to the server, not to us:
+    /// another client of the same server, another ghostty among them,
+    /// can run its commands in between ours, and a name we shared with
+    /// it would let two pastes mix.
+    paste_buffer: [paste_buffer_prefix.len + 16]u8,
+
     /// The window tmux says is current, as of the last notification.
     /// Null until tmux tells us, which it only does on a change.
     current_window_id: ?usize = null,
@@ -251,6 +259,8 @@ pub const Viewer = struct {
 
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
+
+    const paste_buffer_prefix = "ghostty-paste-";
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
@@ -349,6 +359,11 @@ pub const Viewer = struct {
         /// Data to write to a pane, e.g. keyboard input encoded by the
         /// caller into the bytes a normal pty would receive.
         write: Write,
+
+        /// Text to paste into a pane, already through the caller's paste
+        /// encoding but without a bracketed paste frame: tmux adds that
+        /// itself if the pane's program asked for it. See `nextPaste`.
+        paste: Write,
 
         /// Ask tmux to resize a pane, because whatever is displaying it
         /// changed size.
@@ -690,6 +705,16 @@ pub const Viewer = struct {
             .windows = .empty,
             .panes = .empty,
             .pause_after = opts.pause_after,
+            .paste_buffer = paste_buffer: {
+                var token: [8]u8 = undefined;
+                io.random(&token);
+                var name: [paste_buffer_prefix.len + 16]u8 = undefined;
+                _ = std.fmt.bufPrint(&name, "{s}{x}", .{
+                    paste_buffer_prefix,
+                    &token,
+                }) catch unreachable;
+                break :paste_buffer name;
+            },
             .current_window_id = null,
             .last_selected_pane = null,
             .selects_unanswered = undefined,
@@ -732,6 +757,7 @@ pub const Viewer = struct {
         return switch (input) {
             .tmux => self.nextTmux(input.tmux),
             .write => self.nextWrite(input.write),
+            .paste => self.nextPaste(input.paste),
             .resize => self.nextResize(input.resize),
             .client_size => self.nextClientSize(input.client_size),
             .new_window => self.nextNewWindow(),
@@ -1778,6 +1804,151 @@ pub const Viewer = struct {
 
         // Owns the commands from here, whether it succeeds or not.
         return self.queueUserCommands(commands);
+    }
+
+    /// Paste text into a pane through tmux's own paste buffers.
+    ///
+    /// A paste is not sent as keys because of bracketed paste. Whether
+    /// to frame it depends on whether the pane's program asked for that
+    /// (mode 2004), and we cannot know: tmux has no format for it, so a
+    /// program that turned it on before we attached -- an editor started
+    /// once, unlike a shell that asks again at every prompt -- looks to
+    /// us as if it never had. An unframed paste into an editor that
+    /// wanted a framed one is typed text, and autoindent mangles it.
+    ///
+    /// tmux does know. `paste-buffer -p` frames the paste if and only if
+    /// the pane's program asked for it, so the text goes into a buffer
+    /// and tmux pastes it from there:
+    ///
+    ///   - `set-buffer` the text, in chunks, the first replacing the
+    ///     buffer and the rest appending with `-a`;
+    ///   - `paste-buffer -p -r -d`: framed as the program asked, the
+    ///     text as it is (`-r`, no newline translation: the caller has
+    ///     already done that), and the buffer deleted afterwards.
+    ///
+    /// All of it is queued together, so tmux runs it in order with the
+    /// keys typed before and after it.
+    fn nextPaste(
+        self: *Viewer,
+        p: Input.Write,
+    ) []const Action {
+        if (self.state != .command_queue) {
+            log.info(
+                "paste to pane id={} while not ready, dropping",
+                .{p.pane_id},
+            );
+            return &.{};
+        }
+
+        if (!self.panes.contains(p.pane_id)) {
+            log.info("paste to unknown pane id={}, dropping", .{p.pane_id});
+            return &.{};
+        }
+
+        if (p.data.len == 0) return &.{};
+
+        return self.queuePaste(p) catch {
+            log.warn(
+                "failed to queue paste for pane id={}, dropping",
+                .{p.pane_id},
+            );
+            return &.{};
+        };
+    }
+
+    /// The most paste bytes one `set-buffer` carries.
+    ///
+    /// tmux has no limit on a control mode line and the text is a single
+    /// argument, so the yacc stack that bounds `send-keys` does not apply
+    /// (`max_send_keys_bytes`). This only keeps any one command, which
+    /// is up to four times this once escaped, a reasonable size.
+    pub const max_set_buffer_bytes = 16 * 1024;
+
+    fn queuePaste(
+        self: *Viewer,
+        p: Input.Write,
+    ) Allocator.Error![]const Action {
+        const chunks = std.math.divCeil(
+            usize,
+            p.data.len,
+            max_set_buffer_bytes,
+        ) catch unreachable;
+        const commands = try self.alloc.alloc(Command, chunks + 1);
+        defer self.alloc.free(commands);
+
+        {
+            var built: usize = 0;
+            errdefer for (commands[0..built]) |c| c.deinit(self.alloc);
+            var rest = p.data;
+            while (rest.len > 0) : (built += 1) {
+                const chunk = rest[0..@min(rest.len, max_set_buffer_bytes)];
+                rest = rest[chunk.len..];
+                commands[built] = try self.setBufferCommand(
+                    chunk,
+                    built > 0,
+                );
+            }
+            assert(built == chunks);
+
+            commands[built] = try self.userCommand(
+                "paste-buffer -p -r -d -b {s} -t %{d}\n",
+                .{ &self.paste_buffer, p.pane_id },
+            );
+        }
+
+        // Owns the commands from here, whether it succeeds or not.
+        return self.queueUserCommands(commands);
+    }
+
+    /// `set-buffer` of arbitrary bytes into our paste buffer.
+    ///
+    /// The bytes go in a double-quoted string, where tmux's parser turns
+    /// a backslash and three octal digits into that byte. Everything but
+    /// printable ASCII is written that way, and of printable ASCII the
+    /// three characters that mean something inside double quotes: `"`
+    /// and `\`, and `$`, which would expand an environment variable.
+    /// That covers the newline, which would otherwise end the command
+    /// (tmux reads control mode a line at a time), and bytes above
+    /// ASCII, which tmux's lexer will not take raw if they are not valid
+    /// UTF-8 -- and a chunk boundary can split a valid sequence. `#` is
+    /// safe: `set-buffer` does not expand formats.
+    fn setBufferCommand(
+        self: *Viewer,
+        data: []const u8,
+        append: bool,
+    ) Allocator.Error!Command {
+        var builder: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer builder.deinit();
+        writeSetBuffer(
+            &builder.writer,
+            &self.paste_buffer,
+            data,
+            append,
+        ) catch return error.OutOfMemory;
+        return .{ .user = try builder.toOwnedSlice() };
+    }
+
+    fn writeSetBuffer(
+        writer: *std.Io.Writer,
+        name: []const u8,
+        data: []const u8,
+        append: bool,
+    ) std.Io.Writer.Error!void {
+        // `--` because the text can start with a `-`, and the parser has
+        // removed the quotes by the time the flags are read.
+        try writer.print("set-buffer{s} -b {s} -- \"", .{
+            if (append) " -a" else "",
+            name,
+        });
+        for (data) |c| {
+            const literal = c >= ' ' and c <= '~' and
+                c != '"' and c != '\\' and c != '$';
+            if (literal)
+                try writer.writeByte(c)
+            else
+                try writer.print("\\{o:0>3}", .{c});
+        }
+        try writer.writeAll("\"\n");
     }
 
     /// `send-keys -H` takes each key as a hexadecimal number, so we can
@@ -6339,6 +6510,7 @@ test "new inputs are dropped before startup completes" {
     try testViewer(&viewer, &.{
         .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 1, .rows = 1 } } },
         .{ .input = .{ .client_size = .{ .cols = 1, .rows = 1 } } },
+        .{ .input = .{ .paste = .{ .pane_id = 0, .data = "x" } } },
         .{
             .input = .{ .kill_pane = .{ .pane_id = 0 } },
             .check = (struct {
@@ -6872,6 +7044,102 @@ test "a large write is split into bounded send-keys, in order" {
     for (0..3) |_| {
         try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = "" } }).len);
     }
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "a paste goes through a tmux paste buffer, framed by tmux" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    try testing.expect(viewer.command_queue.empty());
+
+    const name = &viewer.paste_buffer;
+    try testing.expect(std.mem.startsWith(u8, name, "ghostty-paste-"));
+
+    // Everything that means something to tmux's parser inside double
+    // quotes, a control byte, a byte that is not UTF-8 on its own, and
+    // a leading `-` that must not be read as a flag.
+    const actions = viewer.next(.{ .paste = .{
+        .pane_id = 0,
+        .data = "-a\"b\\c$HOME #{x}\r\x01\xc3",
+    } });
+    try testing.expectEqual(2, actions.len);
+
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        try std.fmt.bufPrint(
+            &buf,
+            "set-buffer -b {s} -- \"-a\\042b\\134c\\044HOME #{{x}}\\015\\001\\303\"\n",
+            .{name},
+        ),
+        actions[0].command,
+    );
+    try testing.expectEqualStrings(
+        try std.fmt.bufPrint(
+            &buf,
+            "paste-buffer -p -r -d -b {s} -t %0\n",
+            .{name},
+        ),
+        actions[1].command,
+    );
+}
+
+test "a large paste is set in appended chunks, then pasted once" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+
+    const max = Viewer.max_set_buffer_bytes;
+    var data: [2 * max + 1]u8 = undefined;
+    @memset(data[0..max], 'a');
+    @memset(data[max .. 2 * max], 'b');
+    data[2 * max] = 'c';
+
+    const actions = viewer.next(.{ .paste = .{ .pane_id = 0, .data = &data } });
+    try testing.expectEqual(4, actions.len);
+
+    // Only the first replaces the buffer: something stale in it from a
+    // paste that never reached its pane must not survive.
+    var sent: std.ArrayList(u8) = .empty;
+    defer sent.deinit(testing.allocator);
+    for (actions[0..3], 0..) |action, i| {
+        const command = action.command;
+        const prefix = if (i == 0) "set-buffer -b " else "set-buffer -a -b ";
+        try testing.expect(std.mem.startsWith(u8, command, prefix));
+        const open = std.mem.indexOfScalar(u8, command, '"').?;
+        try sent.appendSlice(
+            testing.allocator,
+            command[open + 1 .. command.len - 2],
+        );
+    }
+    try testing.expectEqualSlices(u8, &data, sent.items);
+    try testing.expect(std.mem.startsWith(u8, actions[3].command, "paste-buffer "));
+
+    for (0..4) |_| {
+        try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = "" } }).len);
+    }
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "a paste to an unknown pane is dropped" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+
+    try testing.expectEqual(0, viewer.next(.{ .paste = .{
+        .pane_id = 7,
+        .data = "x",
+    } }).len);
+    try testing.expectEqual(0, viewer.next(.{ .paste = .{
+        .pane_id = 0,
+        .data = "",
+    } }).len);
     try testing.expect(viewer.command_queue.empty());
 }
 

@@ -78,6 +78,10 @@ pub const Router = struct {
             /// Encoded input for a pane, headed for tmux `send-keys`.
             write: *const fn (ctx: *anyopaque, pane_id: usize, data: []const u8) void,
 
+            /// Text pasted into a pane, headed for a tmux paste buffer so
+            /// that tmux frames it as the pane's program asked.
+            paste: *const fn (ctx: *anyopaque, pane_id: usize, data: []const u8) void,
+
             /// The pane's display changed size.
             resize: *const fn (ctx: *anyopaque, pane_id: usize, cols: usize, rows: usize) void,
 
@@ -418,6 +422,13 @@ pub const Router = struct {
         self.host.vtable.write(self.host.ctx, pane_id, data);
     }
 
+    pub fn writePaste(self: *Router, pane_id: usize, data: []const u8) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.paste(self.host.ctx, pane_id, data);
+    }
+
     pub fn requestResize(
         self: *Router,
         pane_id: usize,
@@ -567,6 +578,7 @@ pub const Router = struct {
 const TestHost = struct {
     alloc: Allocator,
     writes: std.ArrayList([]u8) = .empty,
+    pastes: std.ArrayList([]u8) = .empty,
     resizes: std.ArrayList(struct {
         pane_id: usize,
         cols: usize,
@@ -593,6 +605,7 @@ const TestHost = struct {
 
     const vtable: Router.Host.VTable = .{
         .write = write,
+        .paste = paste,
         .resize = resize,
         .kill = kill,
         .newWindow = newWindow,
@@ -667,6 +680,8 @@ const TestHost = struct {
     fn deinit(self: *TestHost) void {
         for (self.writes.items) |w| self.alloc.free(w);
         self.writes.deinit(self.alloc);
+        for (self.pastes.items) |p| self.alloc.free(p);
+        self.pastes.deinit(self.alloc);
         self.resizes.deinit(self.alloc);
         self.kills.deinit(self.alloc);
         self.splits.deinit(self.alloc);
@@ -683,6 +698,13 @@ const TestHost = struct {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
         const copy = self.alloc.dupe(u8, data) catch return;
         self.writes.append(self.alloc, copy) catch self.alloc.free(copy);
+    }
+
+    fn paste(ctx: *anyopaque, pane_id: usize, data: []const u8) void {
+        _ = pane_id;
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        const copy = self.alloc.dupe(u8, data) catch return;
+        self.pastes.append(self.alloc, copy) catch self.alloc.free(copy);
     }
 
     fn resize(ctx: *anyopaque, pane_id: usize, cols: usize, rows: usize) void {
@@ -897,19 +919,26 @@ test "input reaches the host and stops when the pane does" {
     const sink = try tr.router.createChannel(5);
 
     tr.router.writeInput(5, "abc");
+    tr.router.writePaste(5, "pasted");
     tr.router.requestResize(5, 80, 24);
     try testing.expectEqual(1, tr.host.writes.items.len);
     try testing.expectEqualStrings("abc", tr.host.writes.items[0]);
+    try testing.expectEqual(1, tr.host.pastes.items.len);
+    try testing.expectEqualStrings("pasted", tr.host.pastes.items[0]);
     try testing.expectEqual(1, tr.host.resizes.items.len);
 
     // Unknown panes never reach the host.
     tr.router.writeInput(1234, "nope");
+    tr.router.writePaste(1234, "nope");
     try testing.expectEqual(1, tr.host.writes.items.len);
+    try testing.expectEqual(1, tr.host.pastes.items.len);
 
     // Neither do closed ones.
     sink.close();
     tr.router.writeInput(5, "nope");
+    tr.router.writePaste(5, "nope");
     try testing.expectEqual(1, tr.host.writes.items.len);
+    try testing.expectEqual(1, tr.host.pastes.items.len);
 }
 
 test "detachHost closes every pane and blocks further host calls" {

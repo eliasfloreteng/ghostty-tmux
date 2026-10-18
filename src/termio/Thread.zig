@@ -365,6 +365,14 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+            .paste => |v| {
+                defer v.alloc.free(v.data);
+                try io.queuePaste(
+                    data,
+                    v.data,
+                    self.flags.linefeed_mode,
+                );
+            },
         }
     }
 

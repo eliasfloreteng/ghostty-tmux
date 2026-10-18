@@ -97,6 +97,15 @@ pub const Message = union(enum) {
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
 
+    /// Pasted text, for a backend that delivers pastes as pastes rather
+    /// than as bytes: a tmux pane, where only tmux knows whether the
+    /// pane's program asked for bracketed paste (see `Backend.pastes`).
+    ///
+    /// The data is already through `input.paste.encode` for an
+    /// unbracketed paste, so the backend only adds the frame, if any.
+    /// It is allocated and must be freed.
+    paste: WriteReq.Alloc,
+
     /// The payload of the kitty_clipboard_grant_* messages. The
     /// password is allocated and must be freed.
     pub const KittyClipboardGrant = struct {
@@ -123,7 +132,7 @@ pub const Message = union(enum) {
                 v.ptr.deinit();
                 v.alloc.destroy(v.ptr);
             },
-            .write_alloc => |v| v.alloc.free(v.data),
+            .write_alloc, .paste => |v| v.alloc.free(v.data),
             .kitty_clipboard_grant_read,
             .kitty_clipboard_grant_write,
             => |v| v.alloc.free(v.pw),
