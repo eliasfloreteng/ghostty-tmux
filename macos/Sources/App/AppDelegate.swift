@@ -72,6 +72,7 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuChangeTitle: NSMenuItem?
     @IBOutlet private var menuChangeTabTitle: NSMenuItem?
     @IBOutlet private var menuReadonly: NSMenuItem?
+    @IBOutlet private var menuTmuxDetach: NSMenuItem?
     @IBOutlet private var menuQuickTerminal: NSMenuItem?
     @IBOutlet private var menuTerminalInspector: NSMenuItem?
     @IBOutlet private var menuCommandPalette: NSMenuItem?
@@ -1264,6 +1265,10 @@ extension AppDelegate {
         syncMenuShortcut(config, action: "toggle_command_palette", menuItem: self.menuCommandPalette)
 
         syncMenuShortcut(config, action: "toggle_secure_input", menuItem: self.menuSecureInput)
+
+        // Only detach: the rest of the tmux menu are bindings that already
+        // have a menu item of their own, which shows their shortcut.
+        syncMenuShortcut(config, action: "tmux_detach", menuItem: self.menuTmuxDetach)
 
         // This menu item is NOT synced with the configuration because it disables macOS
         // global fullscreen keyboard shortcut. The shortcut in the Ghostty config will continue

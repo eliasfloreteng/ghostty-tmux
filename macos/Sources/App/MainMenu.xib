@@ -67,6 +67,7 @@
                 <outlet property="menuSplitRight" destination="VUR-Ld-nLx" id="RxO-Zw-ovb"/>
                 <outlet property="menuSplitUp" destination="Ggp-7N-GbX" id="YJF-uq-S4Y"/>
                 <outlet property="menuTerminalInspector" destination="QwP-M5-fvh" id="wJi-Dh-S9f"/>
+                <outlet property="menuTmuxDetach" destination="tMx-Dt-Itm" id="tMx-Dt-Out"/>
                 <outlet property="menuToggleFullScreen" destination="8kY-Pi-KaY" id="yQg-6V-OO6"/>
                 <outlet property="menuToggleVisibility" destination="DOX-wA-ilh" id="iBj-Bc-2bq"/>
                 <outlet property="menuUndo" destination="r83-CV-syt" id="bU9-0b-xgQ"/>
@@ -191,6 +192,52 @@
                                 <connections>
                                     <action selector="splitUp:" target="-1" id="bbi-dK-pOS"/>
                                 </connections>
+                            </menuItem>
+                            <menuItem isSeparatorItem="YES" id="tMx-Sp-001"/>
+                            <menuItem title="tmux" id="tMx-Mn-Itm">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <menu key="submenu" title="tmux" id="tMx-Mn-Sub">
+                                    <items>
+                                        <menuItem title="New Window" id="tMx-NW-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxNewWindow:" target="-1" id="tMx-NW-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Split Right" id="tMx-SR-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxSplitRight:" target="-1" id="tMx-SR-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Split Down" id="tMx-SD-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxSplitDown:" target="-1" id="tMx-SD-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Zoom Pane" id="tMx-ZP-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxZoomPane:" target="-1" id="tMx-ZP-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem isSeparatorItem="YES" id="tMx-Sp-002"/>
+                                        <menuItem title="Kill Pane…" id="tMx-KP-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxKillPane:" target="-1" id="tMx-KP-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem isSeparatorItem="YES" id="tMx-Sp-003"/>
+                                        <menuItem title="Detach" id="tMx-Dt-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxDetach:" target="-1" id="tMx-Dt-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                    </items>
+                                </menu>
                             </menuItem>
                             <menuItem isSeparatorItem="YES" id="sjq-M1-UGS"/>
                             <menuItem title="Close" id="DVo-aG-piG">

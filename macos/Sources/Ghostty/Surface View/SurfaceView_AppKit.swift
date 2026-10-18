@@ -219,6 +219,10 @@ extension Ghostty {
         // by the user, this is set to the prior value (which may be empty, but non-nil).
         private var titleFromTerminal: String?
 
+        /// The tmux pane this surface displays, if it is one rather than a
+        /// terminal of its own. Fixed at creation.
+        private(set) var tmuxPaneId: Int?
+
         // The terminal's title from before this surface started hosting a
         // tmux session, to go back to when it stops.
         private var titleBeforeTmux: String?
@@ -408,6 +412,7 @@ extension Ghostty {
 
             // Setup our surface. This will also initialize all the terminal IO.
             let surface_cfg = baseConfig ?? SurfaceConfiguration()
+            if surface_cfg.tmuxRouter != nil { self.tmuxPaneId = surface_cfg.tmuxPaneId }
             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                 ghostty_surface_new(app, &surface_cfg_c)
             }
@@ -1742,8 +1747,36 @@ extension Ghostty {
         /// Leave the tmux session this surface is a pane or the host of.
         /// The session carries on without us.
         @IBAction func tmuxDetach(_ sender: Any?) {
+            performTmuxAction("tmux_detach")
+        }
+
+        // The rest of the tmux menu are the ordinary bindings: on a tmux
+        // pane the core sends each to tmux instead of doing it here. They
+        // have their own selectors so that they can say they are tmux's,
+        // and be enabled only on a pane.
+
+        @IBAction func tmuxNewWindow(_ sender: Any?) {
+            performTmuxAction("new_tab")
+        }
+
+        @IBAction func tmuxSplitRight(_ sender: Any?) {
+            performTmuxAction("new_split:right")
+        }
+
+        @IBAction func tmuxSplitDown(_ sender: Any?) {
+            performTmuxAction("new_split:down")
+        }
+
+        @IBAction func tmuxZoomPane(_ sender: Any?) {
+            performTmuxAction("toggle_split_zoom")
+        }
+
+        @IBAction func tmuxKillPane(_ sender: Any?) {
+            performTmuxAction("close_surface")
+        }
+
+        private func performTmuxAction(_ action: String) {
             guard let surface = self.surface else { return }
-            let action = "tmux_detach"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
                 AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
@@ -2300,6 +2333,16 @@ extension Ghostty.SurfaceView: NSMenuItemValidation {
         case #selector(toggleReadonly):
             item.state = readonly ? .on : .off
             return true
+
+        case #selector(tmuxDetach):
+            return tmuxPaneId != nil || hostedTmuxSession != nil
+
+        case #selector(tmuxNewWindow),
+             #selector(tmuxSplitRight),
+             #selector(tmuxSplitDown),
+             #selector(tmuxZoomPane),
+             #selector(tmuxKillPane):
+            return tmuxPaneId != nil
 
         case #selector(copy(_:)):
             // We only enable copy menu item when there're actual selected text
