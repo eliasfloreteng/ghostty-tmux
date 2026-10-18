@@ -147,6 +147,7 @@ class TmuxWindowManager {
                 ghostty: ghostty,
                 tree: tree,
                 parent: tabParent(action.windows, before: index, host: host))
+            controller.isTmuxWindow = true
             setTitle(controller, window.name)
             windows[key] = .init(value: controller)
         }
@@ -336,23 +337,12 @@ class TmuxWindowManager {
                 continue
             }
 
-            if let controller = entry.value {
-                // Just this tab. closeWindowImmediately takes the whole
-                // tab group with it, and these windows are tabs of one
-                // another, so closing one tmux window would have closed
-                // every other one along with it.
-                //
-                // Undo is off because there is nothing to undo: the
-                // window is gone on the tmux side, and putting a native
-                // one back would show a window that no longer exists.
-                if let undoManager = controller.undoManager {
-                    undoManager.disableUndoRegistration {
-                        controller.closeTabImmediately()
-                    }
-                } else {
-                    controller.closeTabImmediately()
-                }
-            }
+            // Just this tab. closeWindowImmediately takes the whole tab
+            // group with it, and these windows are tabs of one another,
+            // so closing one tmux window would have closed every other
+            // one along with it. Nothing is registered for undo: a tmux
+            // window has no undo manager (see `isTmuxWindow`).
+            entry.value?.closeTabImmediately()
             windows.removeValue(forKey: key)
         }
 

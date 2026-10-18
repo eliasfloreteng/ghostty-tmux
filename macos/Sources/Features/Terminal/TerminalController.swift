@@ -55,6 +55,32 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// For example, terminals executing custom scripts are not restorable.
     private var restorable: Bool = true
 
+    /// True if this controller shows a tmux control mode window.
+    ///
+    /// tmux owns such a window, not us, which rules out the two ways
+    /// AppKit can bring a closed window back:
+    ///
+    /// - Restoration. Its surfaces display panes of a session reached
+    ///   through another surface, and that connection does not survive a
+    ///   relaunch. A restored one would be a plain shell on this machine
+    ///   posing as a pane that is still running on the tmux server.
+    /// - Undo. It closes because tmux stopped listing the window (or the
+    ///   session ended), and a native window put back would show panes
+    ///   that are gone. A pane closing is the same story at split level.
+    ///
+    /// Set by `TmuxWindowManager` as soon as it creates the controller.
+    var isTmuxWindow: Bool = false {
+        didSet {
+            guard isTmuxWindow != oldValue else { return }
+            syncRestoration(ghostty.config)
+        }
+    }
+
+    /// No undo for a tmux window. See `isTmuxWindow`.
+    override var undoManager: ExpiringUndoManager? {
+        isTmuxWindow ? nil : super.undoManager
+    }
+
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig
 
@@ -593,7 +619,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     private func syncRestoration(_ config: Ghostty.Config) {
         guard isWindowLoaded, let window else { return }
         // Setting all three of these is required for restoration to work.
-        window.isRestorable = restorable && config.windowSaveState != "never"
+        window.isRestorable = restorable && !isTmuxWindow && config.windowSaveState != "never"
         window.restorationClass = TerminalWindowRestoration.self
         window.identifier = .init(String(describing: TerminalWindowRestoration.self))
     }
@@ -1134,6 +1160,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     var undoState: UndoState? {
         guard let window else { return nil }
         guard !surfaceTree.isEmpty else { return nil }
+
+        // Not even as part of closing a tab group that also has ordinary
+        // tabs in it, which asks every tab for its state.
+        guard !isTmuxWindow else { return nil }
         return .init(
             frame: window.frame,
             surfaceTree: surfaceTree,
