@@ -75,10 +75,10 @@ the harness restores your previous clipboard _text_ afterwards.
   Security → Automation.
 - **Screen Recording** (optional): needed for useful failure screenshots.
 - **Accessibility** (optional): lets the harness read what AppleScript
-  can't see -- the gateway's overlay, notice bars, alerts, menu items --
-  press the overlay's buttons, and resize windows (`e2e/ax.py`). Without
-  it those checks `SKIP`, and `resize_window` changes the font size
-  instead, which also changes the grid size.
+  can't see -- the gateway's overlay, notice bars, alerts, menu items,
+  scroll bars -- press the overlay's buttons, and resize windows
+  (`e2e/ax.py`). Without it those checks `SKIP`, and `resize_window`
+  changes the font size instead, which also changes the grid size.
 
   This uses the Accessibility API addressed by pid
   (`AXUIElementCreateApplication`), not System Events UI scripting:
@@ -156,7 +156,8 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   `attach_with_history`, `pane_mouse_scroll`: wide characters take the
   same columns as in tmux, less and vim (alternate screen) show what tmux
   shows, history is there after attaching (`write_scrollback_file`), and
-  the wheel scrolls it (read from the app log's scrollbar actions).
+  the wheel scrolls it (read from the native scroll bar over
+  Accessibility; without that permission it `SKIP`s).
 - `pane_mouse_reporting`: a program in a pane that turned on mouse
   reporting (SGR) reads a click in the pane's own cells and the wheel,
   and the wheel no longer scrolls Ghostty's history. Events are sent with

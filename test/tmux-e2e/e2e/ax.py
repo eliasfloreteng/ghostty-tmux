@@ -116,6 +116,29 @@ def sheet_texts(pid: int) -> list[list[str]]:
     ]
 
 
+def scroll_positions(pid: int, window_name: str) -> list[float]:
+    """Where each terminal's vertical scroll bar in the named window is.
+
+    0.0 is the top of the history and 1.0 the bottom (the live screen).
+    The scroll bar is the native one around each surface, kept in sync
+    with the viewport, so this is what a person sees, in any build.
+    """
+    wins = windows(pid)
+    if window_name not in wins:
+        raise RuntimeError(f"no window {window_name!r} (windows: {list(wins)})")
+    out = []
+    for area in _walk(wins[window_name]):
+        if _attr(area, "AXRole") != "AXScrollArea":
+            continue
+        children = _children(area)
+        if not any(_attr(c, "AXRole") == "AXTextArea" for c in children):
+            continue
+        for bar in children:
+            if _attr(bar, "AXRole") == "AXScrollBar" and _attr(bar, "AXOrientation") == "AXVerticalOrientation":
+                out.append(float(_attr(bar, "AXValue")))
+    return out
+
+
 def _press_in(root: Any, title: str) -> bool:
     for e in _walk(root):
         if _attr(e, "AXRole") == "AXButton" and title in (_attr(e, "AXTitle"), _attr(e, "AXDescription")):

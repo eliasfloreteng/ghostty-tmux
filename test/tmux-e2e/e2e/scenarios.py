@@ -1135,13 +1135,14 @@ def attach_with_history(ctx: Context) -> None:
             )
 
 
-def _scrollbar(ctx: Context) -> tuple[int, int, int] | None:
-    """The last (total, offset, len) the app reported for a scrollbar."""
-    found = re.findall(
-        r"action=\.scrollbar value=\.\{ \.total = (\d+), \.offset = (\d+), \.len = (\d+) \}",
-        ctx.app.log_path.read_text(errors="replace"),
-    )
-    return tuple(map(int, found[-1])) if found else None
+def _scroll_positions(ctx: Context, window_name: str) -> list[float]:
+    """The scroll bar position (1.0 is the bottom) of each terminal in a tab.
+
+    Read from the native scroll bars over Accessibility. Not from the app
+    log: the scrollbar actions are logged at debug level, which only a
+    debug build emits.
+    """
+    return ax.scroll_positions(ctx.app.pid, ctx.ax_window(window_name))
 
 
 @scenario
@@ -1151,19 +1152,21 @@ def pane_mouse_scroll(ctx: Context) -> None:
     term = ctx.tab_for_window("main").terminals[0].id
     ctx.tmux.run("send-keys", "-t", f"{SESSION}:main", "seq 1 500", "Enter")
     wait_until(lambda: "\n500" in ctx.app.read_screen(term), timeout=ctx.timeout, desc="history in the GUI")
-    time.sleep(0.5)
-    before = _scrollbar(ctx)
-    check(before is not None and before[1] + before[2] >= before[0], f"not at the bottom before scrolling: {before}")
+    wait_until(
+        lambda: _scroll_positions(ctx, "main") == [1.0],
+        timeout=ctx.timeout,
+        desc="the pane's scroll bar to be at the bottom",
+        describe_state=lambda: f"scroll bars {_scroll_positions(ctx, 'main')}",
+    )
     ctx.app.focus(term)
     ctx.app.scroll(term, 10)
     wait_until(
-        lambda: (bar := _scrollbar(ctx)) is not None and bar[1] + bar[2] < bar[0],
+        lambda: (bars := _scroll_positions(ctx, "main")) and bars[0] < 1.0,
         timeout=ctx.timeout,
         desc="the viewport to scroll up into history",
-        describe_state=lambda: f"scrollbar (total, offset, len) {_scrollbar(ctx)}",
+        describe_state=lambda: f"scroll bars {_scroll_positions(ctx, 'main')}",
     )
     check(ctx.tmux.control_clients(), "scrolling dropped the control client")
-
 
 
 @scenario
@@ -1181,7 +1184,11 @@ def pane_mouse_reporting(ctx: Context) -> None:
         timeout=ctx.timeout,
         desc="the program's request for the mouse in the GUI",
     )
-    before = _scrollbar(ctx)
+    try:
+        before = _scroll_positions(ctx, "main")
+    except ax.AxUnavailable as exc:
+        log(f"not checking that history stays put: {exc}")
+        before = None
 
     # A click near the pane's top left corner, which the program must get
     # in the pane's own cells (tmux's are 1-based), not the window's.
@@ -1203,7 +1210,9 @@ def pane_mouse_reporting(ctx: Context) -> None:
         desc="the program to read the wheel",
         describe_state=lambda: repr(ctx.tmux.capture(pane)),
     )
-    check(_scrollbar(ctx) == before, f"the wheel scrolled the pane's history: {before} -> {_scrollbar(ctx)}")
+    if before is not None:
+        after = _scroll_positions(ctx, "main")
+        check(after == before, f"the wheel scrolled the pane's history: scroll bars {before} -> {after}")
     check(ctx.tmux.control_clients(), "mouse input dropped the control client")
     check(ctx.tab_for_window("main").focused_terminal == term, "the click moved focus off the pane")
 
