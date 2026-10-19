@@ -15,6 +15,7 @@ from typing import Callable
 
 from . import ax
 from .context import SESSION, Context
+from .ghostty import AppleScriptError
 from .util import CheckFailed, Skip, check, log, wait_until
 from .windows import native_windows, resize_front_window, screenshot
 
@@ -704,7 +705,10 @@ def expect_text(ctx: Context, text: str, desc: str) -> None:
 @scenario
 def tmux_config_errors(ctx: Context) -> None:
     """A broken tmux.conf gives a single alert listing every error."""
-    ctx.tmux.add_config("e2e-no-such-command-one\nset -g e2e-no-such-option on\n")
+    # Both mistakes have to be ones tmux runs into, not ones it fails to
+    # parse: a parse error (an unknown command) abandons the rest of the
+    # file, so tmux itself would only ever report the first.
+    ctx.tmux.add_config("set -g e2e-no-such-option-one on\nset -g e2e-no-such-option-two on\n")
     two_window_layout(ctx)
 
     def sheets() -> list[list[str]]:
@@ -718,7 +722,7 @@ def tmux_config_errors(ctx: Context) -> None:
     shown = ax.sheet_texts(ctx.app.pid)
     check(len(shown) == 1, f"expected one alert, got {len(shown)}: {shown}")
     text = "\n".join(shown[0])
-    for needle in ("e2e-no-such-command-one", "e2e-no-such-option"):
+    for needle in ("e2e-no-such-option-one", "e2e-no-such-option-two"):
         check(needle in text, f"the alert does not mention {needle!r}: {shown[0]}")
     ax.dismiss_sheets(ctx.app.pid)
 
@@ -836,6 +840,10 @@ def no_restore_after_relaunch(ctx: Context) -> None:
 def undo_after_tmux_close(ctx: Context) -> None:
     """Undo after a tmux tab or pane closes does nothing."""
     two_window_layout(ctx)
+    # Opening the gateway's window is itself undoable until `undo-timeout`
+    # (5s) passes, and undoing that closes the gateway: a real undo, but
+    # not what this is about. Let it expire first.
+    time.sleep(5.5)
     ctx.tmux.run("kill-pane", "-t", ctx.tmux.window(SESSION, "beta").panes[1].id)
     ctx.wait_synced()
     ctx.tmux.run("kill-window", "-t", f"{SESSION}:beta")
@@ -1057,6 +1065,22 @@ def read_only_client(ctx: Context) -> None:
     ctx.tmux.run("switch-client", "-c", client, "-r")
     expect_text(ctx, "read-only", "a notice that the client is read-only")
     check(ctx.tmux.control_clients(), "going read-only dropped the control client")
+    # tmux announces the change as a session change, and the session's
+    # panes are dropped and come straight back. AppleScript cannot see
+    # the terminals while that happens: wait until it can again, steadily.
+    def settled() -> bool:
+        try:
+            for _ in range(3):
+                ctx.tab_for_window("main")
+                time.sleep(0.2)
+            return True
+        except (CheckFailed, AppleScriptError):
+            return False
+
+    wait_until(settled, timeout=ctx.timeout, desc="the session's terminals to settle")
+    ctx.wait_synced()
+    term = ctx.tab_for_window("main").terminals[0].id
+    ctx.app.focus(term)
 
     # tmux would run whatever we sent; nothing should be.
     token = secrets.token_hex(3)
@@ -1078,6 +1102,8 @@ def read_only_client(ctx: Context) -> None:
     # And back.
     ctx.tmux.run("switch-client", "-c", client, "-r")
     expect_text(ctx, "no longer read-only", "a notice that the client may write again")
+    wait_until(settled, timeout=ctx.timeout, desc="the session's terminals to settle")
+    ctx.wait_synced()
     term = ctx.tab_for_window("main").terminals[0].id
     ctx.app.type_line(term, f"echo typed-{token}")
     wait_until(
@@ -1086,4 +1112,21 @@ def read_only_client(ctx: Context) -> None:
         desc="typing to reach the pane again",
         describe_state=lambda: ctx.tmux.capture(pane).strip()[-300:],
     )
+    ctx.wait_synced()
+
+
+@scenario
+def switch_client_same_session(ctx: Context) -> None:
+    """`switch-client` to the session already shown (as `-r` does) rebuilds the tabs without killing a pane."""
+    ctx.attach()
+    client = ctx.tmux.control_clients()[0]
+    before = [p.id for p in ctx.tmux.window(SESSION, "main").panes]
+    for _ in range(3):
+        ctx.tmux.run("switch-client", "-c", client, "-t", SESSION)
+        time.sleep(1.5)
+        check(ctx.tmux.control_clients(), "the control client went away")
+        check(
+            [p.id for p in ctx.tmux.window(SESSION, "main").panes] == before,
+            f"the panes changed: {before} -> {ctx.describe()}",
+        )
     ctx.wait_synced()
