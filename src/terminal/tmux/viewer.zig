@@ -1203,11 +1203,17 @@ pub const Viewer = struct {
     /// Whether the tmux we are talking to is at least the given version.
     ///
     /// tmux reports versions like `3.5a`, where the letter is a bug-fix
-    /// release, so only the leading `major.minor` is compared. An
-    /// unparseable version answers false: a feature we cannot confirm is
-    /// a feature we do not use.
+    /// release, so only the leading `major.minor` is compared. A build
+    /// from tmux's git tree calls itself `next-3.7`: the release it is
+    /// on its way to, and newer than every release before it, so it
+    /// counts as that one. An unparseable version answers false: a
+    /// feature we cannot confirm is a feature we do not use.
     fn tmuxVersionAtLeast(self: *const Viewer, major: usize, minor: usize) bool {
-        var it = std.mem.splitScalar(u8, self.tmux_version, '.');
+        const version = if (std.mem.startsWith(u8, self.tmux_version, "next-"))
+            self.tmux_version["next-".len..]
+        else
+            self.tmux_version;
+        var it = std.mem.splitScalar(u8, version, '.');
         const major_str = it.next() orelse return false;
         const minor_str = it.next() orelse return false;
 
@@ -6578,8 +6584,14 @@ test "tmux version comparison" {
         .{ "3.10", true },
         .{ "3.3a", false },
         .{ "2.9", false },
+        // A git build, on its way to that release.
+        .{ "next-3.4", true },
+        .{ "next-3.7", true },
+        .{ "next-3.3", false },
         // Nothing we can read is nothing we can rely on.
         .{ "next", false },
+        .{ "next-", false },
+        .{ "master", false },
         .{ "", false },
         .{ "3.x", false },
     };
