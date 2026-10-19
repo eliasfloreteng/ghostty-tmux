@@ -234,6 +234,12 @@ pub const Viewer = struct {
     /// client is read-only, so that every keystroke does not say it again.
     read_only_noticed: ?std.Io.Timestamp = null,
 
+    /// A change of `read_only` the user has not been told about yet. Held
+    /// until the window list that always follows has gone out, so that a
+    /// GUI showing it over the pane the user is in finds that pane: a
+    /// session change empties the window list first.
+    read_only_untold: bool = false,
+
     /// The tmux paste buffer our pastes go through. See `nextPaste`.
     ///
     /// Random per viewer because buffers belong to the server, not to us:
@@ -2684,6 +2690,7 @@ pub const Viewer = struct {
         // changes it, and the list that follows says whether it did.
         replacement.read_only = self.read_only;
         replacement.read_only_noticed = self.read_only_noticed;
+        replacement.read_only_untold = self.read_only_untold;
 
         // Our actions must start out empty so we don't mix arenas
         assert(actions.items.len == 0);
@@ -2837,15 +2844,9 @@ pub const Viewer = struct {
                 try self.receivedPaneVisible(id, content);
             },
 
-            .tmux_version => try self.receivedTmuxVersion(
-                arena_alloc,
-                actions,
-                content,
-            ),
+            .tmux_version => try self.receivedTmuxVersion(content),
 
-            .client_readonly => try self.receivedReadOnly(
-                arena_alloc,
-                actions,
+            .client_readonly => self.receivedReadOnly(
                 std.mem.eql(u8, std.mem.trim(u8, content, " \t\r\n"), "1"),
             ),
         }
@@ -2853,8 +2854,6 @@ pub const Viewer = struct {
 
     fn receivedTmuxVersion(
         self: *Viewer,
-        arena_alloc: Allocator,
-        actions: *std.ArrayList(Action),
         content: []const u8,
     ) !void {
         const line = std.mem.trim(u8, content, " \t\r\n");
@@ -2873,7 +2872,7 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.tmux_version = try self.alloc.dupe(u8, data.version);
-        try self.receivedReadOnly(arena_alloc, actions, data.client_readonly);
+        self.receivedReadOnly(data.client_readonly);
 
         // Now that the version is known, and only now, because the flag
         // does not exist before 3.2 and an older server answers with an
@@ -2884,16 +2883,25 @@ pub const Viewer = struct {
     }
 
     /// tmux told us whether this client is read-only. Only a change is
-    /// news, and being writable is not news on attach.
-    fn receivedReadOnly(
-        self: *Viewer,
-        arena_alloc: Allocator,
-        actions: *std.ArrayList(Action),
-        read_only: bool,
-    ) Allocator.Error!void {
+    /// news, and being writable is not news on attach. The user is told
+    /// with the window list that follows: see `read_only_untold`.
+    fn receivedReadOnly(self: *Viewer, read_only: bool) void {
         if (read_only == self.read_only) return;
         self.read_only = read_only;
         self.read_only_noticed = null;
+        self.read_only_untold = true;
+    }
+
+    /// Tell the user about a change of `read_only`, if there is one to
+    /// tell.
+    fn tellReadOnly(
+        self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+    ) Allocator.Error!void {
+        if (!self.read_only_untold) return;
+        self.read_only_untold = false;
+        const read_only = self.read_only;
         try actions.append(arena_alloc, .{ .notice = .{
             .kind = .message,
             .text = if (read_only)
@@ -2987,6 +2995,7 @@ pub const Viewer = struct {
         // logging/formatting the action is a use-after-free.
         try self.syncLayouts(windows.items);
         try actions.append(arena_alloc, .{ .windows = self.windows.items });
+        try self.tellReadOnly(arena_alloc, actions);
     }
 
     fn receivedPaneState(
@@ -7613,7 +7622,8 @@ test "a read-only client watches but does not touch the session" {
 
     var buf: [4]Viewer.Notice = undefined;
 
-    // Attached with `-r`: the version reply says so, and the user is told.
+    // Attached with `-r`: the version reply says so, and the user is told
+    // once the windows are out, so the notice has a pane to go over.
     try testViewer(&viewer, &.{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .session_changed = .{
@@ -7621,16 +7631,26 @@ test "a read-only client watches but does not touch the session" {
             .name = "test",
         } } } },
     });
+    try testing.expectEqual(0, testNotices(
+        viewer.next(.{ .tmux = .{ .block_end = "3.5a 1" } }),
+        &buf,
+    ).len);
+    try testing.expect(viewer.read_only);
     {
-        const actions = viewer.next(.{ .tmux = .{ .block_end = "3.5a 1" } });
+        const actions = viewer.next(.{ .tmux = .{
+            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+        } });
         const notices = testNotices(actions, &buf);
         try testing.expectEqual(1, notices.len);
         try testing.expectEqual(.message, notices[0].kind);
-        try testing.expect(viewer.read_only);
+        var windows_first = false;
+        for (actions) |action| switch (action) {
+            .windows => windows_first = true,
+            .notice => break,
+            else => {},
+        };
+        try testing.expect(windows_first);
     }
-    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{
-        .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
-    } } }});
     try testViewer(&viewer, &testPrimaryCaptureSteps("", ""));
     try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
     try testing.expect(viewer.command_queue.empty());
@@ -7685,16 +7705,19 @@ test "a read-only client watches but does not touch the session" {
         .commands = &.{ "display-message -p '#{client_readonly}'", "list-windows" },
     }});
     try testing.expect(viewer.read_only);
+    try testing.expectEqual(0, testNotices(
+        viewer.next(.{ .tmux = .{ .block_end = "0" } }),
+        &buf,
+    ).len);
+    try testing.expect(!viewer.read_only);
     {
-        const actions = viewer.next(.{ .tmux = .{ .block_end = "0" } });
+        const actions = viewer.next(.{ .tmux = .{
+            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+        } });
         const notices = testNotices(actions, &buf);
         try testing.expectEqual(1, notices.len);
         try testing.expectEqual(.message, notices[0].kind);
-        try testing.expect(!viewer.read_only);
     }
-    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{
-        .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
-    } } }});
     try testViewer(&viewer, &testPrimaryCaptureSteps("", ""));
     try testViewer(&viewer, &.{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
@@ -7719,7 +7742,13 @@ test "a writable client is not told it is writable" {
             .name = "test",
         } } } },
     });
-    const actions = viewer.next(.{ .tmux = .{ .block_end = "3.5a 0" } });
+    try testing.expectEqual(0, testNotices(
+        viewer.next(.{ .tmux = .{ .block_end = "3.5a 0" } }),
+        &buf,
+    ).len);
+    const actions = viewer.next(.{ .tmux = .{
+        .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+    } });
     try testing.expectEqual(0, testNotices(actions, &buf).len);
     try testing.expect(!viewer.read_only);
 }
