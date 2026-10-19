@@ -1189,7 +1189,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // other back. It shows up as two panes trading a column or a
             // row between them for as long as the window is being
             // dragged.
-            if (windows.seq != self.io.tmux_windows_seq.load(.monotonic)) break :tmux;
+            //
+            // Except an empty one. That is a session changing or ending,
+            // and what it says is not in anything after it: every window
+            // and pane of the session goes, including panes the next
+            // list names again (a session change re-lists the session
+            // already shown, pane ids and all). Skipped, the GUI keeps
+            // those panes' old displays, whose channels tmux's viewer has
+            // just closed, and they close themselves -- taking the windows
+            // that hold them along.
+            if (windows.set.windows.len > 0 and
+                windows.seq != self.io.tmux_windows_seq.load(.monotonic)) break :tmux;
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
