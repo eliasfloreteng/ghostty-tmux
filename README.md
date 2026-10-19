@@ -78,11 +78,18 @@ app (`test/tmux-e2e/`).
 ### Download
 
 macOS builds are on the
-[Releases page](https://github.com/eliasfloreteng/ghostty/releases). They
-are not signed or notarized: after unzipping, run
-`xattr -dr com.apple.quarantine Ghostty.app` (or right-click › Open) once.
-The app uses the same bundle identifier and config as upstream Ghostty,
-so install it in place of it rather than alongside.
+[Releases page](https://github.com/eliasfloreteng/ghostty/releases) as
+**Ghostty tmux.app**. It has its own name and bundle identifier
+(`com.eliasfloreteng.ghostty-tmux`), so it installs and runs alongside the
+official Ghostty with its own preferences and permissions, while reading
+the same Ghostty config. Its updater is disabled, so it never "updates"
+itself into the official release. The build is ad-hoc signed, not
+notarized: after unzipping, run
+`xattr -dr com.apple.quarantine "Ghostty tmux.app"` (or right-click ›
+Open) once.
+
+To build and install it from a checkout instead, run
+[`dist/macos/install-fork.sh`](dist/macos/install-fork.sh).
 
 ### Staying in sync with upstream
 
