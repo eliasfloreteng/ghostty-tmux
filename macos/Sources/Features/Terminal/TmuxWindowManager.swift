@@ -446,10 +446,18 @@ class TmuxWindowManager {
         of entry: WindowEntry,
         host: ObjectIdentifier
     ) {
-        let previous = entry.activePaneId
-        entry.activePaneId = window.activePaneId
-        guard let paneId = window.activePaneId, paneId != previous else { return }
+        guard let paneId = window.activePaneId else {
+            entry.activePaneId = nil
+            return
+        }
+        guard paneId != entry.activePaneId else { return }
+
+        // Not built yet: tmux can name a new pane active before the layout
+        // that holds it arrives (a split does exactly this). Recorded only
+        // once it can be acted on, or the snapshot that brings the pane
+        // would look like a repeat and the move would never happen.
         guard let view = panes[Key(host: host, id: paneId)]?.value else { return }
+        entry.activePaneId = paneId
         focus(view, in: entry)
     }
 
