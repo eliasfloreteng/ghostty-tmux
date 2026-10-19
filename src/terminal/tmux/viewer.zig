@@ -821,6 +821,8 @@ pub const Viewer = struct {
             .text = "client is read-only",
         };
 
+        if (input != .tmux) log.debug("read-only client refuses input={t}", .{input});
+
         switch (input) {
             // Not changes to the session. Our size is fine to report:
             // `-r` comes with `ignore-size`, so tmux does not size

@@ -503,6 +503,28 @@ fn tmuxHostInput(self: *Termio, input: terminalpkg.tmux.Viewer.Input) void {
             self.mailbox.send(msg, self.renderer_state.mutex);
         },
 
+        // Why an input went nowhere, such as a read-only client
+        // refusing it. Copied out of the viewer's buffers for the
+        // surface's thread, as the stream handler does for tmux's own.
+        .notice => |notice| {
+            const text = apprt.surface.Message.WriteReq.init(
+                self.alloc,
+                notice.text,
+            ) catch |err| {
+                log.warn("failed to report tmux notice err={}", .{err});
+                continue;
+            };
+            const msg: apprt.surface.Message = .{ .tmux_notice = .{
+                .kind = notice.kind,
+                .text = text,
+            } };
+            if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+                self.renderer_state.mutex.unlock(global.io());
+                defer self.renderer_state.mutex.lockUncancelable(global.io());
+                _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+            }
+        },
+
         else => {},
     };
 
