@@ -1043,3 +1043,47 @@ def pane_mouse_scroll(ctx: Context) -> None:
     )
     check(ctx.tmux.control_clients(), "scrolling dropped the control client")
 
+
+
+@scenario
+def read_only_client(ctx: Context) -> None:
+    """`switch-client -r` keeps the session on screen; typing and splits are refused with a notice."""
+    ctx.attach()
+    term = ctx.tab_for_window("main").terminals[0].id
+    pane = ctx.tmux.window(SESSION, "main").panes[0].id
+    client = ctx.tmux.control_clients()[0]
+    ctx.app.focus(term)
+
+    ctx.tmux.run("switch-client", "-c", client, "-r")
+    expect_text(ctx, "read-only", "a notice that the client is read-only")
+    check(ctx.tmux.control_clients(), "going read-only dropped the control client")
+
+    # tmux would run whatever we sent; nothing should be.
+    token = secrets.token_hex(3)
+    ctx.app.type_line(term, f"echo refused-{token}")
+    ctx.app.perform(term, "new_split:right")
+    expect_text(ctx, "client is read-only", "the refusal on a notice bar")
+    time.sleep(1)
+    check(f"refused-{token}" not in ctx.tmux.capture(pane), "typing reached a read-only client's pane")
+    check(len(ctx.tmux.window(SESSION, "main").panes) == 1, "a read-only client split a pane")
+
+    # Output still arrives.
+    ctx.tmux.run("send-keys", "-t", pane, f"echo shown-{token}", "Enter")
+    wait_until(
+        lambda: f"shown-{token}" in ctx.app.read_screen(ctx.tab_for_window("main").terminals[0].id),
+        timeout=ctx.timeout,
+        desc="output from elsewhere on screen while read-only",
+    )
+
+    # And back.
+    ctx.tmux.run("switch-client", "-c", client, "-r")
+    expect_text(ctx, "no longer read-only", "a notice that the client may write again")
+    term = ctx.tab_for_window("main").terminals[0].id
+    ctx.app.type_line(term, f"echo typed-{token}")
+    wait_until(
+        lambda: f"typed-{token}" in ctx.tmux.capture(pane),
+        timeout=ctx.timeout,
+        desc="typing to reach the pane again",
+        describe_state=lambda: ctx.tmux.capture(pane).strip()[-300:],
+    )
+    ctx.wait_synced()

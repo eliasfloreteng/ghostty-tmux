@@ -110,6 +110,9 @@ pub const Variable = enum {
     bracketed_paste,
     /// 1 if the cursor is blinking.
     cursor_blinking,
+    /// 1 if the client running the command is read-only (`attach -r`,
+    /// `switch-client -r`).
+    client_readonly,
     /// Cursor colour in pane. Possible formats:
     /// - Named colors: `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
     ///   `cyan`, `white`, `default`, `terminal`, or bright variants.
@@ -192,6 +195,7 @@ pub const Variable = enum {
         return switch (self) {
             .alternate_on,
             .bracketed_paste,
+            .client_readonly,
             .cursor_blinking,
             .cursor_flag,
             .focus_flag,
@@ -247,6 +251,7 @@ pub const Variable = enum {
             .window_zoomed_flag,
             .alternate_on,
             .bracketed_paste,
+            .client_readonly,
             .cursor_blinking,
             .cursor_flag,
             .focus_flag,

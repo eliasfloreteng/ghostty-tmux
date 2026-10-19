@@ -221,6 +221,19 @@ pub const Viewer = struct {
     /// 0 for tmux's own behaviour. See `Options.pause_after`.
     pause_after: u32 = 0,
 
+    /// Whether tmux has made this client read-only, by `attach -r` or
+    /// `switch-client -r`. See `refuseReadOnly`.
+    ///
+    /// Asked alongside the version on attach, and again on every session
+    /// change, which is how `switch-client -r` shows: tmux announces the
+    /// change as a `%session-changed` for the session we are already on.
+    /// (`list-windows` cannot say: its formats have no client.)
+    read_only: bool = false,
+
+    /// When we last told the user that typing goes nowhere because the
+    /// client is read-only, so that every keystroke does not say it again.
+    read_only_noticed: ?std.Io.Timestamp = null,
+
     /// The tmux paste buffer our pastes go through. See `nextPaste`.
     ///
     /// Random per viewer because buffers belong to the server, not to us:
@@ -769,6 +782,10 @@ pub const Viewer = struct {
         // Developer note: this function must never return an error. If
         // an error occurs we must go into a defunct state or some other
         // state to gracefully handle it.
+        if (self.read_only) {
+            if (self.refuseReadOnly(input)) |actions| return actions;
+        }
+
         return switch (input) {
             .tmux => self.nextTmux(input.tmux),
             .write => self.nextWrite(input.write),
@@ -785,6 +802,72 @@ pub const Viewer = struct {
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
         };
+    }
+
+    /// What a read-only client does instead of `input`, or null if it
+    /// may go ahead.
+    ///
+    /// tmux only enforces read-only for keys typed into a normal client:
+    /// "only keys bound to the detach-client or switch-client commands
+    /// have any effect". A control client has no keys, and the commands
+    /// it sends are run whatever its flags (tmux 3.2 to 3.6 alike). So
+    /// the GUI's keys and verbs, which stand in for a client's keys, are
+    /// held to it here: the user, or whoever made this client read-only,
+    /// meant it to watch, and a keystroke reaching a pane anyway would
+    /// be a surprise for everyone else attached.
+    ///
+    /// The session keeps working otherwise. Output, layouts and the rest
+    /// of tmux's notifications still arrive, and detaching still works.
+    fn refuseReadOnly(self: *Viewer, input: Input) ?[]const Action {
+        const refusal: Notice = .{
+            .kind = .command_error,
+            // tmux's own wording, for a command a read-only client may
+            // not run.
+            .text = "client is read-only",
+        };
+
+        switch (input) {
+            // Not changes to the session. Our size is fine to report:
+            // `-r` comes with `ignore-size`, so tmux does not size
+            // anything after it while the client is read-only, and has
+            // it already when the flag goes.
+            .tmux,
+            .client_size,
+            .detach,
+            => return null,
+
+            // Side effects of the GUI, not something the user asked
+            // tmux for: a surface being laid out or focused. Nothing to
+            // tell them, and focus still moves here, just not in tmux.
+            .resize,
+            .select_pane,
+            => return &.{},
+
+            // Typing. Said once in a while rather than per keystroke.
+            .write,
+            .paste,
+            => {
+                const now = std.Io.Timestamp.now(self.io, .awake);
+                if (self.read_only_noticed) |last| {
+                    const quiet: std.Io.Duration = .fromSeconds(3);
+                    if (last.durationTo(now).nanoseconds < quiet.nanoseconds) {
+                        return &.{};
+                    }
+                }
+                self.read_only_noticed = now;
+                return self.singleAction(.{ .notice = refusal });
+            },
+
+            // Something the user asked tmux for in so many words.
+            .new_window,
+            .zoom_pane,
+            .move_window,
+            .rename_window,
+            .split,
+            .kill_windows,
+            .kill_pane,
+            => return self.singleAction(.{ .notice = refusal }),
+        }
     }
 
     /// Ask tmux to resize a pane.
@@ -2590,6 +2673,11 @@ pub const Viewer = struct {
         });
         errdefer replacement.deinit();
 
+        // Not a fact about the session: `switch-client -r` is how tmux
+        // changes it, and the list that follows says whether it did.
+        replacement.read_only = self.read_only;
+        replacement.read_only_noticed = self.read_only_noticed;
+
         // Our actions must start out empty so we don't mix arenas
         assert(actions.items.len == 0);
         errdefer actions.* = .empty;
@@ -2601,7 +2689,7 @@ pub const Viewer = struct {
 
         // Setup our command queue and put ourselves in the command queue
         // state. The list is sent by the caller's flush.
-        try replacement.queueCommands(&.{.list_windows});
+        try replacement.queueCommands(&.{ .client_readonly, .list_windows });
         replacement.state = .command_queue;
 
         // Everything we sent for the old session is still going to be
@@ -2742,12 +2830,24 @@ pub const Viewer = struct {
                 try self.receivedPaneVisible(id, content);
             },
 
-            .tmux_version => try self.receivedTmuxVersion(content),
+            .tmux_version => try self.receivedTmuxVersion(
+                arena_alloc,
+                actions,
+                content,
+            ),
+
+            .client_readonly => try self.receivedReadOnly(
+                arena_alloc,
+                actions,
+                std.mem.eql(u8, std.mem.trim(u8, content, " \t\r\n"), "1"),
+            ),
         }
     }
 
     fn receivedTmuxVersion(
         self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
         content: []const u8,
     ) !void {
         const line = std.mem.trim(u8, content, " \t\r\n");
@@ -2766,6 +2866,7 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.tmux_version = try self.alloc.dupe(u8, data.version);
+        try self.receivedReadOnly(arena_alloc, actions, data.client_readonly);
 
         // Now that the version is known, and only now, because the flag
         // does not exist before 3.2 and an older server answers with an
@@ -2773,6 +2874,26 @@ pub const Viewer = struct {
         if (self.pause_after > 0 and self.tmuxVersionAtLeast(3, 2)) {
             try self.queueCommands(&.{.{ .pause_after = self.pause_after }});
         }
+    }
+
+    /// tmux told us whether this client is read-only. Only a change is
+    /// news, and being writable is not news on attach.
+    fn receivedReadOnly(
+        self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        read_only: bool,
+    ) Allocator.Error!void {
+        if (read_only == self.read_only) return;
+        self.read_only = read_only;
+        self.read_only_noticed = null;
+        try actions.append(arena_alloc, .{ .notice = .{
+            .kind = .message,
+            .text = if (read_only)
+                "this client is read-only: nothing typed here reaches the session"
+            else
+                "this client is no longer read-only",
+        } });
     }
 
     fn receivedListWindows(
@@ -3407,8 +3528,13 @@ const Command = union(enum) {
     /// back to our panes.
     pane_state,
 
-    /// Get the tmux server version.
+    /// Get the tmux server version, and whether this client is
+    /// read-only.
     tmux_version,
+
+    /// Whether this client is read-only, on its own: see
+    /// `Viewer.read_only`.
+    client_readonly,
 
     /// Ask tmux to pause a pane rather than let its backlog grow without
     /// bound. The payload is the age in seconds.
@@ -3426,6 +3552,7 @@ const Command = union(enum) {
             .pane_visible,
             .pane_state,
             .tmux_version,
+            .client_readonly,
             .pause_after,
             => {},
             .user => |v| alloc.free(v),
@@ -3501,6 +3628,10 @@ const Command = union(enum) {
                 "display-message -p '{s}'\n",
                 .{comptime Format.tmux_version.comptimeFormat()},
             )),
+
+            .client_readonly => try writer.writeAll(
+                "display-message -p '#{client_readonly}'\n",
+            ),
 
             .user => |v| try writer.writeAll(v),
         }
@@ -3579,7 +3710,7 @@ const Format = struct {
 
     const tmux_version: Format = .{
         .delim = ' ',
-        .vars = &.{.version},
+        .vars = &.{ .version, .client_readonly },
     };
 
     /// The format string, available at comptime.
@@ -3727,7 +3858,7 @@ test "session changed resets state" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Receive window layout with two panes (same format as "initial flow" test)
         .{
             .input = .{ .tmux = .{
@@ -3797,9 +3928,12 @@ test "session changed resets state" {
         try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = "" } }).len);
     }
     try testing.expectEqual(0, viewer.orphan_replies);
-    try testing.expectEqual(1, viewer.command_queue.len());
+    try testing.expectEqual(2, viewer.command_queue.len());
 
     try testViewer(&viewer, &.{
+        // Whether the client is still writable, asked again because
+        // `switch-client -r` is a session change too.
+        .{ .input = .{ .tmux = .{ .block_end = "0" } }, .commands = &.{} },
         // Receive new window layout for new session (same layout, different session/window)
         // Uses same pane IDs 0,1 - they should be re-created since old panes were cleared
         .{
@@ -3847,7 +3981,7 @@ test "initial flow" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = "3.5a 0" } },
             .commands = &.{},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
@@ -3963,7 +4097,7 @@ test "capture replay decodes escaped escape sequences" {
             .id = 42,
             .name = "main",
         } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // One pane, so the first capture is pane_history for pane 0. The
         // captures must ask tmux to escape what it sends: a raw ESC in a
         // block payload would end the control mode DCS.
@@ -4033,7 +4167,7 @@ test "layout change" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -4101,7 +4235,7 @@ test "layout_change does not wait for commands already in flight" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -4165,7 +4299,7 @@ test "layout_change returns command when queue was empty" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -4230,7 +4364,7 @@ test "window_add queues list_windows when queue empty" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -4289,7 +4423,7 @@ test "window_add queues list_windows when queue not empty" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Receive initial window layout with one pane
         .{
             .input = .{ .tmux = .{
@@ -4346,7 +4480,7 @@ test "two pane flow with pane state" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // list-windows output with 2 panes in a vertical split
         .{
             .input = .{ .tmux = .{
@@ -4558,7 +4692,7 @@ test "pane state ignores out of bounds scroll region" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{
             .input = .{ .tmux = .{
                 .block_end = "$0 @0 1 80 24 b25d,80x24,0,0,0 0 b25d,80x24,0,0,0 %0",
@@ -4626,7 +4760,7 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
 
         // Tmux version response.
         "%begin 2 2 0\n" ++
-        "3.5a\n" ++
+        "3.5a 0\n" ++
         "%end 2 2 0\n" ++
 
         // Window and pane layout.
@@ -4770,7 +4904,7 @@ test "write sends keys to the target pane" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // One window with a single pane, id 0.
         .{
             .input = .{ .tmux = .{
@@ -4825,7 +4959,7 @@ test "a write does not wait for commands in flight" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // One window with a single pane, id 0. This sends the pane setup
         // commands, a history capture among them, which for a big pane
         // can take a long time to come back.
@@ -4897,7 +5031,7 @@ test "write to an unknown pane is dropped" {
         },
         // The version reply. list-windows was sent along with the
         // version query, so this sends nothing.
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Only pane 0 exists.
         .{
             .input = .{ .tmux = .{
@@ -5127,7 +5261,7 @@ fn testSinglePaneSteps() []const TestStep {
             .id = 1,
             .name = "test",
         } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
             \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
@@ -5167,7 +5301,7 @@ fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
             .id = 1,
             .name = "test",
         } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{ .input = .{ .tmux = .{
             .block_end = "$0 @0 1 83 44 " ++ layout ++ " 0 " ++ layout ++ " %0",
         } } },
@@ -5857,7 +5991,7 @@ fn testThreeWindowSteps() []const TestStep {
             .id = 1,
             .name = "test",
         } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
             \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
@@ -6201,7 +6335,7 @@ test "a window already zoomed when we attach arrives zoomed" {
             .id = 1,
             .name = "test",
         } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
 
         // list-windows, with the zoom flag set. The zoomed pane is read
         // out of the visible layout rather than taken to be the active
@@ -6264,7 +6398,7 @@ test "pause mode is asked for once the version allows it" {
         // exist before 3.2 and we cannot know which we are talking to
         // until tmux says.
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = "3.5a 0" } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     var found = false;
@@ -6298,7 +6432,7 @@ test "an old tmux is not asked for pause mode" {
         // 3.1 has no pause-after flag. Asking would earn an error block
         // and nothing else.
         .{
-            .input = .{ .tmux = .{ .block_end = "3.1c" } },
+            .input = .{ .tmux = .{ .block_end = "3.1c 0" } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     var it = v.command_queue.iterator(.forward);
@@ -6322,7 +6456,7 @@ test "pause mode is not asked for when it is off" {
             .name = "test",
         } } } },
         .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .input = .{ .tmux = .{ .block_end = "3.5a 0" } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     var it = v.command_queue.iterator(.forward);
@@ -6406,7 +6540,7 @@ test "an old tmux sizes windows the old way" {
             .name = "test",
         } } } },
         // Per-window sizes arrived in tmux 3.4.
-        .{ .input = .{ .tmux = .{ .block_end = "3.3a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.3a 0" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
             \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
@@ -6913,7 +7047,7 @@ test "layout change resizes a surviving pane" {
             .id = 1,
             .name = "test",
         } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // One pane filling the window.
         .{
             .input = .{ .tmux = .{
@@ -6969,7 +7103,7 @@ test "list-windows windows action outlives the parse" {
             .id = 42,
             .name = "main",
         } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{
             .input = .{ .tmux = .{
                 .block_end =
@@ -7354,7 +7488,7 @@ test "the active pane comes from the window list" {
     try testViewer(&viewer, &.{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .session_changed = .{ .id = 1, .name = "s" } } } },
-        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         // Pane 1 is active, not the first listed.
         .{
             .input = .{ .tmux = .{
@@ -7458,4 +7592,140 @@ test "the echo of our own select is not passed back" {
         } } },
         .contains_tags = &.{.windows},
     }});
+}
+
+test "a read-only client watches but does not touch the session" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var buf: [4]Viewer.Notice = undefined;
+
+    // Attached with `-r`: the version reply says so, and the user is told.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+    });
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = "3.5a 1" } });
+        const notices = testNotices(actions, &buf);
+        try testing.expectEqual(1, notices.len);
+        try testing.expectEqual(.message, notices[0].kind);
+        try testing.expect(viewer.read_only);
+    }
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{
+        .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+    } } }});
+    try testViewer(&viewer, &testPrimaryCaptureSteps("", ""));
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+    try testing.expect(viewer.command_queue.empty());
+
+    // Typing sends nothing, and says why once rather than per key.
+    {
+        const actions = viewer.next(.{ .write = .{ .pane_id = 0, .data = "x" } });
+        try testing.expectEqual(1, actions.len);
+        try testing.expectEqual(.command_error, testNotices(actions, &buf)[0].kind);
+    }
+    try testing.expectEqual(0, viewer.next(.{ .write = .{ .pane_id = 0, .data = "y" } }).len);
+    try testing.expectEqual(0, viewer.next(.{ .paste = .{ .pane_id = 0, .data = "z" } }).len);
+
+    // Asking tmux for something says why nothing happened, every time.
+    for ([_]Viewer.Input{
+        .new_window,
+        .{ .split = .{ .pane_id = 0, .direction = .right } },
+        .{ .kill_pane = .{ .pane_id = 0 } },
+        .{ .kill_windows = .{ .pane_id = 0, .scope = .this } },
+        .{ .zoom_pane = .{ .pane_id = 0 } },
+        .{ .rename_window = .{ .pane_id = 0, .name = "x" } },
+        .{ .move_window = .{ .pane_id = 0, .amount = 1 } },
+    }) |input| {
+        const actions = viewer.next(input);
+        try testing.expectEqual(1, actions.len);
+        try testing.expectEqual(.command_error, testNotices(actions, &buf)[0].kind);
+    }
+
+    // Layout and focus are not the user's to report, and are dropped
+    // quietly.
+    try testing.expectEqual(0, viewer.next(.{ .resize = .{
+        .pane_id = 0,
+        .cols = 40,
+        .rows = 20,
+    } }).len);
+    try testing.expectEqual(0, viewer.next(.{ .select_pane = .{ .pane_id = 0 } }).len);
+    try testing.expect(viewer.command_queue.empty());
+
+    // Our size still goes through.
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .client_size = .{ .cols = 100, .rows = 30 } },
+            .commands = &.{"refresh-client -C 100x30\n"},
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    });
+
+    // `switch-client -r` again: tmux re-announces the session we are on,
+    // and is asked whether the client may write now.
+    try testViewer(&viewer, &.{.{
+        .input = .{ .tmux = .{ .session_changed = .{ .id = 1, .name = "test" } } },
+        .commands = &.{ "display-message -p '#{client_readonly}'", "list-windows" },
+    }});
+    try testing.expect(viewer.read_only);
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = "0" } });
+        const notices = testNotices(actions, &buf);
+        try testing.expectEqual(1, notices.len);
+        try testing.expectEqual(.message, notices[0].kind);
+        try testing.expect(!viewer.read_only);
+    }
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{
+        .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+    } } }});
+    try testViewer(&viewer, &testPrimaryCaptureSteps("", ""));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .write = .{ .pane_id = 0, .data = "x" } },
+            .commands = &.{"send-keys -H -t %0 78\n"},
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .detach, .commands = &.{"detach-client\n"} },
+    });
+}
+
+test "a writable client is not told it is writable" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var buf: [4]Viewer.Notice = undefined;
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+    });
+    const actions = viewer.next(.{ .tmux = .{ .block_end = "3.5a 0" } });
+    try testing.expectEqual(0, testNotices(actions, &buf).len);
+    try testing.expect(!viewer.read_only);
+}
+
+test "a read-only client may still detach" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 1" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+        } } },
+    });
+    try testing.expect(viewer.read_only);
+    try testViewer(&viewer, &.{.{ .input = .detach, .commands = &.{"detach-client\n"} }});
 }

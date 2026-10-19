@@ -155,6 +155,9 @@ const Session = struct {
             format: []const u8,
             expect: []const u8,
         } = null,
+
+        /// Attach with `-r`, as a read-only client.
+        read_only: bool = false,
     };
 
     fn startWith(
@@ -297,7 +300,10 @@ const Session = struct {
 
         // -CC, not -C: only the doubled form wraps the stream in the DCS
         // that this whole chain exists to parse.
-        const pid = try spawn(&pty, &.{
+        const pid = if (opts.read_only) try spawn(&pty, &.{
+            "tmux", "-f",  "/dev/null", "-S",
+            socket, "-CC", "attach",    "-r",
+        }) else try spawn(&pty, &.{
             "tmux", "-f",  "/dev/null", "-S",
             socket, "-CC", "attach",
         });
@@ -2254,5 +2260,88 @@ test "live: the GUI is told which pane and window tmux is on" {
     Ctx.want_window = active.id;
     Ctx.want_pane = now_id;
     try session.waitFor(Ctx.pred);
+    try testing.expect(!session.exited);
+}
+
+test "live: a read-only client keeps watching and keeps its hands off" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "cat");
+    defer session.deinit();
+    try session.waitFor(attached);
+    try testing.expect(!session.viewer.read_only);
+
+    const raw = try session.ask(&.{ "list-clients", "-F", "#{client_name}" });
+    defer alloc.free(raw);
+    const client = std.mem.trim(u8, raw, " \r\n");
+
+    // `switch-client -r` toggles the flag, and tmux announces it as a
+    // change to the session we are already on.
+    {
+        const out = try session.ask(&.{ "switch-client", "-c", client, "-r" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.read_only and attached(v);
+        }
+    }.pred);
+    try testing.expect(session.lastNotice(.message) != null);
+
+    var it = session.viewer.panes.iterator();
+    const pane_id = it.next().?.key_ptr.*;
+
+    // tmux would run our send-keys regardless; it is refused here.
+    try session.input(.{ .write = .{ .pane_id = pane_id, .data = "refused\r" } });
+    try testing.expectEqualStrings("client is read-only", session.lastNotice(.command_error).?);
+    try testing.expect(session.viewer.command_queue.empty());
+
+    // Output still arrives while read-only.
+    {
+        const target = try std.fmt.allocPrint(alloc, "%{d}", .{pane_id});
+        defer alloc.free(target);
+        const out = try session.ask(&.{ "send-keys", "-t", target, "from elsewhere", "Enter" });
+        alloc.free(out);
+    }
+    try session.waitForPaneText(pane_id, "from elsewhere");
+
+    // And back.
+    {
+        const out = try session.ask(&.{ "switch-client", "-c", client, "-r" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return !v.viewer.read_only and attached(v);
+        }
+    }.pred);
+
+    it = session.viewer.panes.iterator();
+    const again = it.next().?.key_ptr.*;
+    try session.input(.{ .write = .{ .pane_id = again, .data = "typed\r" } });
+    try session.waitForPaneText(again, "typed");
+
+    const text = try session.paneText(again);
+    defer alloc.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "refused") == null);
+    try testing.expect(!session.exited);
+}
+
+test "live: attaching read-only says so and still shows the pane" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "echo hello; cat", .{
+        .read_only = true,
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+    try testing.expect(session.viewer.read_only);
+    try testing.expect(session.lastNotice(.message) != null);
+
+    var it = session.viewer.panes.iterator();
+    const pane_id = it.next().?.key_ptr.*;
+    try session.waitForPaneText(pane_id, "hello");
     try testing.expect(!session.exited);
 }
