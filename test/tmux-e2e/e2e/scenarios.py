@@ -1167,6 +1167,48 @@ def pane_mouse_scroll(ctx: Context) -> None:
 
 
 @scenario
+def pane_mouse_reporting(ctx: Context) -> None:
+    """A program in a pane that asks for the mouse gets clicks and the wheel, and history isn't scrolled."""
+    ctx.attach({"main": 2})
+    pane = ctx.tmux.window(SESSION, "main").panes[1].id
+    term = ctx.terminal_for_pane(pane)
+    # SGR reporting of presses, releases and the wheel. `cat -v` stays in
+    # the tty's canonical mode, whose echo shows each report as it arrives
+    # (ESC as `^[`).
+    ctx.tmux.run("send-keys", "-t", pane, "printf '\\033[?1000h\\033[?1006hmouse-%s\\n' ready; cat -v", "Enter")
+    wait_until(
+        lambda: "mouse-ready" in ctx.app.read_screen(term),
+        timeout=ctx.timeout,
+        desc="the program's request for the mouse in the GUI",
+    )
+    before = _scrollbar(ctx)
+
+    # A click near the pane's top left corner, which the program must get
+    # in the pane's own cells (tmux's are 1-based), not the window's.
+    ctx.app.focus(term)
+    ctx.app.click(term, 20, 20)
+    click = wait_until(
+        lambda: re.search(r"\^\[\[<0;(\d+);(\d+)M\^\[\[<0;\1;\2m", ctx.tmux.capture(pane)),
+        timeout=ctx.timeout,
+        desc="the program to read a press and a release at the same cell",
+        describe_state=lambda: repr(ctx.tmux.capture(pane)),
+    )
+    col, row = int(click[1]), int(click[2])
+    check(1 <= col <= 5 and 1 <= row <= 3, f"the click arrived at {col};{row}, not near the pane's corner")
+
+    ctx.app.scroll(term, 3)
+    wait_until(
+        lambda: f"^[[<64;{col};{row}M" in ctx.tmux.capture(pane),
+        timeout=ctx.timeout,
+        desc="the program to read the wheel",
+        describe_state=lambda: repr(ctx.tmux.capture(pane)),
+    )
+    check(_scrollbar(ctx) == before, f"the wheel scrolled the pane's history: {before} -> {_scrollbar(ctx)}")
+    check(ctx.tmux.control_clients(), "mouse input dropped the control client")
+    check(ctx.tab_for_window("main").focused_terminal == term, "the click moved focus off the pane")
+
+
+@scenario
 def read_only_client(ctx: Context) -> None:
     """`switch-client -r` keeps the session on screen; typing and splits are refused with a notice."""
     ctx.attach()

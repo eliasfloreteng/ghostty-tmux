@@ -157,6 +157,10 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   same columns as in tmux, less and vim (alternate screen) show what tmux
   shows, history is there after attaching (`write_scrollback_file`), and
   the wheel scrolls it (read from the app log's scrollbar actions).
+- `pane_mouse_reporting`: a program in a pane that turned on mouse
+  reporting (SGR) reads a click in the pane's own cells and the wheel,
+  and the wheel no longer scrolls Ghostty's history. Events are sent with
+  the `send mouse ...` scripting commands, to the test app only.
 - `pane_osc52_clipboard`: OSC 52 from a program in a pane sets the macOS
   clipboard whatever tmux's `set-clipboard` is (tmux hands a control
   client the pane's output as written, and the option is only about the
