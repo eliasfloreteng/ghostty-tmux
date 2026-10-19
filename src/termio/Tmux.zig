@@ -42,6 +42,9 @@ pub const Config = Pane;
 /// We have no per-thread state: there is no pty to poll and no write
 /// queue to own, because input is handed straight to the router.
 pub const ThreadData = struct {
+    /// What we registered with the router as, to give back on exit.
+    endpoint: ?Router.Endpoint = null,
+
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         _ = self;
         _ = alloc;
@@ -76,9 +79,10 @@ pub fn threadEnter(
     _ = alloc;
 
     // The thread data union is undefined until we set it.
-    td.backend = .{ .tmux = .{} };
+    const endpoint = io.tmuxEndpoint();
+    td.backend = .{ .tmux = .{ .endpoint = endpoint } };
 
-    self.router.register(self.pane_id, io.tmuxEndpoint());
+    self.router.register(self.pane_id, endpoint);
 
     // Pick up whatever was buffered before we existed: our initial size
     // and the capture replay. An idle session produces no host output, so
@@ -95,7 +99,8 @@ pub fn threadExit(self: *Tmux, td: *termio.Termio.ThreadData) void {
 
     // Blocks out any delivery already in progress, so once this returns
     // our terminal can be torn down.
-    if (self.router.deregister(self.pane_id)) {
+    const endpoint = td.backend.tmux.endpoint orelse return;
+    if (self.router.deregister(self.pane_id, endpoint)) {
         // The channel was still open, which means the display was closed
         // first rather than the pane going away. Make that mean something
         // on the tmux side.

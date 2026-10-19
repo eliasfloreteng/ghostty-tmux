@@ -62,6 +62,16 @@ pub const Router = struct {
 
     channels: std.AutoArrayHashMapUnmanaged(usize, *Channel) = .empty,
 
+    /// Closed channels whose pane id has since come back with a channel of
+    /// its own, kept until the display still holding them lets go.
+    ///
+    /// tmux pane ids are unique per server, not per listing: the viewer
+    /// re-lists after `%session-changed`, even for the session it was
+    /// already on, and a session switched to can hold a window linked
+    /// from the old one. The pane is then dropped and comes back under
+    /// the same id while its old display is still closing.
+    retired: std.ArrayList(*Channel) = .empty,
+
     /// How much unread pane output we are willing to hold for a pane
     /// nothing has claimed yet. A pane the GUI never realizes would
     /// otherwise grow this without bound.
@@ -260,6 +270,8 @@ pub const Router = struct {
 
         for (self.channels.values()) |ch| ch.destroy(self.alloc);
         self.channels.deinit(self.alloc);
+        for (self.retired.items) |ch| ch.destroy(self.alloc);
+        self.retired.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -268,15 +280,21 @@ pub const Router = struct {
     // mutex held, so these only ever take S.
     // ---------------------------------------------------------------
 
-    /// Whether this pane has no channel yet, i.e. the caller should make
-    /// one and attach it to the viewer.
+    /// Whether this pane has no open channel, i.e. the caller should make
+    /// one and attach it to the viewer. A closed one is a pane that went
+    /// away; if the viewer has it again, it came back.
     pub fn needsChannel(self: *Router, pane_id: usize) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return !self.channels.contains(pane_id);
+        const ch = self.channels.get(pane_id) orelse return true;
+        return ch.closed;
     }
 
     /// Make a channel for a pane and return the sink to hand the viewer.
+    ///
+    /// A closed channel for the same pane is replaced: it belongs to the
+    /// pane's previous life and its display, which has been told to close
+    /// and must not be handed the new one's ops. See `retired`.
     pub fn createChannel(
         self: *Router,
         pane_id: usize,
@@ -284,9 +302,27 @@ pub const Router = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
+        try self.retired.ensureUnusedCapacity(self.alloc, 1);
         const gop = try self.channels.getOrPut(self.alloc, pane_id);
+        if (gop.found_existing) {
+            const old = gop.value_ptr.*;
+            if (!old.closed) return old.sink();
+
+            const ch = try self.alloc.create(Channel);
+            ch.* = .{ .router = self, .pane_id = pane_id };
+            gop.value_ptr.* = ch;
+
+            // Nobody holds it: nothing left to tell. Otherwise it waits
+            // for its display to deregister, being delivered its close
+            // by `flush` in the meantime if it has not been yet.
+            if (old.endpoint == null) {
+                old.destroy(self.alloc);
+            } else {
+                self.retired.appendAssumeCapacity(old);
+            }
+            return ch.sink();
+        }
         errdefer _ = self.channels.swapRemove(pane_id);
-        if (gop.found_existing) return gop.value_ptr.*.sink();
 
         const ch = try self.alloc.create(Channel);
         ch.* = .{ .router = self, .pane_id = pane_id };
@@ -328,13 +364,15 @@ pub const Router = struct {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
 
-            for (self.channels.values()) |ch| {
-                if (ch.endpoint == null) continue;
-                if (ch.buffer.items.len == 0 and
-                    !(ch.closed and !ch.close_delivered)) continue;
+            for ([_][]const *Channel{ self.channels.values(), self.retired.items }) |list| {
+                for (list) |ch| {
+                    if (ch.endpoint == null) continue;
+                    if (ch.buffer.items.len == 0 and
+                        !(ch.closed and !ch.close_delivered)) continue;
 
-                // On failure we simply try again next flush.
-                work.append(self.alloc, ch) catch break;
+                    // On failure we simply try again next flush.
+                    work.append(self.alloc, ch) catch break;
+                }
             }
         }
 
@@ -404,15 +442,32 @@ pub const Router = struct {
     ///
     /// Returns true if the pane was still open, which means the display
     /// closed first and the caller should ask tmux to kill the pane.
-    pub fn deregister(self: *Router, pane_id: usize) bool {
+    ///
+    /// `endpoint` is the one that registered: the pane may have come back
+    /// with a channel of its own since, which is not this display's to
+    /// give up.
+    pub fn deregister(self: *Router, pane_id: usize, endpoint: Endpoint) bool {
         self.delivery.lockUncancelable(self.io);
         defer self.delivery.unlock(self.io);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const ch = self.channels.get(pane_id) orelse return false;
-        ch.endpoint = null;
-        return !ch.closed;
+        if (self.channels.get(pane_id)) |ch| {
+            if (ch.endpoint) |ep| if (ep.ctx == endpoint.ctx) {
+                ch.endpoint = null;
+                return !ch.closed;
+            };
+        }
+
+        for (self.retired.items, 0..) |ch, i| {
+            const ep = ch.endpoint orelse continue;
+            if (ch.pane_id != pane_id or ep.ctx != endpoint.ctx) continue;
+            _ = self.retired.swapRemove(i);
+            ch.destroy(self.alloc);
+            return false;
+        }
+
+        return false;
     }
 
     pub fn writeInput(self: *Router, pane_id: usize, data: []const u8) void {
@@ -885,7 +940,7 @@ test "nothing reaches an endpoint after deregister" {
     tr.router.register(3, ep.endpoint());
 
     // Still open, so the display closed first: the user did this.
-    try testing.expect(tr.router.deregister(3));
+    try testing.expect(tr.router.deregister(3, ep.endpoint()));
 
     ep.poisoned = true;
     sink.send(&.{.{ .bytes = "ignored" }});
@@ -908,7 +963,45 @@ test "deregister reports a pane tmux already closed" {
     tr.router.register(4, ep.endpoint());
 
     sink.close();
-    try testing.expect(!tr.router.deregister(4));
+    try testing.expect(!tr.router.deregister(4, ep.endpoint()));
+}
+
+test "a pane that comes back gets a channel of its own" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    var old_ep: TestEndpoint = .{ .alloc = alloc };
+    defer old_ep.deinit();
+    var new_ep: TestEndpoint = .{ .alloc = alloc };
+    defer new_ep.deinit();
+
+    // The pane is shown, then dropped: a session change re-lists every
+    // window, the session it was already on included.
+    const old_sink = try tr.router.createChannel(2);
+    tr.router.register(2, old_ep.endpoint());
+    old_sink.close();
+    try testing.expect(tr.router.needsChannel(2));
+
+    // It is listed again before its old display has finished closing, and
+    // a new display claims it. Neither may see the other's traffic.
+    const new_sink = try tr.router.createChannel(2);
+    tr.router.register(2, new_ep.endpoint());
+    try testing.expect(!tr.router.needsChannel(2));
+    new_sink.send(&.{.{ .bytes = "fresh" }});
+    tr.router.flush();
+
+    try testing.expectEqual(1, old_ep.closes);
+    try testing.expectEqual(0, old_ep.bytes.items.len);
+    try testing.expectEqual(0, new_ep.closes);
+    try testing.expectEqualStrings("fresh", new_ep.bytes.items);
+
+    // The old display going away is not the new one going away, and is
+    // not a reason to kill the pane.
+    try testing.expect(!tr.router.deregister(2, old_ep.endpoint()));
+    try testing.expect(tr.router.paneOpen(2));
+    try testing.expect(tr.router.deregister(2, new_ep.endpoint()));
 }
 
 test "registering an unknown pane closes it immediately" {
