@@ -38,6 +38,7 @@ const sinkpkg = @import("sink.zig");
 const Op = sinkpkg.Op;
 const Sink = sinkpkg.Sink;
 const KillScope = sinkpkg.KillScope;
+const SplitDirection = sinkpkg.SplitDirection;
 
 const log = std.log.scoped(.terminal_tmux_router);
 
@@ -106,7 +107,7 @@ pub const Router = struct {
             split: *const fn (
                 ctx: *anyopaque,
                 pane_id: usize,
-                horizontal: bool,
+                direction: SplitDirection,
             ) void,
 
             /// The GUI closed a tab, which for a tmux surface means
@@ -548,17 +549,16 @@ pub const Router = struct {
         self.host.vtable.detach(self.host.ctx);
     }
 
-    /// Ask tmux to split a pane. `horizontal` is tmux's sense of the
-    /// word: a new pane to the right, side by side.
+    /// Ask tmux to split a pane, putting the new one on the given side.
     pub fn splitPane(
         self: *Router,
         pane_id: usize,
-        horizontal: bool,
+        direction: SplitDirection,
     ) void {
         if (!self.paneOpen(pane_id)) return;
         if (!self.hostAcquire()) return;
         defer self.hostRelease();
-        self.host.vtable.split(self.host.ctx, pane_id, horizontal);
+        self.host.vtable.split(self.host.ctx, pane_id, direction);
     }
 
     /// Ask tmux to close windows. `pane_id` names the window the user
@@ -665,7 +665,7 @@ const TestHost = struct {
     renames: std.ArrayList([]u8) = .empty,
     splits: std.ArrayList(struct {
         pane_id: usize,
-        horizontal: bool,
+        direction: SplitDirection,
     }) = .empty,
     window_kills: std.ArrayList(struct {
         pane_id: usize,
@@ -734,11 +734,11 @@ const TestHost = struct {
         }) catch @panic("oom");
     }
 
-    fn split(ctx: *anyopaque, pane_id: usize, horizontal: bool) void {
+    fn split(ctx: *anyopaque, pane_id: usize, direction: SplitDirection) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
         self.splits.append(self.alloc, .{
             .pane_id = pane_id,
-            .horizontal = horizontal,
+            .direction = direction,
         }) catch @panic("oom");
     }
 

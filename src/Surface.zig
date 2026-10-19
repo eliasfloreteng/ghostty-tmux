@@ -2387,7 +2387,7 @@ fn tmuxSplit(
 
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
-    pane.router.splitPane(pane.id, direction == .right);
+    pane.router.splitPane(pane.id, direction);
     return true;
 }
 
@@ -5775,8 +5775,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // than in the viewer, because which way is bigger is a
             // property of this surface, which tmux cannot see.
             if (self.tmuxSplit(switch (direction) {
-                .right, .left => .right,
-                .down, .up => .down,
+                .right => .right,
+                .left => .left,
+                .down => .down,
+                .up => .up,
                 .auto => if (self.size.screen.width > self.size.screen.height)
                     .right
                 else

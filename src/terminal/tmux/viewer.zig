@@ -444,12 +444,7 @@ pub const Viewer = struct {
             pane_id: usize,
             direction: Direction,
 
-            pub const Direction = enum {
-                /// New pane to the right: tmux's -h.
-                right,
-                /// New pane below: tmux's -v.
-                down,
-            };
+            pub const Direction = sinkpkg.SplitDirection;
         };
 
         pub const KillWindows = struct {
@@ -1675,10 +1670,14 @@ pub const Viewer = struct {
             return &.{};
         }
 
+        // `-b` puts the new pane before the one split, which is what
+        // left and up mean.
         return self.queueUserCommand("split-window {s} -t %{d}\n", .{
             switch (split.direction) {
                 .right => "-h",
+                .left => "-h -b",
                 .down => "-v",
+                .up => "-v -b",
             },
             split.pane_id,
         }) catch {
@@ -7728,4 +7727,28 @@ test "a read-only client may still detach" {
     });
     try testing.expect(viewer.read_only);
     try testViewer(&viewer, &.{.{ .input = .detach, .commands = &.{"detach-client\n"} }});
+}
+
+test "a split names the side the new pane goes" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+
+    const cases = .{
+        .{ .right, "split-window -h -t %0\n" },
+        .{ .left, "split-window -h -b -t %0\n" },
+        .{ .down, "split-window -v -t %0\n" },
+        .{ .up, "split-window -v -b -t %0\n" },
+    };
+    inline for (cases) |case| {
+        try testViewer(&viewer, &.{
+            .{
+                .input = .{ .split = .{ .pane_id = 0, .direction = case[0] } },
+                .commands = &.{case[1]},
+            },
+            .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        });
+    }
 }

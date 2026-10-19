@@ -54,6 +54,20 @@ pub const KillScope = enum {
     right,
 };
 
+/// Where a new pane goes relative to the one being split.
+///
+/// Lives here for the same reason as `KillScope`.
+pub const SplitDirection = enum {
+    /// To the right: tmux's `-h`.
+    right,
+    /// To the left: `-h -b`, the new pane before the old one.
+    left,
+    /// Below: tmux's `-v`.
+    down,
+    /// Above: `-v -b`.
+    up,
+};
+
 pub const Op = union(enum) {
     /// Raw VT bytes: `%output` data, or capture-pane replay content.
     ///

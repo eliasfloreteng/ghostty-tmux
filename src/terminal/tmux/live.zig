@@ -1896,6 +1896,45 @@ test "live: a downward split stacks the panes" {
     try testing.expect(!session.exited);
 }
 
+test "live: a split to the left or up puts the new pane first" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .left } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    {
+        const layout = session.viewer.windows.items[0].layout;
+        try testing.expect(layout.content == .horizontal);
+        try testing.expectEqual(1, layout.content.horizontal[0].content.pane);
+        try testing.expectEqual(0, layout.content.horizontal[1].content.pane);
+    }
+
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .up } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 3 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    {
+        const layout = session.viewer.windows.items[0].layout;
+        const right = layout.content.horizontal[1];
+        try testing.expect(right.content == .vertical);
+        try testing.expectEqual(2, right.content.vertical[0].content.pane);
+        try testing.expectEqual(0, right.content.vertical[1].content.pane);
+    }
+    try testing.expect(!session.exited);
+}
+
 test "live: a large styled history does not break the attach" {
     if (!enabled()) return error.SkipZigTest;
 

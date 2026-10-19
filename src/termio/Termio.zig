@@ -586,11 +586,15 @@ fn tmuxHostNewWindow(ctx: *anyopaque) void {
     self.tmuxHostInput(.new_window);
 }
 
-fn tmuxHostSplit(ctx: *anyopaque, pane_id: usize, horizontal: bool) void {
+fn tmuxHostSplit(
+    ctx: *anyopaque,
+    pane_id: usize,
+    direction: terminalpkg.tmux.Viewer.Input.Split.Direction,
+) void {
     const self: *Termio = @ptrCast(@alignCast(ctx));
     self.tmuxHostInput(.{ .split = .{
         .pane_id = pane_id,
-        .direction = if (horizontal) .right else .down,
+        .direction = direction,
     } });
 }
 
