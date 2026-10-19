@@ -427,7 +427,7 @@ class GhosttyApp:
 
     def _read_dump(self, terminal: str, action: str, name: str, timeout: float) -> str:
         before = {p: p.stat().st_mtime_ns for p in self.tmpdir.rglob(name)}
-        saved_clipboard = _pbpaste()
+        saved_clipboard = pbpaste()
         try:
             if not self.perform(terminal, action):
                 raise AppleScriptError(f"{action} was not performed")
@@ -440,7 +440,7 @@ class GhosttyApp:
 
             path = wait_until(new_file, timeout=timeout, interval=0.1, desc="screen dump file")
         finally:
-            _pbcopy(saved_clipboard)
+            pbcopy(saved_clipboard)
         text = path.read_text(errors="replace")
         path.unlink(missing_ok=True)
         return text
@@ -450,12 +450,12 @@ def _real(value: float):
     return ae.D.descriptorWithDouble_(value)
 
 
-def _pbpaste() -> str | None:
+def pbpaste() -> str | None:
     proc = subprocess.run(["pbpaste"], capture_output=True)
     return proc.stdout.decode(errors="surrogateescape") if proc.returncode == 0 else None
 
 
-def _pbcopy(text: str | None) -> None:
+def pbcopy(text: str | None) -> None:
     if text is None:
         return
     # Give the app a moment to finish its own clipboard write first.

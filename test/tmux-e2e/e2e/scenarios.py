@@ -7,6 +7,7 @@ screen reading, private tmux socket) and should pass on any recent build.
 
 from __future__ import annotations
 
+import base64
 import re
 import secrets
 import time
@@ -15,7 +16,7 @@ from typing import Callable
 
 from . import ax
 from .context import SESSION, Context
-from .ghostty import AppleScriptError
+from .ghostty import AppleScriptError, pbcopy, pbpaste
 from .util import CheckFailed, Skip, check, log, wait_until
 from .windows import native_windows, resize_front_window, screenshot
 
@@ -995,6 +996,56 @@ def pane_grapheme_widths(ctx: Context) -> None:
     finally:
         ctx.gateway = ""
         ctx.app.relaunch()
+
+
+def _osc52(ctx: Context, text: str, then: str = "") -> None:
+    encoded = base64.b64encode(text.encode()).decode()
+    ctx.tmux.run("send-keys", "-t", f"{SESSION}:main", f"printf '\\033]52;c;{encoded}\\a'{then}", "Enter")
+
+
+@scenario
+def pane_osc52_clipboard(ctx: Context) -> None:
+    """OSC 52 from a program in a pane sets the clipboard, as Ghostty's `clipboard-write` allows."""
+    # tmux passes a pane's output to a control client as the program wrote
+    # it, OSC 52 included, so the app sees the request itself. Whatever
+    # `set-clipboard` says: that option is about the terminals tmux draws
+    # on, and a control client is not one.
+    saved = pbpaste()
+    try:
+        ctx.attach()
+        for setting in ("on", "external", "off"):
+            ctx.tmux.run("set", "-g", "set-clipboard", setting)
+            text = f"osc52-{setting}-{secrets.token_hex(4)}"
+            _osc52(ctx, text)
+            wait_until(
+                lambda: pbpaste() == text,
+                timeout=ctx.timeout,
+                desc=f"{text!r} on the clipboard (set-clipboard {setting})",
+                describe_state=lambda: f"clipboard: {pbpaste()!r}",
+            )
+
+        # Which is Ghostty's to refuse.
+        ctx.app.relaunch("clipboard-write = deny\n")
+        ctx.gateway = ""
+        ctx.app.close_all_windows(timeout=ctx.timeout)
+        ctx.tmux.kill_server()
+        ctx.attach()
+        pbcopy("osc52-before")
+        # The GUI showing what the program printed next means it has
+        # been through the request.
+        _osc52(ctx, "osc52-denied", "; echo osc52-$((6*7))")
+        term = ctx.tab_for_window("main").terminals[0].id
+        wait_until(
+            lambda: "osc52-42" in ctx.app.read_screen(term),
+            timeout=ctx.timeout,
+            desc="the pane's output after the request in the GUI",
+        )
+        check(pbpaste() == "osc52-before", f"clipboard-write = deny let a pane write {pbpaste()!r}")
+    finally:
+        pbcopy(saved)
+        if "clipboard-write = deny" in ctx.app.config.read_text():
+            ctx.gateway = ""
+            ctx.app.relaunch()
 
 
 def _numbered_file(ctx: Context, lines: int) -> str:

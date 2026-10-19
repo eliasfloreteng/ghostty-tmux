@@ -157,6 +157,11 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   same columns as in tmux, less and vim (alternate screen) show what tmux
   shows, history is there after attaching (`write_scrollback_file`), and
   the wheel scrolls it (read from the app log's scrollbar actions).
+- `pane_osc52_clipboard`: OSC 52 from a program in a pane sets the macOS
+  clipboard whatever tmux's `set-clipboard` is (tmux hands a control
+  client the pane's output as written, and the option is only about the
+  terminals tmux draws on), and `clipboard-write = deny` refuses it. The
+  app is relaunched for the latter, and your clipboard text is restored.
 - `pane_grapheme_widths`: ZWJ sequences, flags, VS15/VS16 and combining
   marks take the columns tmux gives them, with
   `grapheme-width-method = legacy` and a program resetting mode 2027 (the
