@@ -855,7 +855,15 @@ extension Ghostty {
 
         override func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()
-            if result { focusDidChange(true) }
+
+            // Only in a key window. A window that is not key -- a tab that
+            // has not been shown yet, say -- can still pick a first
+            // responder as it loads, and that surface does not have focus:
+            // nothing typed reaches it. The controller syncs focus when its
+            // window becomes key. Reporting it early is not harmless: a
+            // tmux pane gaining focus tells tmux the user is there, which
+            // makes its window tmux's current one.
+            if result, window?.isKeyWindow ?? false { focusDidChange(true) }
             return result
         }
 
