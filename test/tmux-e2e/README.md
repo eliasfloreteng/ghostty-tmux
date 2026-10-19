@@ -58,7 +58,12 @@ window for each failed scenario.
   talking to _your_ running Ghostty instead. With raw events by pid, tests
   never touch another Ghostty instance, even one with the same bundle id.
 
-The test app takes focus while it runs. It also briefly uses the
+The test app takes focus while it runs: before every scenario it is
+activated (the standard `activate` event, by pid). Focus decides which
+pane tmux has active, so scenarios about focus need the app to really be
+the active one. macOS refuses that while the screen is locked, and may
+while you are using another app; the runner then prints `(app could not
+become active; focus checks will fail)` next to the scenario. It also briefly uses the
 clipboard: reading screen contents puts a file path on the clipboard, and
 the harness restores your previous clipboard _text_ afterwards.
 
@@ -69,9 +74,19 @@ the harness restores your previous clipboard _text_ afterwards.
   aborts with error `-1743`. Allow it in System Settings → Privacy &
   Security → Automation.
 - **Screen Recording** (optional): needed for useful failure screenshots.
-- **Accessibility** (optional): lets `resize_window` resize the window
-  through System Events. Without it, the scenario changes the font size
+- **Accessibility** (optional): lets the harness read what AppleScript
+  can't see -- the gateway's overlay, notice bars, alerts, menu items --
+  press the overlay's buttons, and resize windows (`e2e/ax.py`). Without
+  it those checks `SKIP`, and `resize_window` changes the font size
   instead, which also changes the grid size.
+
+  This uses the Accessibility API addressed by pid
+  (`AXUIElementCreateApplication`), not System Events UI scripting:
+  System Events turns element references back into
+  `application process "ghostty"`, which is also the name of a Ghostty you
+  may be running yourself, so a click through it can land in your app.
+  The tree only holds windows on the active Space, so lookups wait for a
+  window to show up there.
 
 ## What is checked
 
@@ -105,9 +120,43 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   `new_split`, closing a split or tab, selecting a tab, focusing a split,
   `toggle_split_zoom`.
 - `pane_output_visible`: output from `send-keys` appears on the GUI screen.
-- `detach_client`, `server_exit`: the tmux tabs close, Ghostty keeps
-  running, and the gateway shell still answers.
+- `detach_client`, `kill_session`, `server_exit`: the tmux tabs close
+  without a prompt, Ghostty keeps running, the gateway comes to the front
+  with its title back, and its shell still answers. (No reason bar is
+  expected: tmux 3.6 ends these with a bare `%exit`.)
+- `switch_client`: the tabs become the other session's, the gateway is
+  retitled and stays behind.
 - `resize_window`: resizing the GUI changes the tmux window size.
+- `gateway_*`: keys and pastes into the gateway never reach tmux; the
+  gateway is titled `tmux: <session>` and its overlay names the session;
+  Show Windows brings tmux's current window forward; the `tmux_detach`
+  action and the Detach button detach.
+- `attach_focuses_active_panes`, `tmux_select_pane_background`,
+  `gui_split_focuses_new_pane`: focus lands on tmux's active pane on
+  attach without the selected tab flipping, a background `select-pane`
+  doesn't pull the GUI over (focus moves once the tab is shown), and a GUI
+  split focuses the new pane.
+- `tmux_config_errors`, `tmux_display_message`, `gui_failed_split_notice`:
+  one alert lists every tmux.conf error; `display-message -c` and a split
+  tmux refuses (read-only client) show a notice bar.
+- `tmux_menu_enabled`: File › tmux is enabled on a pane, only Detach on
+  the gateway, nothing elsewhere. The menu is opened to read it, since
+  AppKit validates items only then.
+- `no_restore_after_relaunch`: with `window-save-state = always`, quitting
+  and relaunching brings no tmux tabs back and the gateway's window back
+  as a plain shell. The app is relaunched twice for this.
+- `undo_after_tmux_close`: undo after tmux tabs and panes close changes
+  nothing.
+- `pane_throughput`: a flood doesn't get the control client dropped and
+  AppleScript keeps answering. A debug build is flooded with 20 000
+  lines instead of 200 000: it checks every terminal page it touches and
+  is about a thousand times slower at applying output, enough for tmux to
+  drop it as too far behind.
+- `pane_wide_chars`, `pane_alt_screen`, `attach_while_vim_open`,
+  `attach_with_history`, `pane_mouse_scroll`: wide characters take the
+  same columns as in tmux, less and vim (alternate screen) show what tmux
+  shows, history is there after attaching (`write_scrollback_file`), and
+  the wheel scrolls it (read from the app log's scrollbar actions).
 
 Some things can't be checked automatically. These scenarios report `SKIP`
 with a reason:
@@ -141,6 +190,7 @@ e2e/tmux.py         private tmux server, ground-truth queries
 e2e/context.py      per-scenario fixture, GUI-vs-tmux comparison
 e2e/scenarios.py    the scenarios
 e2e/windows.py      CoreGraphics window list, screenshots, resizing
+e2e/ax.py           Accessibility API by pid: overlays, alerts, menus
 ```
 
 To add a scenario, write a function `def my_case(ctx: Context)` in

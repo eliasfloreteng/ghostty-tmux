@@ -21,6 +21,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import ax
 from .ghostty import GhosttyApp, Snapshot, Tab
 from .tmux import Tmux, Window
 from .util import CheckFailed, check, log, wait_until
@@ -36,11 +37,15 @@ class Context:
     timeout: float
     gateway: str = ""  # terminal id of the gateway terminal
     gateway_tty: str = ""
+    gateway_title: str = ""  # the gateway window's title before attaching
 
     # -- setup --------------------------------------------------------------
 
     def open_gateway(self) -> str:
         """Open a fresh Ghostty window running the plain test shell."""
+        # Focus decides which pane tmux has active, so the app has to be
+        # the active one, not merely have its windows on screen.
+        self.app.activate()
         self.app.new_window()
         snap = wait_until(
             lambda: (s := self.app.snapshot()).terminals and s,
@@ -76,6 +81,13 @@ class Context:
         if not self.gateway:
             self.open_gateway()
         self.create_session(layout)
+        self.attach_session(wait_gui=wait_gui)
+
+    def attach_session(self, wait_gui: bool = True) -> None:
+        """Attach the gateway, in control mode, to the session already there."""
+        if not self.gateway:
+            self.open_gateway()
+        self.gateway_title = self.gateway_window_name()
         self.app.type_line(self.gateway, self.tmux.shell_command("-CC", "attach-session", "-t", SESSION))
         wait_until(
             self.tmux.control_clients,
@@ -90,7 +102,7 @@ class Context:
         self.tmux.kill_server()
         if self.app.alive():
             self.app.close_all_windows(timeout=self.timeout)
-        self.gateway = self.gateway_tty = ""
+        self.gateway = self.gateway_tty = self.gateway_title = ""
 
     # -- GUI <-> tmux comparison -------------------------------------------
 
@@ -178,6 +190,43 @@ class Context:
             mapping[term.id] = pane_id
         log(f"pane map for {tab.name!r}: {mapping}")
         return mapping
+
+    def gateway_window_name(self) -> str:
+        """The title of the GUI window holding the gateway terminal."""
+        for w in self.app.snapshot().windows:
+            if any(x.id == self.gateway for t in w.tabs for x in t.terminals):
+                return w.name
+        raise CheckFailed(f"no window holds the gateway{self.describe()}")
+
+    def front_window(self) -> str:
+        """The name of the frontmost GUI window (AppleScript lists them front to back)."""
+        windows = self.app.snapshot().windows
+        check(windows, "Ghostty has no windows")
+        return windows[0].name
+
+    def terminal_for_pane(self, pane_id: str) -> str:
+        """The GUI terminal showing tmux pane `pane_id`."""
+        pane = next((p for w in self.windows() for p in w.panes if p.id == pane_id), None)
+        check(pane is not None, f"no tmux pane {pane_id}{self.describe()}")
+        window = next(w for w in self.windows() if w.id == pane.window_id)
+        mapping = self.pane_map(self.tab_for_window(window.name))
+        return next(t for t, p in mapping.items() if p == pane_id)
+
+    def ax_window(self, name: str) -> str:
+        """Wait until UI scripting can see the window `name`, and return it.
+
+        UI scripting only sees windows on the active Space, so this keeps
+        activating the app until the window shows up there.
+        """
+
+        def visible() -> bool:
+            if name in ax.window_names(self.app.pid):
+                return True
+            self.app.activate()
+            return False
+
+        wait_until(visible, timeout=self.timeout, desc=f"window {name!r} to be visible to UI scripting")
+        return name
 
     def active_pane(self, window_name: str) -> str:
         w = self.tmux.window(SESSION, window_name)

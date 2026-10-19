@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pyobjc-framework-Quartz>=10"]
+# dependencies = ["pyobjc-framework-Quartz>=10", "pyobjc-framework-ApplicationServices>=10"]
 # ///
 """End-to-end tests for tmux control mode (`tmux -CC`) in the Ghostty macOS app.
 
@@ -73,6 +73,8 @@ def run_one(s: Scenario, app: GhosttyApp, workdir: Path, out_dir: Path, timeout:
     ctx = Context(app=app, tmux=tmux, out_dir=out_dir, timeout=timeout)
     try:
         app.close_all_windows(timeout=timeout)
+        if not app.ensure_active():
+            print("(app could not become active; focus checks will fail) ", end="", flush=True)
         s.func(ctx)
         if not app.alive():
             raise CheckFailed("Ghostty is no longer running")

@@ -7,12 +7,15 @@ screen reading, private tmux socket) and should pass on any recent build.
 
 from __future__ import annotations
 
+import re
 import secrets
+import time
 from dataclasses import dataclass
 from typing import Callable
 
+from . import ax
 from .context import SESSION, Context
-from .util import Skip, check, log, wait_until
+from .util import CheckFailed, Skip, check, log, wait_until
 from .windows import native_windows, resize_front_window, screenshot
 
 
@@ -335,8 +338,25 @@ def pane_output_visible(ctx: Context) -> None:
 # -- lifecycle -----------------------------------------------------------------
 
 
+def enter_session(ctx: Context) -> None:
+    """Put the user in a tmux tab, as they would be when the session ends."""
+    ctx.app.focus(ctx.tmux_tabs()[0].terminals[0].id)
+    wait_until(
+        lambda: ctx.front_window() != ctx.gateway_window_name(),
+        timeout=ctx.timeout,
+        desc="a tmux tab to come to the front",
+        describe_state=ctx.describe,
+    )
+
+
 def expect_gateway_back(ctx: Context, why: str) -> None:
-    """After control mode ends: tmux tabs gone, app alive, gateway usable."""
+    """After control mode ends: tmux tabs gone without asking, app alive,
+    the gateway in front with its title back, and usable.
+
+    No reason bar is expected: tmux (3.6) ends a session it detached,
+    killed or lost with a bare `%exit`, and the app shows one only for the
+    reason `%exit` carries.
+    """
     wait_until(
         lambda: not ctx.tmux_tabs(),
         timeout=ctx.timeout,
@@ -346,6 +366,27 @@ def expect_gateway_back(ctx: Context, why: str) -> None:
     check(ctx.app.alive(), f"Ghostty exited after {why}")
     gateway = next((t for t in ctx.app.snapshot().terminals if t.id == ctx.gateway), None)
     check(gateway is not None, f"the gateway terminal is gone after {why}{ctx.describe()}")
+
+    # Closing tmux's windows is not the user closing anything: no
+    # confirmation may be left up anywhere.
+    try:
+        sheets = ax.sheet_texts(ctx.app.pid)
+        check(not sheets, f"a sheet is up after {why}: {sheets}")
+    except ax.AxUnavailable as exc:
+        log(f"not checking for prompts: {exc}")
+
+    wait_until(
+        lambda: ctx.front_window() == ctx.gateway_window_name(),
+        timeout=ctx.timeout,
+        desc=f"the gateway window to come to the front after {why}",
+        describe_state=ctx.describe,
+    )
+    wait_until(
+        lambda: ctx.gateway_window_name() == ctx.gateway_title,
+        timeout=ctx.timeout,
+        desc=f"the gateway title to go back to {ctx.gateway_title!r} after {why}",
+        describe_state=lambda: f"title {ctx.gateway_window_name()!r}",
+    )
     ctx.app.type_line(ctx.gateway, "echo back-$((40+2))")
     wait_until(
         lambda: "back-42" in ctx.app.read_screen(ctx.gateway),
@@ -356,8 +397,9 @@ def expect_gateway_back(ctx: Context, why: str) -> None:
 
 @scenario
 def detach_client(ctx: Context) -> None:
-    """`tmux detach-client` closes tmux tabs; the gateway shell comes back."""
+    """`tmux detach-client` closes tmux tabs; the gateway comes back to the front."""
     two_window_layout(ctx)
+    enter_session(ctx)
     for client in ctx.tmux.control_clients():
         ctx.tmux.run("detach-client", "-t", client)
     expect_gateway_back(ctx, "detach-client")
@@ -365,11 +407,54 @@ def detach_client(ctx: Context) -> None:
 
 
 @scenario
+def kill_session(ctx: Context) -> None:
+    """`tmux kill-session` closes tmux tabs; the gateway comes back to the front."""
+    two_window_layout(ctx)
+    ctx.tmux.run("new-session", "-d", "-s", "keepalive")
+    enter_session(ctx)
+    ctx.tmux.run("kill-session", "-t", SESSION)
+    expect_gateway_back(ctx, "kill-session")
+
+
+@scenario
 def server_exit(ctx: Context) -> None:
     """`tmux kill-server` closes tmux tabs without crashing Ghostty."""
     two_window_layout(ctx)
+    enter_session(ctx)
     ctx.tmux.kill_server()
     expect_gateway_back(ctx, "kill-server")
+
+
+@scenario
+def switch_client(ctx: Context) -> None:
+    """`switch-client` replaces the tabs with the other session's; the gateway stays behind."""
+    two_window_layout(ctx)
+    ctx.tmux.run("new-session", "-d", "-s", "other", "-n", "gamma", "-x", "110", "-y", "30")
+    ctx.tmux.run("new-window", "-d", "-t", "other", "-n", "delta")
+    enter_session(ctx)
+    client = ctx.tmux.control_clients()[0]
+    ctx.tmux.run("switch-client", "-c", client, "-t", "other")
+
+    wait_until(
+        lambda: sorted(t.name for t in ctx.tmux_tabs()) == ["delta", "gamma"],
+        timeout=ctx.timeout,
+        desc="the tabs to be session 'other''s windows",
+        describe_state=ctx.describe,
+    )
+    wait_until(
+        lambda: ctx.gateway_window_name() == "tmux: other",
+        timeout=ctx.timeout,
+        desc="the gateway title to name the new session",
+        describe_state=lambda: f"title {ctx.gateway_window_name()!r}",
+    )
+    # A session change is not the session ending: the user is taken to
+    # the new windows, not back to the gateway.
+    time.sleep(1)
+    check(
+        ctx.front_window() != ctx.gateway_window_name(),
+        f"the gateway came to the front on switch-client{ctx.describe()}",
+    )
+    check(ctx.tmux.client_session(client) == "other", "the control client is not on 'other'")
 
 
 # -- resize --------------------------------------------------------------------
@@ -389,7 +474,7 @@ def resize_window(ctx: Context) -> None:
     ctx.app.select_tab(tab)
     native = [w for w in native_windows(ctx.app.pid) if w.onscreen]
     if native and resize_front_window(ctx.app.pid, native[0].width + 300, native[0].height + 200):
-        method = "growing the window via System Events"
+        method = "growing the window via Accessibility"
     else:
         # No Accessibility permission: shrink the font instead, which grows
         # the grid without touching the window frame.
@@ -403,3 +488,558 @@ def resize_window(ctx: Context) -> None:
         desc=f"tmux window to grow from {before[0]}x{before[1]} after {method}",
         describe_state=lambda: f"now {'x'.join(map(str, size()))}{ctx.describe()}",
     )
+
+
+
+
+
+
+# -- gateway -------------------------------------------------------------------
+
+
+@scenario
+def gateway_input_ignored(ctx: Context) -> None:
+    """Keys and pastes into the gateway never reach tmux; the session keeps working."""
+    ctx.attach()
+    # Each would be a tmux command if it reached tmux's stdin: typed keys
+    # would detach, the paste would kill the server.
+    for key in "detach":
+        ctx.app.send_key(ctx.gateway, key)
+    ctx.app.send_key(ctx.gateway, "enter")
+    ctx.app.input_text(ctx.gateway, "kill-server\n")
+    ctx.app.input_text(ctx.gateway, "new-window -n pasted\r")
+
+    # Nothing to wait for but the absence of an effect.
+    time.sleep(2)
+    check(ctx.tmux.alive(), "the tmux server died: the paste reached tmux")
+    check(ctx.tmux.control_clients(), "the control client went away: the keys reached tmux")
+    check(all(w.name != "pasted" for w in ctx.windows()), "a pasted command created a tmux window")
+
+    ctx.tmux.run("new-window", "-t", SESSION, "-n", "after")
+    ctx.wait_synced("the session to keep working after input to the gateway")
+    ctx.tab_for_window("after")
+
+
+@scenario
+def gateway_shows_session(ctx: Context) -> None:
+    """The gateway is titled and labelled with the session; Show Windows brings it forward."""
+    two_window_layout(ctx)
+    wait_until(
+        lambda: ctx.gateway_window_name() == f"tmux: {SESSION}",
+        timeout=ctx.timeout,
+        desc="the gateway title to name the session",
+        describe_state=lambda: f"title {ctx.gateway_window_name()!r}",
+    )
+
+    name = ctx.ax_window(ctx.gateway_window_name())
+    wait_until(
+        lambda: f"Attached to tmux session “{SESSION}”" in ax.window_texts(ctx.app.pid, name),
+        timeout=ctx.timeout,
+        desc="the gateway overlay to name the session",
+        describe_state=lambda: repr(ax.window_texts(ctx.app.pid, name)),
+    )
+
+    ctx.app.focus(ctx.gateway)
+    wait_until(lambda: ctx.front_window() == name, timeout=ctx.timeout, desc="the gateway to be in front")
+    ax.press_button(ctx.app.pid, name, "Show Windows")
+    wait_until(
+        lambda: ctx.front_window() == "alpha",
+        timeout=ctx.timeout,
+        desc="Show Windows to bring tmux's current window forward",
+        describe_state=ctx.describe,
+    )
+
+
+@scenario
+def gateway_detach_action(ctx: Context) -> None:
+    """The `tmux_detach` action on the gateway detaches, leaving the session running."""
+    two_window_layout(ctx)
+    check(ctx.app.perform(ctx.gateway, "tmux_detach"), "tmux_detach was not performed on the gateway")
+    wait_until(
+        lambda: not ctx.tmux.control_clients(),
+        timeout=ctx.timeout,
+        desc="the control client to detach",
+        describe_state=lambda: f"clients: {ctx.tmux.clients()}",
+    )
+    expect_gateway_back(ctx, "tmux_detach")
+    check([w.name for w in ctx.windows()] == ["alpha", "beta"], "the session did not survive the detach")
+
+
+@scenario
+def gateway_detach_button(ctx: Context) -> None:
+    """The overlay's Detach button detaches."""
+    two_window_layout(ctx)
+    name = ctx.ax_window(f"tmux: {SESSION}")
+    ax.press_button(ctx.app.pid, name, "Detach")
+    wait_until(
+        lambda: not ctx.tmux.control_clients(),
+        timeout=ctx.timeout,
+        desc="the control client to detach",
+        describe_state=lambda: f"clients: {ctx.tmux.clients()}",
+    )
+    expect_gateway_back(ctx, "the Detach button")
+
+
+# -- focus ---------------------------------------------------------------------
+
+
+@scenario
+def attach_focuses_active_panes(ctx: Context) -> None:
+    """On attach each tab focuses tmux's active pane, and the selected tab doesn't flip."""
+    ctx.open_gateway()
+    ctx.create_session({"alpha": 3, "beta": 3})
+    alpha, beta = ctx.windows()
+    ctx.tmux.run("select-pane", "-t", alpha.panes[1].id)
+    ctx.tmux.run("select-pane", "-t", beta.panes[2].id)
+    ctx.attach_session()
+
+    # Watch the selected tab for a while: it must settle on tmux's
+    # current window and stay there.
+    seen = []
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        selected = [t.name for t in ctx.tmux_tabs() if t.selected]
+        if not seen or seen[-1] != selected:
+            seen.append(selected)
+        time.sleep(0.1)
+    check(seen[-1] == ["alpha"], f"tab 'alpha' is not the selected one: {seen}{ctx.describe()}")
+    check(len(seen) <= 2, f"the selected tab flipped while attaching: {seen}")
+
+    def focused_pane(name: str) -> str | None:
+        tab = ctx.tab_for_window(name)
+        return ctx.pane_map(tab).get(tab.focused_terminal or "")
+
+    wait_until(
+        lambda: focused_pane("alpha") == alpha.panes[1].id,
+        timeout=ctx.timeout,
+        desc=f"tab 'alpha' to focus tmux's active pane {alpha.panes[1].id}",
+        describe_state=ctx.describe,
+    )
+    # A background tab takes its focus when it is shown.
+    ctx.app.select_tab(ctx.tab_for_window("beta"))
+    wait_until(
+        lambda: focused_pane("beta") == beta.panes[2].id,
+        timeout=ctx.timeout,
+        desc=f"tab 'beta' to focus tmux's active pane {beta.panes[2].id}",
+        describe_state=ctx.describe,
+    )
+    check(ctx.active_pane("beta") == beta.panes[2].id, "showing tab 'beta' moved tmux's active pane")
+
+
+@scenario
+def tmux_select_pane_background(ctx: Context) -> None:
+    """`select-pane` in a background window doesn't pull the GUI over; focus moves once it's shown."""
+    two_window_layout(ctx)
+    beta = ctx.tmux.window(SESSION, "beta")
+    mapping = ctx.pane_map(ctx.tab_for_window("beta"))
+    target = beta.panes[2].id
+    ctx.tmux.run("select-pane", "-t", target)
+
+    time.sleep(1.5)
+    check(ctx.tab_for_window("alpha").selected, f"select-pane in a background window pulled the GUI over{ctx.describe()}")
+    check(ctx.tmux.window(SESSION, "alpha").active, "tmux's current window moved")
+
+    ctx.app.select_tab(ctx.tab_for_window("beta"))
+    term = next(t for t, p in mapping.items() if p == target)
+    wait_until(
+        lambda: ctx.tab_for_window("beta").focused_terminal == term,
+        timeout=ctx.timeout,
+        desc=f"focus to be on {target} once tab 'beta' is shown",
+        describe_state=ctx.describe,
+    )
+    check(ctx.active_pane("beta") == target, "showing the tab moved tmux's active pane")
+
+
+@scenario
+def gui_split_focuses_new_pane(ctx: Context) -> None:
+    """A GUI split focuses the new pane, in the GUI and in tmux."""
+    ctx.attach()
+    tab = ctx.tab_for_window("main")
+    old = ctx.tmux.window(SESSION, "main").panes[0].id
+    ctx.app.focus(tab.terminals[0].id)
+    ctx.app.perform(tab.terminals[0].id, "new_split:right")
+    wait_until(
+        lambda: len(ctx.tmux.window(SESSION, "main").panes) == 2,
+        timeout=ctx.timeout,
+        desc="a second pane in tmux window 'main'",
+        describe_state=ctx.describe,
+    )
+    ctx.wait_synced()
+    new = next(p.id for p in ctx.tmux.window(SESSION, "main").panes if p.id != old)
+    wait_until(
+        lambda: ctx.active_pane("main") == new,
+        timeout=ctx.timeout,
+        desc=f"tmux's active pane to be the new {new}",
+        describe_state=ctx.describe,
+    )
+    mapping = ctx.pane_map(ctx.tab_for_window("main"))
+    wait_until(
+        lambda: mapping.get(ctx.tab_for_window("main").focused_terminal or "") == new,
+        timeout=ctx.timeout,
+        desc=f"GUI focus to be on the new pane {new}",
+        describe_state=ctx.describe,
+    )
+
+
+# -- notices -------------------------------------------------------------------
+
+
+def expect_text(ctx: Context, text: str, desc: str) -> None:
+    """Wait for `text` in a static text of any window (notice bars, alerts)."""
+
+    def found() -> bool:
+        if any(text in t for t in ax.window_texts(ctx.app.pid)):
+            return True
+        ctx.app.activate()
+        return False
+
+    wait_until(
+        found,
+        timeout=ctx.timeout,
+        desc=desc,
+        describe_state=lambda: repr([t for t in ax.window_texts(ctx.app.pid) if "tmux" in t]),
+    )
+
+
+@scenario
+def tmux_config_errors(ctx: Context) -> None:
+    """A broken tmux.conf gives a single alert listing every error."""
+    ctx.tmux.add_config("e2e-no-such-command-one\nset -g e2e-no-such-option on\n")
+    two_window_layout(ctx)
+
+    def sheets() -> list[list[str]]:
+        found = ax.sheet_texts(ctx.app.pid)
+        if not found:
+            ctx.app.activate()
+        return found
+
+    shown = wait_until(sheets, timeout=ctx.timeout, desc="an alert for the tmux.conf errors")
+    time.sleep(1.5)  # any second alert would be up by now
+    shown = ax.sheet_texts(ctx.app.pid)
+    check(len(shown) == 1, f"expected one alert, got {len(shown)}: {shown}")
+    text = "\n".join(shown[0])
+    for needle in ("e2e-no-such-command-one", "e2e-no-such-option"):
+        check(needle in text, f"the alert does not mention {needle!r}: {shown[0]}")
+    ax.dismiss_sheets(ctx.app.pid)
+
+
+@scenario
+def tmux_display_message(ctx: Context) -> None:
+    """`display-message -c <client>` shows a notice bar."""
+    ctx.attach()
+    ctx.app.focus(ctx.tab_for_window("main").terminals[0].id)
+    token = f"hello-{secrets.token_hex(3)}"
+    ctx.tmux.run("display-message", "-c", ctx.tmux.control_clients()[0], token)
+    expect_text(ctx, f"tmux: {token}", "the message on a notice bar")
+
+
+@scenario
+def gui_failed_split_notice(ctx: Context) -> None:
+    """A split tmux refuses shows the error on a notice bar."""
+    ctx.attach()
+    term = ctx.tab_for_window("main").terminals[0].id
+    ctx.app.focus(term)
+    # A huge font leaves the window a few columns wide, and tmux refuses
+    # to split a pane that has no room for another.
+    ctx.app.perform(term, "set_font_size:200")
+    wait_until(
+        lambda: ctx.tmux.window(SESSION, "main").width < 12,
+        timeout=ctx.timeout,
+        desc="the tmux window to shrink with the font",
+        describe_state=ctx.describe,
+    )
+
+    def refused() -> bool:
+        if any("no space" in t for t in ax.window_texts(ctx.app.pid)):
+            return True
+        ctx.app.perform(ctx.tab_for_window("main").terminals[-1].id, "new_split:right")
+        time.sleep(0.5)
+        return False
+
+    wait_until(
+        refused,
+        timeout=3 * ctx.timeout,
+        interval=0.5,
+        desc="tmux's refusal of a split on a notice bar",
+        describe_state=lambda: repr([t for t in ax.window_texts(ctx.app.pid) if "tmux" in t]) + ctx.describe(),
+    )
+
+
+# -- menu ------------------------------------------------------------------------
+
+TMUX_ITEMS = ["New Window", "Split Right", "Split Down", "Zoom Pane", "Kill Pane…", "Detach"]
+
+
+@scenario
+def tmux_menu_enabled(ctx: Context) -> None:
+    """File > tmux items are enabled on a tmux pane, only Detach on the gateway, none elsewhere."""
+    ctx.attach()
+    plain = ctx.app.new_window()
+    plain_term = wait_until(
+        lambda: next((t.terminals[0].id for w in ctx.app.snapshot().windows if w.id == plain for t in w.tabs), None),
+        timeout=ctx.timeout,
+        desc="an ordinary window",
+    )
+
+    def items_with_focus(term: str) -> dict[str, bool]:
+        ctx.app.focus(term)
+        time.sleep(0.5)
+        ctx.app.activate()
+        return ax.menu_items(ctx.app.pid, "File", "tmux")
+
+    pane = items_with_focus(ctx.tab_for_window("main").terminals[0].id)
+    check(set(pane) >= set(TMUX_ITEMS), f"the tmux menu is missing items: {pane}")
+    check(all(pane[i] for i in TMUX_ITEMS), f"on a tmux pane every item should be enabled: {pane}")
+
+    gateway = items_with_focus(ctx.gateway)
+    check(gateway["Detach"], f"Detach should be enabled on the gateway: {gateway}")
+    check(not any(gateway[i] for i in TMUX_ITEMS if i != "Detach"), f"only Detach belongs to the gateway: {gateway}")
+
+    other = items_with_focus(plain_term)
+    check(not any(other[i] for i in TMUX_ITEMS), f"nothing should be enabled outside tmux: {other}")
+
+
+# -- persistence -----------------------------------------------------------------
+
+
+@scenario
+def no_restore_after_relaunch(ctx: Context) -> None:
+    """With window-save-state=always, tmux tabs don't come back; the gateway returns as a shell."""
+    ctx.app.relaunch("window-save-state = always\n")
+    try:
+        ctx.app.close_all_windows(timeout=ctx.timeout)
+        two_window_layout(ctx)
+        ctx.app.quit()
+        ctx.app.launch()
+
+        # Restoration happens during launch; give it a moment to finish.
+        time.sleep(2)
+        snap = ctx.app.snapshot()
+        names = [t.name for t in snap.tabs]
+        check(not {"alpha", "beta"} & set(names), f"tmux tabs came back after relaunch: {snap.describe()}")
+        check(snap.terminals, "the gateway's window did not come back")
+        term = snap.terminals[0].id
+        check(not ctx.tmux.control_clients(), "something re-attached to tmux after relaunch")
+        ctx.app.type_line(term, "echo restored-$((40+2))")
+        wait_until(
+            lambda: "restored-42" in ctx.app.read_screen(term),
+            timeout=ctx.timeout,
+            desc="the restored window to run a normal shell",
+        )
+        check(not ctx.tmux.control_clients(), "the restored window re-attached to tmux")
+    finally:
+        ctx.gateway = ""
+        ctx.app.relaunch()
+
+
+@scenario
+def undo_after_tmux_close(ctx: Context) -> None:
+    """Undo after a tmux tab or pane closes does nothing."""
+    two_window_layout(ctx)
+    ctx.tmux.run("kill-pane", "-t", ctx.tmux.window(SESSION, "beta").panes[1].id)
+    ctx.wait_synced()
+    ctx.tmux.run("kill-window", "-t", f"{SESSION}:beta")
+    ctx.wait_synced()
+    ctx.app.close(ctx.tab_for_window("alpha").terminals[0].id)
+    wait_until(lambda: not ctx.tmux_tabs(), timeout=ctx.timeout, desc="the last tmux tab to close")
+
+    before = ctx.app.snapshot().describe()
+    for _ in range(3):
+        ctx.app.perform(ctx.gateway, "undo")
+    time.sleep(1.5)
+    after = ctx.app.snapshot().describe()
+    check(after == before, f"undo changed the GUI:\n    before: {before}\n    after:  {after}")
+    try:
+        ctx.app.activate()
+        edit = ax.menu_items(ctx.app.pid, "Edit")
+        undo = next((k for k in edit if k.startswith("Undo")), None)
+        check(undo is None or not edit[undo], f"Undo is still offered: {edit}")
+    except ax.AxUnavailable as exc:
+        log(f"not checking the Undo menu item: {exc}")
+
+
+# -- content -------------------------------------------------------------------
+
+
+@scenario
+def pane_throughput(ctx: Context) -> None:
+    """A flood of output doesn't get the client dropped, and the GUI stays responsive."""
+    ctx.attach()
+    term = ctx.tab_for_window("main").terminals[0].id
+    # A debug build checks the integrity of every terminal page it touches
+    # and applies output about a thousand times slower than a release one
+    # (seq 1 200000: about 155s against 0.2s in the core alone), slow enough
+    # for tmux to drop it as too far behind. Its flood is cut to match.
+    lines = 20000 if ctx.app.bundle_id.endswith(".debug") else 200000
+    log(f"flooding with {lines} lines")
+    ctx.tmux.run("send-keys", "-t", f"{SESSION}:main", f"seq 1 {lines}; echo flood-$((6*7))", "Enter")
+
+    slowest = 0.0
+    deadline = time.monotonic() + 120
+    while "flood-42" not in ctx.tmux.capture(f"{SESSION}:main"):
+        check(time.monotonic() < deadline, "the flood did not finish in tmux within 120s")
+        start = time.monotonic()
+        ctx.app.snapshot()
+        slowest = max(slowest, time.monotonic() - start)
+        check(ctx.tmux.control_clients(), "tmux dropped the control client during the flood")
+        time.sleep(0.2)
+    log(f"slowest AppleScript round trip during the flood: {slowest:.2f}s")
+    check(slowest < 5, f"the GUI took {slowest:.1f}s to answer during the flood")
+
+    wait_until(
+        lambda: "flood-42" in ctx.app.read_screen(term),
+        timeout=60,
+        desc="the end of the flood on the GUI screen",
+    )
+    screen = ctx.app.read_screen(term)
+    check(f"\n{lines}\n" in screen, "the last line of the flood is missing from the GUI")
+    check(ctx.tmux.control_clients(), "tmux dropped the control client after the flood")
+
+
+def _lines(text: str) -> list[str]:
+    return [line.rstrip() for line in text.splitlines()]
+
+
+@scenario
+def pane_wide_chars(ctx: Context) -> None:
+    """Wide characters take the same columns in the GUI as in tmux."""
+    ctx.attach()
+    term = ctx.tab_for_window("main").terminals[0].id
+    # "W|" then four wide characters (8 columns), then ABCD, and a "*"
+    # written at column 11 by absolute position: over the A if every wide
+    # character is two columns wide, over another letter if not.
+    ctx.tmux.run(
+        "send-keys", "-t", f"{SESSION}:main",
+        "printf 'W|\\346\\227\\245\\346\\234\\254\\350\\252\\236\\360\\237\\216\\211ABCD\\033[11G*\\n'",
+        "Enter",
+    )
+
+    def tmux_line() -> str | None:
+        return next((line for line in _lines(ctx.tmux.capture(f"{SESSION}:main")) if line.startswith("W|")), None)
+
+    want = wait_until(tmux_line, timeout=ctx.timeout, desc="the wide characters in tmux")
+    check(want == "W|日本語🎉*BCD", f"tmux did not lay the line out as expected: {want!r}")
+    wait_until(
+        lambda: want in _lines(ctx.app.read_screen(term)),
+        timeout=ctx.timeout,
+        desc=f"the GUI to show {want!r} exactly as tmux does",
+        describe_state=lambda: repr([line for line in _lines(ctx.app.read_screen(term)) if line.startswith("W|")]),
+    )
+
+
+def _numbered_file(ctx: Context, lines: int) -> str:
+    path = ctx.tmux.conf.parent / "numbered.txt"
+    path.write_text("".join(f"line-{i:04d}\n" for i in range(1, lines + 1)))
+    return str(path)
+
+
+def expect_same_screen(ctx: Context, term: str, pane: str, desc: str) -> None:
+    """The GUI terminal shows the `line-NNNN` lines tmux shows for the pane."""
+
+    def marks(text: str) -> list[str]:
+        return re.findall(r"line-\d{4}", text)
+
+    want = marks(ctx.tmux.capture(pane))
+    check(want, f"tmux shows no numbered lines in {pane}: {ctx.tmux.capture(pane)!r}")
+    wait_until(
+        lambda: marks(ctx.app.read_screen(term)) == want,
+        timeout=ctx.timeout,
+        desc=desc,
+        describe_state=lambda: f"tmux {want[:3]}..{want[-1:]}, gui {marks(ctx.app.read_screen(term))[:3]}..",
+    )
+
+
+@scenario
+def pane_alt_screen(ctx: Context) -> None:
+    """less (alternate screen) in a pane shows what tmux shows, and leaving it restores the shell."""
+    ctx.attach()
+    term = ctx.tab_for_window("main").terminals[0].id
+    path = _numbered_file(ctx, 500)
+    pane = f"{SESSION}:main"
+    ctx.tmux.run("send-keys", "-t", pane, "clear; echo before-less", "Enter")
+    ctx.tmux.run("send-keys", "-t", pane, f"less {path}", "Enter")
+    wait_until(lambda: "line-0001" in ctx.tmux.capture(pane), timeout=ctx.timeout, desc="less in tmux")
+    expect_same_screen(ctx, term, pane, "the GUI to show less's screen")
+    ctx.tmux.run("send-keys", "-t", pane, "q")
+    wait_until(
+        lambda: "line-0001" not in ctx.app.read_screen(term) and "before-less" in ctx.app.read_screen(term),
+        timeout=ctx.timeout,
+        desc="the shell's screen back in the GUI after less",
+    )
+
+
+@scenario
+def attach_while_vim_open(ctx: Context) -> None:
+    """Attaching while vim is open shows vim's screen."""
+    ctx.open_gateway()
+    ctx.create_session()
+    path = _numbered_file(ctx, 500)
+    pane = f"{SESSION}:main"
+    ctx.tmux.run("send-keys", "-t", pane, f"vim -u NONE -N {path}", "Enter")
+    wait_until(lambda: "line-0001" in ctx.tmux.capture(pane), timeout=ctx.timeout, desc="vim in tmux")
+    ctx.attach_session()
+    term = ctx.tab_for_window("main").terminals[0].id
+    expect_same_screen(ctx, term, pane, "the GUI to show vim's screen")
+    ctx.tmux.run("send-keys", "-t", pane, "Escape", ":qa!", "Enter")
+
+
+@scenario
+def attach_with_history(ctx: Context) -> None:
+    """Attaching to panes with long history makes the history scrollable in the GUI."""
+    ctx.open_gateway()
+    ctx.create_session({"alpha": 1, "beta": 2})
+    panes = [p.id for w in ctx.windows() for p in w.panes]
+    for i, pane in enumerate(panes):
+        ctx.tmux.run("send-keys", "-t", pane, f"seq -f 'p{i}-%04g' 1 1500", "Enter")
+    for i, pane in enumerate(panes):
+        wait_until(lambda: f"p{i}-1500" in ctx.tmux.capture(pane), timeout=ctx.timeout, desc=f"history in {pane}")
+    ctx.attach_session()
+
+    for name in ("alpha", "beta"):
+        tab = ctx.tab_for_window(name)
+        for term, pane in ctx.pane_map(tab).items():
+            want = [line for line in _lines(ctx.tmux.capture_all(pane)) if re.fullmatch(r"p\d-\d{4}", line)]
+            check(len(want) >= 1000, f"tmux kept only {len(want)} history lines in {pane}")
+
+            def gui() -> list[str]:
+                return [line for line in _lines(ctx.app.read_scrollback(term)) if re.fullmatch(r"p\d-\d{4}", line)]
+
+            # The scrollback holds everything above the screen; the screen
+            # holds the rest, so together they must be tmux's whole history.
+            wait_until(
+                lambda: want[: len(gui())] == gui() and len(gui()) >= len(want) - 40,
+                timeout=ctx.timeout,
+                desc=f"the GUI's history of {pane} to match tmux's",
+                describe_state=lambda: f"tmux {len(want)} lines {want[:1]}..{want[-1:]}, gui {len(gui())} lines {gui()[:1]}..{gui()[-1:]}",
+            )
+
+
+def _scrollbar(ctx: Context) -> tuple[int, int, int] | None:
+    """The last (total, offset, len) the app reported for a scrollbar."""
+    found = re.findall(
+        r"action=\.scrollbar value=\.\{ \.total = (\d+), \.offset = (\d+), \.len = (\d+) \}",
+        ctx.app.log_path.read_text(errors="replace"),
+    )
+    return tuple(map(int, found[-1])) if found else None
+
+
+@scenario
+def pane_mouse_scroll(ctx: Context) -> None:
+    """The mouse wheel scrolls a pane's history in the GUI."""
+    ctx.attach()
+    term = ctx.tab_for_window("main").terminals[0].id
+    ctx.tmux.run("send-keys", "-t", f"{SESSION}:main", "seq 1 500", "Enter")
+    wait_until(lambda: "\n500" in ctx.app.read_screen(term), timeout=ctx.timeout, desc="history in the GUI")
+    time.sleep(0.5)
+    before = _scrollbar(ctx)
+    check(before is not None and before[1] + before[2] >= before[0], f"not at the bottom before scrolling: {before}")
+    ctx.app.focus(term)
+    ctx.app.scroll(term, 10)
+    wait_until(
+        lambda: (bar := _scrollbar(ctx)) is not None and bar[1] + bar[2] < bar[0],
+        timeout=ctx.timeout,
+        desc="the viewport to scroll up into history",
+        describe_state=lambda: f"scrollbar (total, offset, len) {_scrollbar(ctx)}",
+    )
+    check(ctx.tmux.control_clients(), "scrolling dropped the control client")
+

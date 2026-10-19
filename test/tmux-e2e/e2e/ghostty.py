@@ -133,10 +133,17 @@ class GhosttyApp:
         self.shell.write_text(SHELL_WRAPPER)
         self.shell.chmod(0o755)
         self.config = workdir / "config.ghostty"
-        self.config.write_text(CONFIG.format(shell=shlex.quote(str(self.shell))))
+        self.write_config()
         self.proc: subprocess.Popen | None = None
         self._log_file = None
         self._ae: AppleEventClient | None = None
+
+    def write_config(self, extra: str = "") -> None:
+        """(Re)write the generated config; `extra` lines override the defaults.
+
+        Takes effect at the next launch.
+        """
+        self.config.write_text(CONFIG.format(shell=shlex.quote(str(self.shell))) + extra)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -191,6 +198,27 @@ class GhosttyApp:
             hint = ("\n  app log errors:\n    " + "\n    ".join(errors[-5:])) if errors else ""
             raise HarnessError(f"{exc}{hint}\n  full log: {self.log_path}") from exc
 
+    def quit(self, timeout: float = 10.0) -> None:
+        """Quit the way a user does (the `quit` Apple Event), so that the app
+        gets to save its window state, and wait for it to exit."""
+        if not self.alive():
+            return
+        try:
+            self.ae.send("aevtquit")
+        except AppleScriptError as exc:
+            log(f"quit: {exc}")
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log("quit timed out; terminating")
+        self.terminate()
+
+    def relaunch(self, extra_config: str = "", timeout: float = 30.0) -> None:
+        """Quit and start again, with `extra_config` added to the config."""
+        self.quit()
+        self.write_config(extra_config)
+        self.launch(timeout=timeout)
+
     @property
     def pid(self) -> int:
         if self.proc is None:
@@ -224,6 +252,41 @@ class GhosttyApp:
 
     def version(self) -> str:
         return self.ae.get(ae.prop("vers"))
+
+    def activate(self) -> None:
+        """Make the test instance the active app (the standard `activate`
+        event, addressed by pid like everything else).
+
+        Focus follows the key window, and tmux follows focus, so scenarios
+        about either need the app to be active. Another app in front --
+        a full screen one in particular -- otherwise keeps it inactive.
+        """
+        self.ae.send("miscactv")
+
+    def ensure_active(self, timeout: float = 5.0) -> bool:
+        """Activate the app and wait until it is the active one.
+
+        Returns False if it never became active: macOS lets the app in
+        front keep focus when someone is using it, and then nothing that
+        depends on a key window (focus, and so tmux's active pane and
+        window) can be checked.
+        """
+        from . import ax
+
+        def active() -> bool:
+            try:
+                if ax.is_frontmost(self.pid):
+                    return True
+            except ax.AxUnavailable:
+                return True  # can't tell; carry on and let scenarios decide
+            self.activate()
+            return False
+
+        try:
+            wait_until(active, timeout=timeout, interval=0.3, desc="Ghostty to become the active app")
+            return True
+        except CheckFailed:
+            return False
 
     def snapshot(self) -> Snapshot:
         """Read the whole window -> tab -> terminal tree."""
@@ -327,6 +390,13 @@ class GhosttyApp:
         new = self.ae.send("GhstNWin", GNwS=config)
         return self.ae.get(ae.prop("ID", new))
 
+    def activate_window(self, window_id: str) -> None:
+        self.ae.send("GhstAcWn", ae.by_id(WINDOW, window_id))
+
+    def scroll(self, terminal: str, dy: float) -> None:
+        """Send a (non-precision) mouse wheel event; positive scrolls up."""
+        self.ae.send("GhstSMSc", GMsX=_real(0.0), GMsY=_real(dy), GMsT=self._terminal(terminal))
+
     def close_all_windows(self, timeout: float = 10.0) -> None:
         for w in self.snapshot().windows:
             try:
@@ -338,21 +408,32 @@ class GhosttyApp:
     # -- screen contents ----------------------------------------------------
 
     def read_screen(self, terminal: str, timeout: float = 5.0) -> str:
-        """Return the visible screen text of a terminal.
+        """Return the screen text of a terminal, scrollback included.
 
         AppleScript has no "contents" property, so this runs the
         `write_screen_file:copy` action, which dumps the screen to a file
         under our private $TMPDIR (and puts its path on the clipboard; the
         caller's clipboard text is saved and restored around it).
         """
-        before = {p: p.stat().st_mtime_ns for p in self.tmpdir.rglob("screen.txt")}
+        return self._read_dump(terminal, "write_screen_file:copy", "screen.txt", timeout)
+
+    def read_scrollback(self, terminal: str, timeout: float = 5.0) -> str:
+        """Return the scrollback (history above the screen) of a terminal.
+
+        Runs `write_scrollback_file:copy`. A terminal with no history
+        writes no file, so that times out.
+        """
+        return self._read_dump(terminal, "write_scrollback_file:copy", "history.txt", timeout)
+
+    def _read_dump(self, terminal: str, action: str, name: str, timeout: float) -> str:
+        before = {p: p.stat().st_mtime_ns for p in self.tmpdir.rglob(name)}
         saved_clipboard = _pbpaste()
         try:
-            if not self.perform(terminal, "write_screen_file:copy"):
-                raise AppleScriptError("write_screen_file action was not performed")
+            if not self.perform(terminal, action):
+                raise AppleScriptError(f"{action} was not performed")
 
             def new_file() -> Path | None:
-                for p in self.tmpdir.rglob("screen.txt"):
+                for p in self.tmpdir.rglob(name):
                     if before.get(p) != p.stat().st_mtime_ns:
                         return p
                 return None
@@ -363,6 +444,10 @@ class GhosttyApp:
         text = path.read_text(errors="replace")
         path.unlink(missing_ok=True)
         return text
+
+
+def _real(value: float):
+    return ae.D.descriptorWithDouble_(value)
 
 
 def _pbpaste() -> str | None:

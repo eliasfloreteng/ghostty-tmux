@@ -82,17 +82,18 @@ def screenshot(pid: int, out_dir: Path, stem: str) -> list[Path]:
 
 
 def resize_front_window(pid: int, width: int, height: int) -> bool:
-    """Resize the front window of `pid` through System Events.
+    """Resize the focused window of `pid` through the Accessibility API.
 
     Needs the Accessibility permission for the invoking terminal. Returns
     False (rather than raising) when that isn't available.
     """
-    script = (
-        'tell application "System Events" to tell (first process whose unix id is '
-        f"{pid}) to set size of front window to {{{width}, {height}}}"
-    )
-    proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
-    if proc.returncode != 0:
-        log(f"System Events resize failed: {proc.stderr.strip()}")
+    from . import ax
+
+    try:
+        ok = ax.set_window_size(pid, width, height)
+    except ax.AxUnavailable as exc:
+        log(f"resize via Accessibility unavailable: {exc}")
         return False
-    return True
+    if not ok:
+        log("resize via Accessibility failed")
+    return ok

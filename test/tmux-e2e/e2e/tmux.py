@@ -59,6 +59,11 @@ class Tmux:
         # Never let a surrounding tmux session leak into ours.
         self.env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
 
+    def add_config(self, text: str) -> None:
+        """Append lines to the server's config. Only before the server starts."""
+        with self.conf.open("a") as f:
+            f.write(text.rstrip("\n") + "\n")
+
     # -- invocation ---------------------------------------------------------
 
     @property
@@ -123,6 +128,13 @@ class Tmux:
 
     def capture(self, target: str) -> str:
         return self.run("capture-pane", "-p", "-J", "-t", target)
+
+    def capture_all(self, target: str) -> str:
+        """The pane's history and screen, as `capture-pane -S -` sees them."""
+        return self.run("capture-pane", "-p", "-J", "-S", "-", "-t", target)
+
+    def client_session(self, client: str) -> str:
+        return self.run("display-message", "-p", "-c", client, "#{client_session}").strip()
 
     def describe(self, session: str) -> str:
         try:
