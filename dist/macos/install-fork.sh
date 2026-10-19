@@ -1,27 +1,22 @@
 #!/bin/sh
 # Build a release Ghostty.app from this checkout and install it next to
-# the official Ghostty under its own name and bundle ID.
+# the official Ghostty as this fork's app (see package-fork.sh for what
+# that changes, and for FORK_NAME, FORK_BUNDLE_ID and SIGN_IDENTITY).
 #
-# The separate bundle ID keeps this build's preferences, window state and
-# permissions (Accessibility, Automation, ...) apart from the official
-# app's, so both can be installed and running at the same time. The
-# updater is disabled: the official appcast and signing key would
-# otherwise happily "update" this build into the official release.
+# Usage: dist/macos/install-fork.sh [destination-dir]
 #
-# Both apps still read the same Ghostty config file.
-#
-# Usage: dist/macos/install-fork.sh [name] [bundle-id] [destination-dir]
-#
-# Environment:
-#   ZIG       zig binary to build with (default: zig, or .toolchain/zig
-#             in the repository if present)
+# Environment, besides package-fork.sh's:
+#   ZIG       zig binary to build with (default: .toolchain/zig in the
+#             repository if present, else zig)
 #   OPTIMIZE  Zig optimize mode (default: ReleaseFast)
+#
+# To keep macOS permissions across updates, sign with a certificate, e.g.:
+#   SIGN_IDENTITY="Apple Development" dist/macos/install-fork.sh
 
 set -eu
 
-name="${1:-Ghostty tmux}"
-bundle_id="${2:-com.eliasfloreteng.ghostty-tmux}"
-dest_dir="${3:-/Applications}"
+dest_dir="${1:-/Applications}"
+name="${FORK_NAME:-Ghostty tmux}"
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$repo"
@@ -36,33 +31,16 @@ fi
 
 "$ZIG" build -Doptimize="${OPTIMIZE:-ReleaseFast}"
 
-built="$repo/macos/build/ReleaseLocal/Ghostty.app"
-if [ ! -d "$built" ]; then
-  echo "error: expected app bundle at $built" >&2
-  exit 1
-fi
-
 # Stage next to the build output so a failure never leaves a half-made
 # app in the destination.
 staged="$repo/macos/build/ReleaseLocal/$name.app"
-rm -rf "$staged"
-cp -R "$built" "$staged"
-
-plist="$staged/Contents/Info.plist"
-pb() { /usr/libexec/PlistBuddy -c "$1" "$plist"; }
-pb "Set :CFBundleIdentifier $bundle_id"
-pb "Set :CFBundleName $name" 2>/dev/null || pb "Add :CFBundleName string $name"
-pb "Delete :CFBundleDisplayName" 2>/dev/null || true
-pb "Add :CFBundleDisplayName string $name"
-pb "Delete :GhosttyUpdaterDisabled" 2>/dev/null || true
-pb "Add :GhosttyUpdaterDisabled bool true"
-
-# Changing Info.plist invalidates the existing signature. Re-sign ad hoc,
-# which is what a local release build is signed with anyway.
-codesign --force --deep --sign - "$staged"
-codesign --verify --deep --strict "$staged"
+"$repo/dist/macos/package-fork.sh" "$repo/macos/build/ReleaseLocal/Ghostty.app" "$staged"
 
 target="$dest_dir/$name.app"
+if pgrep -qf "^$target/Contents/MacOS/" 2>/dev/null; then
+  echo "error: $target is running; quit it first" >&2
+  exit 1
+fi
 rm -rf "$target"
 mv "$staged" "$target"
-echo "installed $target ($bundle_id)"
+echo "installed $target"
