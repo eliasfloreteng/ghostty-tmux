@@ -77,7 +77,7 @@ def run_one(s: Scenario, app: GhosttyApp, workdir: Path, out_dir: Path, timeout:
             print("(app could not become active; focus checks will fail) ", end="", flush=True)
         s.func(ctx)
         if not app.alive():
-            raise CheckFailed("Ghostty is no longer running")
+            raise CheckFailed("Ghostty went away during the scenario")
         return "PASS", ""
     except Skip as exc:
         return "SKIP", str(exc)
@@ -88,7 +88,11 @@ def run_one(s: Scenario, app: GhosttyApp, workdir: Path, out_dir: Path, timeout:
             if shots:
                 detail += "\n  screenshots: " + ", ".join(map(str, shots))
         else:
-            detail += f"\n  Ghostty is not running anymore (exit code {app.proc.returncode})"
+            # Its going away is what failed the check, most likely, so
+            # say so first: the check's own message guesses at a cause
+            # inside the app (e.g. "the keys reached tmux" for a control
+            # client that went away because the app did).
+            detail = f"Ghostty is not running anymore: {app.exit_reason()}\n  then: {detail}"
         return "FAIL", detail
     except HarnessError:
         raise
@@ -132,7 +136,7 @@ def main() -> int:
 
         for s in scenarios:
             if not app.alive():
-                print("  Ghostty died; relaunching for the next scenario")
+                print(f"  Ghostty is not running ({app.exit_reason()}); relaunching for the next scenario")
                 app.terminate()
                 app.launch()
             print(f"{s.name} ...", end=" ", flush=True)

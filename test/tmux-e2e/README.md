@@ -57,6 +57,11 @@ window for each failed scenario.
   `Application(<pid>)` turns the pid back into a bundle id and can end up
   talking to _your_ running Ghostty instead. With raw events by pid, tests
   never touch another Ghostty instance, even one with the same bundle id.
+  It doesn't hold the other way round: quitting an app by name or bundle
+  id (`osascript -e 'quit app "Ghostty tmux"'`, a script that does so
+  before reinstalling it) can quit the instance under test. A scenario
+  it happens in fails with "it quit normally (exit code 0)", and the
+  next one relaunches the app.
 
 The test app takes focus while it runs: before every scenario it is
 activated (the standard `activate` event, by pid). Focus decides which

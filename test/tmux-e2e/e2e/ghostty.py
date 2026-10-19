@@ -236,6 +236,23 @@ class GhosttyApp:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def exit_reason(self) -> str:
+        """Why the app is no longer running, as far as its exit status says."""
+        code = self.proc.returncode if self.proc is not None else None
+        if code is None:
+            return "it is still running"
+        if code == 0:
+            # The app logs nothing on its way out, so the status is all
+            # there is to go by. The harness itself only quits it to
+            # relaunch it.
+            return (
+                "it quit normally (exit code 0), so something asked it to: Cmd-Q, or a quit "
+                "Apple Event sent by app name or bundle id, which reaches this instance too"
+            )
+        if code < 0:
+            return f"it was killed by {signal.Signals(-code).name}"
+        return f"it exited with code {code}; see {self.log_path}"
+
     def terminate(self, timeout: float = 5.0) -> None:
         if self.proc is None:
             return
