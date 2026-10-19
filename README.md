@@ -21,6 +21,102 @@
   </p>
 </p>
 
+> [!NOTE]
+> **This is a personal fork of [Ghostty](https://github.com/ghostty-org/ghostty)**
+> that adds **native tmux control mode (`tmux -CC`) integration on macOS**,
+> in the spirit of iTerm2's tmux integration. Everything else is upstream
+> Ghostty, merged in automatically every week. See
+> [About this fork](#about-this-fork) below; the rest of this README is
+> upstream's.
+
+## About this fork
+
+### What it changes
+
+Run `tmux -CC` (or `tmux -CC attach`, over ssh or locally) in any Ghostty
+terminal and the session opens as native Ghostty windows:
+
+- **tmux windows are native tabs, tmux panes are native splits.** Layouts
+  follow tmux exactly, including zoom, and are rebuilt live as they change
+  from any client.
+- **Ghostty's verbs go to tmux.** New tab is `new-window`, new split is
+  `split-window` (all four directions), closing a split or tab kills the
+  tmux pane or window (always confirmed), zoom is `resize-pane -Z`, moving
+  a tab is `swap-window`, renaming a tab is `rename-window`, and dragging a
+  divider resizes the tmux pane. Each tmux window is sized from its own
+  Ghostty window (tmux 3.4+, with a fallback for older servers).
+- **Focus follows both ways.** Focusing a split selects the tmux pane, and
+  `select-pane`/`select-window` from tmux or another client moves Ghostty.
+- **Full history on attach**, both screens, cursor and terminal modes, so
+  scrollback, search and selection are Ghostty's own. Typing, IME and
+  pastes (bracketed exactly when the pane's program asked for it) are sent
+  through tmux; queries are answered by tmux only.
+- **The terminal that ran `tmux -CC`** shows which session it hosts and
+  offers _Show Windows_ and _Detach_; it no longer swallows keys as tmux
+  commands. Closing it says it detaches, and the session keeps running.
+- **File › tmux menu** (New Window, Split Right/Down, Zoom Pane, Kill Pane,
+  Detach) and a `tmux_detach` keybind action (unbound by default).
+- **tmux talks back**: `display-message`, tmux.conf errors, refused
+  commands and the reason a session ended are shown as notices or alerts.
+- **Robust sessions**: detach, `kill-session`, `kill-server`, `switch-client`
+  (including to the same session), dropped ssh connections, large histories,
+  floods (optional `tmux-pause-after = <seconds>`) and read-only clients
+  (`attach -r` / `switch-client -r`: the session stays visible, input is
+  refused with a notice) are all handled. tmux windows are not restored on
+  relaunch and closes done by tmux are not undoable.
+
+Linux (GTK) gets the core tmux windows-as-tabs support, but the macOS app
+is what this fork is built and tested for.
+
+The implementation lives in `src/terminal/tmux/` (protocol, viewer, router),
+`src/termio/` (the pty-less tmux pane backend) and
+`macos/Sources/Features/Terminal/TmuxWindowManager.swift`. It is covered by
+unit tests (`zig build test -Dtest-filter=tmux`), tests against a real tmux
+server (`zig build test-tmux-live`) and GUI end-to-end tests that drive the
+app (`test/tmux-e2e/`).
+
+### Download
+
+macOS builds are on the
+[Releases page](https://github.com/eliasfloreteng/ghostty/releases). They
+are not signed or notarized: after unzipping, run
+`xattr -dr com.apple.quarantine Ghostty.app` (or right-click › Open) once.
+The app uses the same bundle identifier and config as upstream Ghostty,
+so install it in place of it rather than alongside.
+
+### Staying in sync with upstream
+
+A [weekly workflow](.github/workflows/fork-sync-upstream.yml) merges
+`ghostty-org/ghostty`'s `main` into this fork's `main`, keeping the fork's
+changes. It stops without pushing when the merge conflicts, and skips the
+update when the tests (including the live tmux tests) fail after the
+merge, so `main` only ever moves to a merge that builds and passes. It can
+also be run by hand from the Actions tab.
+
+### Future work
+
+Not done yet, roughly in order of usefulness:
+
+- Bell, activity and silence markers on tabs from tmux's window flags.
+- Mirroring tab drag-and-drop (reorder, tear off) to tmux.
+- Per-pane titles (`#{pane_title}`) on splits.
+- A session picker / dashboard: list sessions, attach, choose which windows
+  to show, hide windows (iTerm2's tmux dashboard).
+- Options: open tmux windows as separate windows or tabs, hide the host
+  terminal while attached, cap history read on attach, mirror tmux paste
+  buffers to the clipboard, extra client flags (`active-pane`,
+  `no-detach-on-destroy`).
+- `refresh-client -B` subscriptions (pane titles, working directory,
+  activity) and turning off output for panes not on screen.
+- A "paused, catching up" indicator per pane when `tmux-pause-after`
+  kicks in, and reading history lazily so big sessions attach faster.
+- Swap, rotate, break and join panes from the GUI.
+- Mirroring tmux's status line, and a "run tmux command" prompt.
+- Restoring keyboard protocol modes (modifyOtherKeys, kitty keyboard) and
+  passing through DCS/image passthrough sequences.
+- A clear message for tmux older than 3.2, and a reconnect helper for
+  dropped connections.
+
 ## About
 
 Ghostty is a terminal emulator that differentiates itself by being

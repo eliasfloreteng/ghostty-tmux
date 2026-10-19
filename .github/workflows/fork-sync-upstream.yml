@@ -1,0 +1,151 @@
+# Fork-only: keep this fork's `main` up to date with upstream Ghostty.
+#
+# Once a week, merge ghostty-org/ghostty's `main` into this fork's `main`,
+# keeping the fork's own changes (a merge, never a rebase, so the fork's
+# history is left alone). Then:
+#
+#   - If the merge conflicts, stop. Nothing is pushed; the run fails and
+#     its summary lists the conflicting files, to be resolved by hand.
+#   - If it merges but the tests fail, skip the update. Nothing is pushed;
+#     the run fails and says which step did. Next week tries again with
+#     whatever upstream has by then.
+#   - Otherwise push the merge to `main`.
+#
+# Upstream's own workflows run on ghostty-org's custom runners and are
+# gated on `github.repository == 'ghostty-org/ghostty'`, so they do not
+# get in the way here.
+#
+# Pushing a merge that changes files under `.github/workflows/` needs a
+# token with the `workflow` scope, which the default GITHUB_TOKEN never
+# has. Set a fine-grained token with "Contents" and "Workflows" write on
+# this repository as the `FORK_SYNC_TOKEN` secret for those weeks to go
+# through; without it such a push is rejected and the run fails.
+name: Sync with upstream
+
+on:
+  schedule:
+    # Mondays, 05:17 UTC.
+    - cron: "17 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'eliasfloreteng/ghostty'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/ghostty-org/ghostty.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream $(git rev-parse --short upstream/main)." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream=$(git rev-parse --short upstream/main)
+          if ! git merge --no-ff --no-edit -m "Merge upstream ghostty-org/ghostty main ($upstream)" upstream/main; then
+            {
+              echo "## Merge conflict: not synced"
+              echo
+              echo "Merging upstream \`$upstream\` into \`main\` conflicts in:"
+              echo
+              git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/'
+              echo
+              echo "Resolve by hand: \`git fetch upstream && git merge upstream/main\` on \`main\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            exit 1
+          fi
+
+          {
+            echo "Merged upstream \`$upstream\`:"
+            echo
+            git log --oneline --no-merges HEAD^1..HEAD^2 | head -50 | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Get required Zig version
+        if: steps.merge.outputs.changed == 'true'
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Zig
+        if: steps.merge.outputs.changed == 'true'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      # The GTK packages are not needed: everything builds with
+      # -Dapp-runtime=none. libonig-dev is (tmux control mode needs it).
+      - name: Install system dependencies
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq -y --no-install-recommends install \
+            build-essential \
+            libbz2-dev \
+            libonig-dev \
+            libxml2-utils \
+            pandoc \
+            tmux
+
+      - name: zig build test
+        if: steps.merge.outputs.changed == 'true'
+        id: test
+        run: zig build test -Dapp-runtime=none --summary all
+
+      # Building the library compiles the embedded apprt, which the macOS
+      # app uses and the test step does not build.
+      - name: zig build (lib)
+        if: steps.merge.outputs.changed == 'true'
+        id: build
+        run: zig build -Dapp-runtime=none --summary all
+
+      # The fork's own tests against a real tmux server.
+      - name: zig build test-tmux-live
+        if: steps.merge.outputs.changed == 'true'
+        id: live
+        run: |
+          tmux -V
+          zig build test-tmux-live -Dapp-runtime=none --summary all
+
+      - name: Report skipped update
+        if: failure() && steps.merge.outputs.changed == 'true'
+        run: |
+          {
+            echo
+            echo "## Tests failed after merging: not synced"
+            echo
+            echo "- zig build test: ${{ steps.test.outcome }}"
+            echo "- zig build (lib): ${{ steps.build.outcome }}"
+            echo "- zig build test-tmux-live: ${{ steps.live.outcome }}"
+            echo
+            echo "\`main\` was left as it was."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          git push origin HEAD:main
+          echo "Pushed $(git rev-parse --short HEAD) to main." >> "$GITHUB_STEP_SUMMARY"
