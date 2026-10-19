@@ -497,7 +497,18 @@ class TmuxWindowManager {
     /// that was key when this was asked and is not any more by the time
     /// the view is in it, which is every tab but the last when several
     /// are created together.
+    ///
+    /// The controller is told straight away, though: its focused surface
+    /// is what it, and the terminal view appearing for the first time,
+    /// put focus back on when the window becomes key. Left on the pane
+    /// tmux had active before, that would move focus there -- and tmux
+    /// with it -- after this had moved it to the right one.
     private func focus(_ view: Ghostty.SurfaceView, in entry: WindowEntry) {
+        if let controller = entry.controller,
+           controller.surfaceTree.contains(view),
+           !(controller.window?.isKeyWindow ?? false) {
+            controller.focusedSurface = view
+        }
         entry.pendingFocus = view
         DispatchQueue.main.async { [weak self, weak entry] in
             guard let self, let entry else { return }
