@@ -1475,7 +1475,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         confirmClose(
             messageText: "Close Tab?",
-            informativeText: "The terminal still has a running process. If you close the tab the process will be killed."
+            informativeText: closeInformativeText(
+                surfaceTree,
+                otherwise: "The terminal still has a running process. If you close the tab the process will be killed.")
         ) {
             if !self.closeTabViaTmux() { self.closeTabImmediately() }
         }
@@ -1597,7 +1599,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // attached to the window that needs confirmation.
             confirmControllers[0].confirmClose(
                 messageText: "Close Window?",
-                informativeText: "All terminal sessions in this window will be terminated.",
+                informativeText: closeInformativeText(
+                    confirmControllers[0].surfaceTree,
+                    otherwise: "All terminal sessions in this window will be terminated."),
             ) {
                 self.closeWindowViaTmuxOrImmediately()
             }

@@ -496,12 +496,35 @@ class BaseTerminalController: NSWindowController,
         // being shown, and provides no callback to detect this.
         confirmClose(
             messageText: "Close Terminal?",
-            informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
+            informativeText: closeInformativeText(
+                node,
+                otherwise: "The terminal still has a running process. If you close the terminal the process will be killed.")
         ) { [weak self] in
             if let self, !self.closeViaTmux(node) {
                 self.removeSurfaceNode(node)
             }
         }
+    }
+
+    /// What closing `surfaces` does, for a confirmation that would
+    /// otherwise say `text`.
+    ///
+    /// A terminal hosting a tmux control mode session is running `tmux`,
+    /// and the usual warning that its process will be killed is true but
+    /// says nothing useful: what goes is the session's client. The
+    /// session keeps running on its server and only its windows here
+    /// close, which is worth knowing before they vanish with no trace of
+    /// where they went.
+    func closeInformativeText(
+        _ surfaces: some Sequence<Ghostty.SurfaceView>,
+        otherwise text: String
+    ) -> String {
+        guard let session = surfaces.lazy.compactMap(\.hostedTmuxSession).first else {
+            return text
+        }
+
+        return "This terminal is attached to the tmux session \u{201C}\(session)\u{201D}. " +
+            "Closing it detaches: the session keeps running, and its windows here close."
     }
 
     /// Ask tmux to close the panes in `node`, if they are tmux panes that
@@ -1251,7 +1274,9 @@ class BaseTerminalController: NSWindowController,
         // We require confirmation, so show an alert as long as we aren't already.
         confirmClose(
             messageText: "Close Terminal?",
-            informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
+            informativeText: closeInformativeText(
+                surfaceTree,
+                otherwise: "The terminal still has a running process. If you close the terminal the process will be killed.")
         ) { [weak self] in
             self?.window?.close()
         }
