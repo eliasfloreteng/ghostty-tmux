@@ -585,8 +585,22 @@ pub const Router = struct {
     /// is gone in tmux (or the whole session is), and closing its display
     /// is the right thing to do locally. Returns true when the kill was
     /// sent, and then the display goes away when tmux stops listing it.
-    pub fn closePane(self: *Router, pane_id: usize) bool {
-        if (!self.paneOpen(pane_id)) return false;
+    ///
+    /// `endpoint` is the display being closed, and only its own channel
+    /// counts. A pane can come back under the same id with a channel of
+    /// its own while its old display is still closing -- a session change
+    /// re-lists every window, the session already on included -- and the
+    /// old display closing because tmux dropped it must not kill the pane
+    /// that just came back.
+    pub fn closePane(self: *Router, pane_id: usize, endpoint: Endpoint) bool {
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const ch = self.channels.get(pane_id) orelse return false;
+            if (ch.closed) return false;
+            const ep = ch.endpoint orelse return false;
+            if (ep.ctx != endpoint.ctx) return false;
+        }
         if (!self.hostAcquire()) return false;
         defer self.hostRelease();
         self.host.vtable.kill(self.host.ctx, pane_id);
@@ -1092,22 +1106,58 @@ test "closing a pane asks tmux only while tmux still has it" {
     try tr.init(alloc);
     defer tr.deinit();
 
+    var ep: TestEndpoint = .{ .alloc = alloc };
+    defer ep.deinit();
+
     const sink = try tr.router.createChannel(8);
+    tr.router.register(8, ep.endpoint());
 
     // Open: the user closed it, and tmux has to be told.
-    try testing.expect(tr.router.closePane(8));
+    try testing.expect(tr.router.closePane(8, ep.endpoint()));
     try testing.expectEqual(1, tr.host.kills.items.len);
     try testing.expectEqual(8, tr.host.kills.items[0]);
 
     // Closed by tmux: its display is closing because the pane is gone,
     // and a kill would be aimed at nothing.
     sink.close();
-    try testing.expect(!tr.router.closePane(8));
+    try testing.expect(!tr.router.closePane(8, ep.endpoint()));
     try testing.expectEqual(1, tr.host.kills.items.len);
 
     // Never ours.
-    try testing.expect(!tr.router.closePane(1234));
+    try testing.expect(!tr.router.closePane(1234, ep.endpoint()));
     try testing.expectEqual(1, tr.host.kills.items.len);
+}
+
+test "closing the old display of a pane that came back does not kill it" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    var old_ep: TestEndpoint = .{ .alloc = alloc };
+    defer old_ep.deinit();
+    var new_ep: TestEndpoint = .{ .alloc = alloc };
+    defer new_ep.deinit();
+
+    // A session change drops the pane and lists it again, and the new
+    // channel is open before the GUI has closed the old display.
+    const old_sink = try tr.router.createChannel(2);
+    tr.router.register(2, old_ep.endpoint());
+    old_sink.close();
+    _ = try tr.router.createChannel(2);
+
+    // The GUI closing the old display is tmux's doing, not the user's.
+    try testing.expect(!tr.router.closePane(2, old_ep.endpoint()));
+    try testing.expectEqual(0, tr.host.kills.items.len);
+
+    // Not yet claimed by a new display either: nobody's to close.
+    try testing.expect(!tr.router.closePane(2, new_ep.endpoint()));
+
+    // Once the new display has it, closing that one is the user's.
+    tr.router.register(2, new_ep.endpoint());
+    try testing.expect(tr.router.closePane(2, new_ep.endpoint()));
+    try testing.expectEqual(1, tr.host.kills.items.len);
+    _ = tr.router.deregister(2, old_ep.endpoint());
 }
 
 test "a pane nothing claims stops buffering rather than growing forever" {

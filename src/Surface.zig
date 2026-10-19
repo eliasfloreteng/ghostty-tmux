@@ -2310,7 +2310,7 @@ pub fn tmuxClosePane(self: *Surface) bool {
 
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
-    return pane.router.closePane(pane.id);
+    return pane.router.closePane(pane.id, self.io.tmuxEndpoint());
 }
 
 /// Ask tmux for a new window, if this surface is a tmux pane.
