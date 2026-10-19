@@ -371,21 +371,37 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     ///   - tree: The split tree to use for the new window.
     ///   - position: Optional screen position (top-left corner) for the new window.
     ///               If nil, the window will cascade from the last cascade point.
+    ///
+    /// `contentSize` is the size to open at. Without it the window takes
+    /// the size the tree's views already have, which is right for views
+    /// that were on screen (a split dragged out) and not for views that
+    /// never were: they still have their default frame, and a tree of them
+    /// adds those up.
     static func newWindow(
         _ ghostty: Ghostty.App,
         tree: SplitTree<Ghostty.SurfaceView>,
         position: NSPoint? = nil,
+        contentSize: CGSize? = nil,
+        initialFocus: Ghostty.SurfaceView? = nil,
         confirmUndo: Bool = true,
         inheritBackgroundOpacity: Bool? = nil
     ) -> TerminalController {
         // Calculate the target frame based on the tree's view bounds
         // before moving into the new window
-        let treeSize: CGSize? = tree.root?.viewBounds()
+        let treeSize: CGSize? = contentSize ?? tree.root?.viewBounds()
 
         let c = TerminalController.init(ghostty, withSurfaceTree: tree)
+        c.setInitialFocus(initialFocus)
         if let inheritBackgroundOpacity {
             c.isBackgroundOpaque = inheritBackgroundOpacity
         }
+
+        // A new TerminalWindow prefers tabbing until its first event loop
+        // turn is over, which is for window restoration (see TerminalWindow).
+        // Shown within that turn, as it is here, AppKit tabs it into the key
+        // window -- whatever window the tree was dragged out of, or the
+        // terminal that ran `tmux -CC` -- instead of opening it on its own.
+        c.window?.tabbingMode = .automatic
 
         // Showing window in current event loop works so far with dragging surface into
         // a new window, but remember to defer the cascade when you move it inside
@@ -442,22 +458,42 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         return c
     }
 
+    /// Have `view` take focus when the window is first shown, rather than
+    /// whichever surface AppKit finds first. Before the window is shown:
+    /// afterwards AppKit has already picked one.
+    private func setInitialFocus(_ view: Ghostty.SurfaceView?) {
+        guard let view, surfaceTree.contains(view) else { return }
+        focusedSurface = view
+        window?.initialFirstResponder = view
+    }
+
     /// Open a new tab of `parent`.
     ///
     /// `tree` starts the tab from surfaces that already exist rather than
     /// from a fresh one, which is what a tmux window needs: its panes are
     /// built before there is anywhere to put them.
+    ///
+    /// `ordered` places the tab after (`.above`) or before (`.below`)
+    /// `parent`, unless `window-new-tab-position` says to put it at the end.
+    ///
+    /// A tab that is not `select`ed goes into the tab bar without being
+    /// shown, and without becoming key. That is not cosmetic for a tmux
+    /// window: becoming key gives its pane focus, and a pane gaining focus
+    /// tells tmux the user is there, which makes it tmux's current window.
     static func newTab(
         _ ghostty: Ghostty.App,
         from parent: NSWindow? = nil,
         withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil,
-        withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil
+        withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
+        ordered: NSWindow.OrderingMode = .above,
+        select: Bool = true,
+        initialFocus: Ghostty.SurfaceView? = nil
     ) -> TerminalController? {
         // Making sure that we're dealing with a TerminalController. If not,
         // then we just create a new window.
         guard let parent,
               let parentController = parent.windowController as? TerminalController else {
-            if let tree { return newWindow(ghostty, tree: tree) }
+            if let tree { return newWindow(ghostty, tree: tree, initialFocus: initialFocus) }
             return newWindow(ghostty, withBaseConfig: baseConfig, withParent: parent)
         }
 
@@ -480,6 +516,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             withBaseConfig: baseConfig,
             withSurfaceTree: tree)
         controller.isBackgroundOpaque = parentController.isBackgroundOpaque
+        controller.setInitialFocus(initialFocus)
         guard let window = controller.window else { return controller }
 
         // If the parent is miniaturized, then macOS exhibits really strange behaviors
@@ -514,14 +551,23 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
             case "current": fallthrough
             default:
-                tabCreated = parent.addTabbedWindowSafely(window, ordered: .above)
+                tabCreated = parent.addTabbedWindowSafely(window, ordered: ordered)
             }
-            if tabCreated {
+            if tabCreated && select {
                 // We set the selectedWindow early here because we want the next window
                 // to become first responder as quickly as possible. Usually this is
                 // set while `-[NSWindowController showWindow:]` is called, but we're
                 // dispatching it to resolve other issues.
                 parent.tabGroup?.selectedWindow = window
+            }
+
+            // In the tab bar is all an unselected tab needs. It is shown,
+            // and becomes key, when it is selected.
+            if tabCreated && !select {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    controller.relabelTabs()
+                }
+                return controller
             }
         }
 

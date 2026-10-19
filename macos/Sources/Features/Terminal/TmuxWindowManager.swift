@@ -125,7 +125,15 @@ class TmuxWindowManager {
             }
         }
 
-        for (index, window) in action.windows.enumerated() {
+        // tmux's current window first: it is the one tab to be shown, and
+        // every other tab is placed relative to one already on screen. See
+        // `tabParent`.
+        let order = action.windows.indices.sorted { a, b in
+            action.windows[a].active && !action.windows[b].active
+        }
+
+        for index in order {
+            let window = action.windows[index]
             guard !window.nodes.isEmpty else { continue }
 
             guard let root = node(
@@ -194,12 +202,28 @@ class TmuxWindowManager {
             // absorbed. `newTab` puts it in the group before anything is
             // presented, and handles the fullscreen rules while it is
             // there.
+            //
+            // Only tmux's current window is selected. Any other is put in
+            // the tab bar without being shown: showing it would make it
+            // key, its pane would gain focus, and a pane gaining focus
+            // tells tmux the user is there -- making it tmux's current
+            // window, which the tab bar then follows. A session switched
+            // to, or a window opened with `new-window -d`, would pull the
+            // user into whichever tab happened to be built last.
             let controller = newController(
                 ghostty: ghostty,
                 tree: tree,
-                parent: tabParent(action.windows, before: index, host: host))
+                placement: tabParent(action.windows, of: index, host: host),
+                select: window.active,
+                hostSize: hostView.window.map { $0.contentRect(forFrameRect: $0.frame).size },
+                // Where focus goes when the tab is first shown, which for
+                // a tab made in the background is when the user picks it.
+                // Otherwise it is the first pane, and focusing that tells
+                // tmux the user moved there, over the pane tmux had active.
+                initialFocus: window.activePaneId.flatMap { panes[Key(host: host, id: $0)]?.value })
             controller.isTmuxWindow = true
             setTitle(controller, window.name)
+
             let entry = WindowEntry(controller: controller)
             entry.isActive = window.active
             windows[key] = entry
@@ -545,21 +569,34 @@ class TmuxWindowManager {
     private func newController(
         ghostty: Ghostty.App,
         tree: SplitTree<Ghostty.SurfaceView>,
-        parent: NSWindow?
+        placement: (window: NSWindow, ordered: NSWindow.OrderingMode)?,
+        select: Bool,
+        hostSize: CGSize?,
+        initialFocus: Ghostty.SurfaceView?
     ) -> TerminalController {
-        if let parent,
+        if let placement,
            let controller = TerminalController.newTab(
                ghostty,
-               from: parent,
-               withSurfaceTree: tree) {
+               from: placement.window,
+               withSurfaceTree: tree,
+               ordered: placement.ordered,
+               select: select,
+               initialFocus: initialFocus) {
             return controller
         }
 
-        return TerminalController.newWindow(ghostty, tree: tree)
+        // The size of the terminal that started the session: the panes'
+        // views are new, so the tree has no size of its own to offer.
+        return TerminalController.newWindow(
+            ghostty,
+            tree: tree,
+            contentSize: hostSize,
+            initialFocus: initialFocus)
     }
 
-    /// The window a new tab for `windows[index]` should go in after, or
-    /// nil if this host has nothing on screen yet.
+    /// Where a new tab for `windows[index]` goes: after or before a window
+    /// of this host already on screen, or nil if it has nothing on screen
+    /// yet.
     ///
     /// Asked rather than remembered, because a remembered one goes stale:
     /// the tmux window holding it can close while others stay open, and
@@ -568,34 +605,36 @@ class TmuxWindowManager {
     ///
     /// Found by walking tmux's order rather than by taking any window of
     /// this host. Any of them finds the right tab group, but `newTab`
-    /// puts the tab in *after the one it is given*, and `windows` is a
+    /// puts the tab next to *the one it is given*, and `windows` is a
     /// dictionary -- so picking whichever came out first dropped new tabs
     /// at an arbitrary position in the bar.
     private func tabParent(
         _ windows: [Ghostty.Action.TmuxWindows.Window],
-        before index: Int,
+        of index: Int,
         host: ObjectIdentifier
-    ) -> NSWindow? {
-        // The nearest window before this one that is already on screen.
-        // Going in after it is what lines our tabs up with tmux's order.
+    ) -> (window: NSWindow, ordered: NSWindow.OrderingMode)? {
+        // After the nearest window before this one that is on screen.
         for i in stride(from: index - 1, through: 0, by: -1) {
-            if let window = liveWindow(id: windows[i].id, host: host) { return window }
+            if let window = liveWindow(id: windows[i].id, host: host) { return (window, .above) }
         }
 
-        // Nothing before it, so settle for finding the group: the tab
-        // lands one place later than tmux has it. Only reachable when a
-        // window appears before ones already on screen, which needs a
-        // lower index to be freed up and reused.
+        // Nothing before it on screen -- tmux's current window is built
+        // first, and may come later in tmux's order -- so before the
+        // nearest one after it.
         for i in stride(from: index + 1, to: windows.count, by: 1) {
-            if let window = liveWindow(id: windows[i].id, host: host) { return window }
+            if let window = liveWindow(id: windows[i].id, host: host) { return (window, .below) }
         }
 
         return nil
     }
 
+    /// The window showing a tmux window, if it is still in a tab group or
+    /// on screen. A tab that was never selected is not visible, but it is
+    /// in the tab bar and something can go next to it.
     private func liveWindow(id: Int, host: ObjectIdentifier) -> NSWindow? {
         guard let window = windows[Key(host: host, id: id)]?.controller?.window,
-              window.isVisible else { return nil }
+              window.isVisible || window.tabGroup?.windows.contains(window) == true
+        else { return nil }
         return window
     }
 
