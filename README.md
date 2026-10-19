@@ -77,19 +77,23 @@ app (`test/tmux-e2e/`).
 
 ### Download
 
-macOS builds are on the
-[Releases page](https://github.com/eliasfloreteng/ghostty/releases) as
+macOS builds (Apple silicon) are on the
+[Releases page](https://github.com/eliasfloreteng/ghostty-tmux/releases) as
 **Ghostty tmux.app**. It has its own name and bundle identifier
 (`com.eliasfloreteng.ghostty-tmux`), so it installs and runs alongside the
 official Ghostty with its own preferences and permissions, while reading
 the same Ghostty config. Its updater is disabled, so it never "updates"
-itself into the official release. The build is ad-hoc signed, not
-notarized: after unzipping, run
+itself into the official release. Unless the build workflow has signing
+secrets (see [`fork-build.yml`](.github/workflows/fork-build.yml)), a
+release is ad-hoc signed and not notarized: after unzipping, run
 `xattr -dr com.apple.quarantine "Ghostty tmux.app"` (or right-click ›
 Open) once.
 
 To build and install it from a checkout instead, run
-[`dist/macos/install-fork.sh`](dist/macos/install-fork.sh).
+[`dist/macos/install-fork.sh`](dist/macos/install-fork.sh). Signing it with
+a certificate (`SIGN_IDENTITY="Apple Development" dist/macos/install-fork.sh`)
+keeps macOS permissions across updates; an ad-hoc signed build is a new
+app to macOS every time.
 
 ### Staying in sync with upstream
 
@@ -100,10 +104,24 @@ update when the tests (including the live tmux tests) fail after the
 merge, so `main` only ever moves to a merge that builds and passes. It can
 also be run by hand from the Actions tab.
 
+Every successful sync, and every push to `main`, is followed by the
+[build workflow](.github/workflows/fork-build.yml), which builds
+**Ghostty tmux.app** on a GitHub-hosted Mac and publishes it as a release
+tagged `build-<commit>` (once per commit).
+
 ### Future work
 
 Not done yet, roughly in order of usefulness:
 
+- Notification passthrough: desktop notifications from programs inside
+  tmux panes (for example Claude Code when it needs input or finishes),
+  sent as OSC 9, OSC 777 or OSC 99, or wrapped in tmux's `DCS tmux;`
+  passthrough (`allow-passthrough`), should become native Ghostty
+  notifications for that pane, and clicking one should bring its tab and
+  split forward. Still to find out: which of these tmux forwards to a
+  control client as plain `%output` (and so may already work) and which it
+  consumes or rewrites, and how tools detect the terminal when
+  `TERM_PROGRAM` is `tmux`.
 - Bell, activity and silence markers on tabs from tmux's window flags.
 - Mirroring tab drag-and-drop (reorder, tear off) to tmux.
 - Per-pane titles (`#{pane_title}`) on splits.
