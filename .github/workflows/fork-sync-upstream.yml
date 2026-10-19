@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   sync:
-    if: github.repository == 'eliasfloreteng/ghostty'
+    if: github.repository == 'eliasfloreteng/ghostty-tmux'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

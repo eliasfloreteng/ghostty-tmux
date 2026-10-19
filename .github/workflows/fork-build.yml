@@ -1,0 +1,212 @@
+# Fork-only: build "Ghostty tmux.app" and publish it as a GitHub release.
+#
+# Runs after every successful upstream sync (see fork-sync-upstream.yml),
+# on pushes to `main`, and by hand. Each commit of `main` is released at
+# most once, as the tag `build-<short sha>`: a sync that found nothing new
+# leaves `main` where it was, so it finds that release and stops early.
+#
+# Signing. Without secrets the app is ad-hoc signed, which runs fine after
+# clearing the quarantine flag, but macOS treats every build as a new app
+# and asks for its permissions again. To sign with a certificate, set:
+#
+#   MACOS_CERTIFICATE_P12       the certificate and its private key, as a
+#                               base64-encoded .p12 export
+#                               (`base64 -i cert.p12 | pbcopy`)
+#   MACOS_CERTIFICATE_PASSWORD  the .p12's password
+#   MACOS_SIGN_IDENTITY         the identity to sign with, e.g.
+#                               "Developer ID Application: Accord Software
+#                               AB (XQ9HKBVB36)"
+#
+# A "Developer ID Application" certificate is what makes a download open
+# on any Mac. With one, also set these to notarize and staple the build,
+# so Gatekeeper opens it without complaint:
+#
+#   APPLE_NOTARY_KEY     an App Store Connect API key (.p8 contents)
+#   APPLE_NOTARY_KEY_ID  its key ID
+#   APPLE_NOTARY_ISSUER  its issuer ID
+name: Build fork
+
+on:
+  workflow_run:
+    workflows: ["Sync with upstream"]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# Queue rather than cancel: a queued run for the same commit then finds
+# the release the first one made and stops.
+concurrency:
+  group: fork-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'eliasfloreteng/ghostty-tmux' &&
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.conclusion == 'success')
+    # macos-26 images ship Xcode 26, which main requires (see HACKING.md).
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      # Secrets cannot be tested in a step's `if`, so expose whether they
+      # are set.
+      NOTARIZE: ${{ secrets.APPLE_NOTARY_KEY_ID != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+    steps:
+      # After a sync, build what the sync pushed: the tip of main, not the
+      # commit the sync workflow itself ran on.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && 'main' || github.sha }}
+          fetch-depth: 0
+
+      - name: Check for an existing release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse --short=9 HEAD)
+          tag="build-$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to build." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get required Zig version
+        if: steps.release.outputs.exists == 'false'
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Zig
+        if: steps.release.outputs.exists == 'false'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      # The newest Xcode on the image, so a rotation to a newer one is
+      # picked up and an older default never is.
+      - name: Select Xcode
+        if: steps.release.outputs.exists == 'false'
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      # Since Xcode 26 the Metal compiler is a separate download, and the
+      # runner images do not include it.
+      - name: Install Metal Toolchain
+        if: steps.release.outputs.exists == 'false'
+        run: sudo xcodebuild -downloadComponent MetalToolchain
+
+      - name: Install gettext
+        if: steps.release.outputs.exists == 'false'
+        run: which msgfmt || brew install gettext
+
+      # Native (arm64) only: the fork is built for Apple silicon Macs, and
+      # skipping the x86_64 and iOS slices halves the build.
+      - name: Build Ghostty.app
+        if: steps.release.outputs.exists == 'false'
+        run: zig build -Doptimize=ReleaseFast -Dxcframework-target=native --summary all
+
+      - name: Import signing certificate
+        if: steps.release.outputs.exists == 'false'
+        id: cert
+        env:
+          P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          if [ -z "$P12" ] || [ -z "$IDENTITY" ]; then
+            echo "No signing secrets; signing ad hoc." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(uuidgen)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "Signing as $IDENTITY." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Package Ghostty tmux.app
+        if: steps.release.outputs.exists == 'false'
+        env:
+          SIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
+          # Notarization requires a secure timestamp.
+          SIGN_TIMESTAMP: ${{ env.NOTARIZE == 'true' && '1' || '' }}
+        run: |
+          dist/macos/package-fork.sh macos/build/ReleaseLocal/Ghostty.app "$RUNNER_TEMP/Ghostty tmux.app"
+
+      - name: Notarize
+        if: steps.release.outputs.exists == 'false' && env.NOTARIZE == 'true'
+        env:
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          app="$RUNNER_TEMP/Ghostty tmux.app"
+          echo "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --wait \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER"
+          xcrun stapler staple "$app"
+          rm "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
+          echo "Notarized and stapled." >> "$GITHUB_STEP_SUMMARY"
+
+      # ditto rather than zip: it keeps the symlinks and modes inside an
+      # .app bundle, which a plain zip mangles.
+      - name: Zip
+        if: steps.release.outputs.exists == 'false'
+        run: |
+          cd "$RUNNER_TEMP"
+          ditto -c -k --sequesterRsrc --keepParent "Ghostty tmux.app" Ghostty-tmux.zip
+
+      - name: Publish release
+        if: steps.release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SHA: ${{ steps.release.outputs.sha }}
+          IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: |
+          version=$("macos/build/ReleaseLocal/Ghostty.app/Contents/MacOS/ghostty" +version | sed -n 's/^Ghostty //p' | head -1)
+          if [ "$IDENTITY" = "-" ]; then
+            signing="Ad-hoc signed. After unzipping, run \`xattr -dr com.apple.quarantine \"Ghostty tmux.app\"\` once."
+          else
+            signing="Signed as $IDENTITY."
+          fi
+          {
+            echo "Ghostty with native tmux control mode, built from \`main\` at $SHA."
+            echo
+            echo "Version: \`$version\`"
+            echo
+            echo "$signing"
+            echo
+            echo "Changes since the previous build: see the commits of \`main\`."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" "$RUNNER_TEMP/Ghostty-tmux.zip" \
+            --target "$(git rev-parse HEAD)" \
+            --title "Ghostty tmux $(date -u +%Y-%m-%d) ($SHA)" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest
+          echo "Published $TAG." >> "$GITHUB_STEP_SUMMARY"
