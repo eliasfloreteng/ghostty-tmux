@@ -149,7 +149,14 @@ class GhosttyApp:
     # -- lifecycle ----------------------------------------------------------
 
     def launch(self, timeout: float = 30.0) -> None:
-        env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+        # Drop what a surrounding tmux or Ghostty would hand down. Release
+        # builds honor GHOSTTY_RESOURCES_DIR, so running the harness from
+        # inside another Ghostty would test that Ghostty's resources.
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("TMUX", "TMUX_PANE") and not k.startswith("GHOSTTY_")
+        }
         env.update(
             {
                 # Temp files (e.g. write_screen_file output) land here so the
