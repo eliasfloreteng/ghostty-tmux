@@ -21,6 +21,15 @@ class UpdateController {
         viewModel.state.shouldTerminateWithoutWarning
     }
 
+    /// True if this build must never update itself, set with the
+    /// `GhosttyUpdaterDisabled` Info.plist key. A build that is not an
+    /// official release (a fork, a local build under another bundle ID)
+    /// would otherwise "update" into the official release, which the
+    /// official feed and signing key both accept.
+    static var isDisabled: Bool {
+        Bundle.main.infoDictionary?["GhosttyUpdaterDisabled"] as? Bool == true
+    }
+
     /// Initialize a new update controller.
     init() {
         let hostBundle = Bundle.main
@@ -40,6 +49,8 @@ class UpdateController {
     /// This must be called before the updater can check for updates. If starting fails,
     /// the error will be shown to the user.
     func startUpdater() {
+        guard !Self.isDisabled else { return }
+
         do {
             try updater.start()
         } catch {
@@ -60,6 +71,8 @@ class UpdateController {
     ///
     /// This is typically connected to a menu item action.
     func checkForUpdates() {
+        guard !Self.isDisabled else { return }
+
         // If we're already idle, then just check for updates immediately.
         if viewModel.state == .idle {
             updater.checkForUpdates()
