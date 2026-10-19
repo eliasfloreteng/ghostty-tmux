@@ -157,6 +157,12 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   same columns as in tmux, less and vim (alternate screen) show what tmux
   shows, history is there after attaching (`write_scrollback_file`), and
   the wheel scrolls it (read from the app log's scrollbar actions).
+- `pane_grapheme_widths`: ZWJ sequences, flags, VS15/VS16 and combining
+  marks take the columns tmux gives them, with
+  `grapheme-width-method = legacy` and a program resetting mode 2027 (the
+  app is relaunched for this). An emoji with a skin tone modifier is left
+  out: tmux 3.6 does not join the two and makes it four columns wide,
+  where Ghostty makes it two.
 
 Some things can't be checked automatically. These scenarios report `SKIP`
 with a reason:

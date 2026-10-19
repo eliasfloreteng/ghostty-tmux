@@ -2384,3 +2384,60 @@ test "live: attaching read-only says so and still shows the pane" {
     try session.waitForPaneText(pane_id, "hello");
     try testing.expect(!session.exited);
 }
+
+test "live: characters are as wide here as tmux makes them" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "cat");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    var it = session.viewer.panes.iterator();
+    const pane_id = it.next().?.key_ptr.*;
+    const target = try std.fmt.allocPrint(alloc, "%{d}", .{pane_id});
+    defer alloc.free(target);
+
+    // Typed into `cat`, so the tty's echo puts each on a line of its own.
+    // Where the cursor ends up is how wide tmux made the line, and the
+    // same has to hold for our copy of the pane: anything after a
+    // character we disagree about is drawn in the wrong column.
+    //
+    // Left out, because we cannot match it: an emoji with a skin tone
+    // modifier, which tmux 3.6 does not join and gives four columns.
+    const cases = [_][]const u8{
+        "a\u{65E5}\u{672C}\u{8A9E}b\u{1F389}ce\u{301}\u{301}d", // CJK, emoji, combining marks
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", // ZWJ sequence
+        "\u{2764}\u{FE0F}", // made wide by VS16
+        "\u{26A0}\u{FE0F}", // same
+        "\u{1F1F8}\u{1F1EA}", // a flag
+        "\u{263A}\u{FE0E}", // kept narrow by VS15
+    };
+
+    for (cases, 0..) |case, i| {
+        var marker_buf: [8]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&marker_buf, "#{d}#", .{i});
+        const data = try std.mem.concat(alloc, u8, &.{ case, marker });
+        defer alloc.free(data);
+
+        try session.input(.{ .write = .{ .pane_id = pane_id, .data = data } });
+        try session.waitForPaneText(pane_id, marker);
+
+        // By the time the echo reached us tmux had put it in its grid.
+        const out = try session.ask(&.{
+            "display-message", "-p", "-t", target, "#{cursor_x}",
+        });
+        defer alloc.free(out);
+        const want = try std.fmt.parseInt(usize, std.mem.trim(u8, out, " \r\n"), 10);
+
+        const pane = session.viewer.panes.get(pane_id).?;
+        const got = pane.terminal.screens.active.cursor.x;
+        if (got != want) {
+            log.err("{s}: tmux has the cursor at {d}, we have {d}", .{ case, want, got });
+            return error.WidthMismatch;
+        }
+
+        try session.input(.{ .write = .{ .pane_id = pane_id, .data = "\r" } });
+    }
+    try testing.expect(!session.exited);
+}

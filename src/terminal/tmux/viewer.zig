@@ -654,6 +654,11 @@ pub const Viewer = struct {
             self.terminal = try .init(io, alloc, .{
                 .cols = cols,
                 .rows = rows,
+
+                // Characters as wide as tmux makes them, as in the
+                // surface showing the pane. See the termio stream
+                // handler's `follow_grapheme_mode`.
+                .default_modes = .{ .grapheme_cluster = true },
             });
             errdefer self.terminal.deinit(alloc);
 

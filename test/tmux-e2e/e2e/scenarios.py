@@ -935,6 +935,68 @@ def pane_wide_chars(ctx: Context) -> None:
     )
 
 
+def _printf_octal(text: str) -> str:
+    """`text` as a printf format of octal escapes, so the shell never sees
+    the characters themselves."""
+    return "".join(f"\\{b:03o}" for b in text.encode())
+
+
+# Widths tmux 3.6 gives these, which the GUI must match. Not here, because
+# it can't: an emoji with a skin tone modifier, which tmux doesn't join and
+# makes four columns wide.
+GRAPHEME_CASES = {
+    "cjk-emoji-combining": "a\u65e5\u672c\u8a9eb\U0001f389ce\u0301\u0301d",
+    "zwj-family": "\U0001f468\u200d\U0001f469\u200d\U0001f467",
+    "vs16-heart": "\u2764\ufe0f",
+    "vs16-warning": "\u26a0\ufe0f",
+    "flag": "\U0001f1f8\U0001f1ea",
+    "vs15-smiley": "\u263a\ufe0e",
+}
+
+
+@scenario
+def pane_grapheme_widths(ctx: Context) -> None:
+    """Graphemes take tmux's columns in the GUI, whatever the config or the program says about mode 2027."""
+    # The config would have the GUI measure these differently. A pane's
+    # grid is tmux's, so it must not.
+    ctx.app.relaunch("grapheme-width-method = legacy\n")
+    try:
+        ctx.app.close_all_windows(timeout=ctx.timeout)
+        ctx.attach()
+        term = ctx.tab_for_window("main").terminals[0].id
+        pane = f"{SESSION}:main"
+        # As does a program turning grapheme clustering off, which tmux
+        # ignores.
+        ctx.tmux.run("send-keys", "-t", pane, "printf '\\033[?2027l'", "Enter")
+
+        for i, (name, text) in enumerate(GRAPHEME_CASES.items()):
+            # A "*" at a fixed column after the text lands on a different
+            # letter if the GUI and tmux disagree about how wide it is.
+            prefix = f"G{i}|"
+            ctx.tmux.run(
+                "send-keys", "-t", pane,
+                f"printf '{prefix}{_printf_octal(text)}ABCDEFGHIJKLMNOP\\033[20G*\\n'",
+                "Enter",
+            )
+
+            def tmux_line() -> str | None:
+                return next((line for line in _lines(ctx.tmux.capture(pane)) if line.startswith(prefix)), None)
+
+            want = wait_until(tmux_line, timeout=ctx.timeout, desc=f"{name} in tmux")
+            check("*" in want, f"{name}: tmux did not lay the line out as expected: {want!r}")
+            wait_until(
+                lambda: want in _lines(ctx.app.read_screen(term)),
+                timeout=ctx.timeout,
+                desc=f"{name}: the GUI to show {want!r} exactly as tmux does",
+                describe_state=lambda: repr(
+                    [line for line in _lines(ctx.app.read_screen(term)) if line.startswith(prefix)]
+                ),
+            )
+    finally:
+        ctx.gateway = ""
+        ctx.app.relaunch()
+
+
 def _numbered_file(ctx: Context, lines: int) -> str:
     path = ctx.tmux.conf.parent / "numbered.txt"
     path.write_text("".join(f"line-{i:04d}\n" for i in range(1, lines + 1)))

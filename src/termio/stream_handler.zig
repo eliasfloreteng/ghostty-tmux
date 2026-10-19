@@ -82,6 +82,27 @@ pub const StreamHandler = struct {
     /// bells, clipboard writes and so on.
     answer_queries: bool = true,
 
+    /// Whether a program can turn grapheme clustering (mode 2027) on and
+    /// off.
+    ///
+    /// Off for a terminal displaying a tmux control mode pane, which keeps
+    /// clustering on. tmux lays out the pane's grid and decides how wide
+    /// every character in it is; we only draw a copy. If our widths differ
+    /// from tmux's, everything after the character is drawn in the wrong
+    /// column, and the cursor tmux reports is not where our text ends.
+    ///
+    /// tmux 3.6 clusters graphemes much as mode 2027 does: a ZWJ
+    /// sequence, a flag, or a character made wide by VS16 takes two
+    /// columns, as here, where without clustering they would take four,
+    /// six, or one. It has no mode 2027 of its own and ignores a program
+    /// setting it, so neither may we.
+    ///
+    /// Not identical: tmux does not join an emoji to its skin tone
+    /// modifier, which it gives two columns of its own, and its
+    /// `codepoint-widths` and `variation-selector-always-wide` options
+    /// change widths in ways we cannot see.
+    follow_grapheme_mode: bool = true,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -912,6 +933,13 @@ pub const StreamHandler = struct {
         if (mode == .cursor_blinking and
             self.terminal.cursor.default_blink != null)
         {
+            return;
+        }
+
+        // Kept on, which a restored mode may have just undone. See the
+        // field.
+        if (mode == .grapheme_cluster and !self.follow_grapheme_mode) {
+            self.terminal.modes.set(.grapheme_cluster, true);
             return;
         }
 

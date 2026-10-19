@@ -293,6 +293,11 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .legacy => {},
         }
 
+        // A tmux pane's grid is tmux's, and tmux decides how wide every
+        // character in it is, whatever we are configured with. See
+        // `StreamHandler.follow_grapheme_mode`.
+        if (opts.backend == .tmux) modes.grapheme_cluster = true;
+
         // Set default cursor blink settings
         modes.cursor_blinking = opts.config.cursor_blink orelse true;
 
@@ -357,8 +362,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .xt_checksum_report = opts.config.xt_checksum_report,
         .tmux_host = if (comptime StreamHandler.tmux_enabled) self else {},
 
-        // tmux answers the program in a pane itself. See the field.
+        // tmux answers the program in a pane itself, and decides how
+        // wide its characters are. See the fields.
         .answer_queries = backend != .tmux,
+        .follow_grapheme_mode = backend != .tmux,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
