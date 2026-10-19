@@ -35,6 +35,9 @@ protocol TerminalViewModel: ObservableObject {
 
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
+
+    /// The surface in the tree to have focus, if one was chosen.
+    var focusedSurface: Ghostty.SurfaceView? { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -85,7 +88,21 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         .environmentObject(ghostty)
                         .ghosttyLastFocusedSurface(lastFocusedSurface)
                         .focused($focused)
-                        .onAppear { self.focused = true }
+                        .onAppear {
+                            // The surface chosen to have focus, if there is
+                            // one. Focusing the tree leaves the choice to
+                            // SwiftUI, which picks the first surface, a
+                            // moment after the window has put focus on the
+                            // chosen one. For a tmux window that is not only
+                            // the wrong pane: focusing a pane selects it in
+                            // tmux, so the pane tmux had active was lost.
+                            if let surface = viewModel.focusedSurface,
+                               viewModel.surfaceTree.contains(surface) {
+                                Ghostty.moveFocus(to: surface)
+                            } else {
+                                self.focused = true
+                            }
+                        }
                         .onChange(of: focusedSurface) { newValue in
                             // We want to keep track of our last focused surface so even if
                             // we lose focus we keep this set to the last non-nil value.
