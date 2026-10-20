@@ -27,6 +27,12 @@ extension Ghostty.Action {
             /// session ends; the session keeps running in tmux.
             case unsupported
 
+            /// The connection to tmux dropped without the session ending.
+            /// The text is the command line that started the session in
+            /// the host's terminal, which `ghostty_surface_tmux_reattach`
+            /// runs again. Sent just before the session's windows go.
+            case connectionLost
+
             init?(_ c: ghostty_tmux_notice_kind_e) {
                 switch c {
                 case GHOSTTY_TMUX_NOTICE_MESSAGE: self = .message
@@ -34,6 +40,7 @@ extension Ghostty.Action {
                 case GHOSTTY_TMUX_NOTICE_COMMAND_ERROR: self = .commandError
                 case GHOSTTY_TMUX_NOTICE_EXIT: self = .exit
                 case GHOSTTY_TMUX_NOTICE_UNSUPPORTED: self = .unsupported
+                case GHOSTTY_TMUX_NOTICE_CONNECTION_LOST: self = .connectionLost
                 default: return nil
                 }
             }

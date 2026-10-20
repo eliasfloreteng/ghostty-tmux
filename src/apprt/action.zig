@@ -1137,6 +1137,13 @@ pub const TmuxWindows = struct {
 ///     names the version found and the one needed; the session ends
 ///     right after, and keeps running in tmux. Worth more than a toast:
 ///     without it the user only sees `tmux -CC` return.
+///   - `connection_lost`: the connection to tmux dropped (no `%exit`
+///     came before control mode ended), so the session is likely still
+///     running. The text is the command line that started it in the
+///     host's terminal, read back from shell integration's marks; the
+///     GUI may offer to run it again with `ghostty_surface_tmux_reattach`.
+///     Sent just before the session's windows go. A drop with no such
+///     command is reported as `exit` instead.
 ///
 /// The text is tmux's, UTF-8 in practice but not guaranteed to be, and
 /// not localized. It is only valid for the duration of the action call.

@@ -175,6 +175,9 @@ pub const Viewer = struct {
     /// empty session name.
     session_name: []const u8 = "",
 
+    /// See `Options.reattach_command`. Owned, or empty.
+    reattach_command: []const u8 = "",
+
     /// The tmux server version string (e.g., "3.5a"). We capture this
     /// on startup because it will allow us to change behavior between
     /// versions as necessary.
@@ -380,6 +383,16 @@ pub const Viewer = struct {
             /// immediately followed by a `detach-client` command and the
             /// `exit` action; the session keeps running in tmux.
             unsupported,
+
+            /// The connection to tmux dropped without the session ending:
+            /// control mode stopped with no `%exit` from tmux, so the
+            /// session is most likely still running. The text is the
+            /// command line that started control mode in the host
+            /// terminal, which running again there reattaches. Only sent
+            /// when that command is known (see `Options.reattach_command`);
+            /// otherwise the drop is reported as an `exit` notice. Always
+            /// immediately followed by the `exit` action.
+            connection_lost,
         };
     };
 
@@ -433,6 +446,14 @@ pub const Viewer = struct {
         kill_windows: KillWindows,
 
         kill_pane: KillPane,
+
+        /// Control mode ended without tmux saying so: the stream carrying
+        /// it stopped with no `%exit` before it. tmux says `%exit`
+        /// whenever one of its clients leaves, however it leaves, so this
+        /// is the connection to tmux breaking (ssh losing the network,
+        /// typically) and not the session ending. Ends the viewer like
+        /// an exit does.
+        connection_lost: void,
 
         pub const Write = struct {
             pane_id: usize,
@@ -710,6 +731,15 @@ pub const Viewer = struct {
         /// means re-reading the pane and losing whatever scrolled past.
         /// Which of the two is worse belongs to the user.
         pause_after: u32 = 0,
+
+        /// The command line that started control mode in the host
+        /// terminal, if it is known and running it again would reattach.
+        /// See `host_command.read`. Copied; empty if unknown.
+        ///
+        /// Offered back to the user when the connection drops, which is
+        /// all it is used for. It is the command that started *this*
+        /// viewer, so a session switched to since is not where it leads.
+        reattach_command: []const u8 = "",
     };
 
     pub fn init(
@@ -721,6 +751,9 @@ pub const Viewer = struct {
         var command_queue: CommandQueue = try .init(alloc, COMMAND_QUEUE_INITIAL);
         errdefer command_queue.deinit(alloc);
 
+        const reattach_command = try alloc.dupe(u8, opts.reattach_command);
+        errdefer alloc.free(reattach_command);
+
         return .{
             .io = io,
             .alloc = alloc,
@@ -730,6 +763,7 @@ pub const Viewer = struct {
             // set this to a real value.
             .session_id = 0,
             .tmux_version = "",
+            .reattach_command = reattach_command,
             .command_queue = command_queue,
             .commands_sent = 0,
             .orphan_replies = 0,
@@ -777,6 +811,7 @@ pub const Viewer = struct {
         if (self.session_name.len > 0) {
             self.alloc.free(self.session_name);
         }
+        self.alloc.free(self.reattach_command);
         self.action_arena.promote(self.alloc).deinit();
     }
 
@@ -814,6 +849,7 @@ pub const Viewer = struct {
             .split => self.nextSplit(input.split),
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
+            .connection_lost => self.connectionLost(),
         };
     }
 
@@ -849,6 +885,7 @@ pub const Viewer = struct {
             .tmux,
             .client_size,
             .detach,
+            .connection_lost,
             => return null,
 
             // Side effects of the GUI, not something the user asked
@@ -2731,6 +2768,7 @@ pub const Viewer = struct {
         // the session that just ended.
         var replacement: Viewer = try .init(self.io, self.alloc, .{
             .pause_after = self.pause_after,
+            .reattach_command = self.reattach_command,
         });
         errdefer replacement.deinit();
 
@@ -3506,6 +3544,30 @@ pub const Viewer = struct {
         return &self.action_exit;
     }
 
+    /// The connection to tmux broke without the session ending. See
+    /// `Input.connection_lost`.
+    ///
+    /// Said either way, because a session whose windows all vanish
+    /// without a reason looks like a crash. With the command that
+    /// started it known, it is said as an offer to run that again.
+    fn connectionLost(self: *Viewer) []const Action {
+        if (self.state == .defunct) return &.{};
+
+        const actions = self.defunct();
+        log.info("lost the connection to tmux", .{});
+        self.action_exit = .{
+            .{ .notice = if (self.reattach_command.len > 0) .{
+                .kind = .connection_lost,
+                .text = self.reattach_command,
+            } else .{
+                .kind = .exit,
+                .text = "lost the connection to tmux",
+            } },
+            actions[0],
+        };
+        return &self.action_exit;
+    }
+
     /// The notice a notification amounts to, if any. Shared by every
     /// state, since tmux can say these at any time.
     fn notificationNotice(n: control.Notification) ?Notice {
@@ -3953,6 +4015,64 @@ test "immediate exit" {
             }).check,
         },
     });
+}
+
+test "a lost connection offers the command that started it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .reattach_command = "ssh host -t tmux -CC attach",
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // A session change carries it over: it is about the host, not
+        // about the session.
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 2,
+            .name = "other",
+        } } } },
+        .{
+            .input = .connection_lost,
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(2, actions.len);
+                    try testing.expectEqual(.connection_lost, actions[0].notice.kind);
+                    try testing.expectEqualStrings(
+                        "ssh host -t tmux -CC attach",
+                        actions[0].notice.text,
+                    );
+                    try testing.expect(actions[1] == .exit);
+                    try testing.expectEqual(.defunct, v.state);
+                }
+            }).check,
+        },
+        // Said once.
+        .{
+            .input = .connection_lost,
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+    });
+}
+
+test "a lost connection with no command to offer still says so" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{.{
+        .input = .connection_lost,
+        .check = (struct {
+            fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                try testing.expectEqual(2, actions.len);
+                try testing.expectEqual(.exit, actions[0].notice.kind);
+                try testing.expect(actions[1] == .exit);
+            }
+        }).check,
+    }});
 }
 
 test "session changed resets state" {
