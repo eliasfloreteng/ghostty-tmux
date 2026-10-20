@@ -42,21 +42,48 @@ terminal and the session opens as native Ghostty windows:
 - **Ghostty's verbs go to tmux.** New tab is `new-window`, new split is
   `split-window` (all four directions), closing a split or tab kills the
   tmux pane or window (always confirmed), zoom is `resize-pane -Z`, moving
-  a tab is `swap-window`, renaming a tab is `rename-window`, and dragging a
-  divider resizes the tmux pane. Each tmux window is sized from its own
-  Ghostty window (tmux 3.4+, with a fallback for older servers).
+  or dragging a tab reorders the tmux windows, renaming a tab is
+  `rename-window`, and dragging a divider resizes the tmux pane. Dropping
+  a split onto another moves the tmux pane there; dragging one out of its
+  window breaks it into a new tmux window. Each tmux window is sized from
+  its own Ghostty window (tmux 3.4+, with a fallback for older servers),
+  and fullscreening or resizing re-reads what tmux has on screen, so
+  full-screen programs (lazygit, Neovim, Claude Code) stay intact.
+- **Swap, rotate, break and join panes** (`tmux_swap_pane`,
+  `tmux_rotate_window`, `tmux_break_pane`, `tmux_join_pane`), and **run
+  any tmux command** from a prompt (`prompt_tmux_command`) or a keybind
+  (`tmux_command:<line>`). All unbound by default.
+- **Tabs show what tmux knows**: bell, activity and silence marks from
+  tmux's window flags, each pane's title (`#{pane_title}`) and working
+  directory, kept live with `refresh-client -B` subscriptions; tab order
+  follows tmux's window order, whoever moved them. Optionally, tmux's
+  status line along the bottom of each window (`tmux-status-bar`).
 - **Focus follows both ways.** Focusing a split selects the tmux pane, and
   `select-pane`/`select-window` from tmux or another client moves Ghostty.
 - **Full history on attach**, both screens, cursor and terminal modes
   (modifyOtherKeys too, from tmux 3.5), so scrollback, search and
-  selection are Ghostty's own. Typing, IME and pastes (bracketed exactly
+  selection are Ghostty's own. Each pane's screen is shown first and its
+  history fills in behind it, so big sessions appear at once. Typing, IME and pastes (bracketed exactly
   when the pane's program asked for it) are sent through tmux; queries are
   answered by tmux only.
 - **The terminal that ran `tmux -CC`** shows which session it hosts and
   offers _Show Windows_ and _Detach_; it no longer swallows keys as tmux
   commands. Closing it says it detaches, and the session keeps running.
+- **A tmux dashboard** (File › tmux › Dashboard…, or from the host
+  terminal): the server's sessions, to switch between, and the session's
+  windows, any of which can be hidden (it keeps running in tmux, with no
+  tab, and stays hidden on the next attach).
 - **File › tmux menu** (New Window, Split Right/Down, Zoom Pane, Kill Pane,
-  Detach) and a `tmux_detach` keybind action (unbound by default).
+  swap, rotate, break and join, Run Command…, Dashboard…, Detach) and a
+  `tmux_detach` keybind action (unbound by default).
+- **Options**: `tmux-window-placement = windows` opens tmux windows as
+  separate windows rather than tabs, `tmux-hide-host` hides the terminal
+  that ran `tmux -CC` while the session is on screen,
+  `tmux-history-limit` caps the history read on attach,
+  `tmux-paste-buffer-clipboard` copies tmux paste buffers to the
+  clipboard, `tmux-client-flags` sets `active-pane` and
+  `no-detach-on-destroy`, and `tmux-hidden-output-off-after` stops output
+  for panes nobody can see (see its documentation for the catch).
 - **tmux talks back**: `display-message`, tmux.conf errors, refused
   commands and the reason a session ended are shown as notices or alerts.
 - **Notifications, links and passthrough from panes**: OSC 9, OSC 777 and
@@ -71,11 +98,14 @@ terminal and the session opens as native Ghostty windows:
   on its `auto` channel there; set it to `ghostty` (OSC 777) with
   `claude config set --global preferredNotifChannel ghostty`.
 - **Robust sessions**: detach, `kill-session`, `kill-server`, `switch-client`
-  (including to the same session), dropped ssh connections, large histories,
-  floods (optional `tmux-pause-after = <seconds>`) and read-only clients
+  (including to the same session), dropped ssh connections (with an offer
+  to run the `tmux -CC` command again, when shell integration knows it),
+  large histories, floods (optional `tmux-pause-after = <seconds>`, with a
+  "catching up" badge on a paused pane) and read-only clients
   (`attach -r` / `switch-client -r`: the session stays visible, input is
-  refused with a notice) are all handled. tmux windows are not restored on
-  relaunch and closes done by tmux are not undoable.
+  refused with a notice) are all handled. tmux older than 3.2 is turned
+  away with a message. tmux windows are not restored on relaunch and
+  closes done by tmux are not undoable.
 
 Linux (GTK) gets the core tmux windows-as-tabs support, but the macOS app
 is what this fork is built and tested for.
@@ -125,41 +155,22 @@ tagged `build-<commit>` (once per commit).
 
 Not done yet, roughly in order of usefulness:
 
-- Notification passthrough: desktop notifications from programs inside
-  tmux panes (for example Claude Code when it needs input or finishes),
-  sent as OSC 9, OSC 777 or OSC 99, or wrapped in tmux's `DCS tmux;`
-  passthrough (`allow-passthrough`), should become native Ghostty
-  notifications for that pane, and clicking one should bring its tab and
-  split forward. Still to find out: which of these tmux forwards to a
-  control client as plain `%output` (and so may already work) and which it
-  consumes or rewrites, and how tools detect the terminal when
-  `TERM_PROGRAM` is `tmux`.
-- Bell, activity and silence markers on tabs from tmux's window flags.
-- Passthrough of pressing hyperlinks.
-- Mirroring tab drag-and-drop (reorder, tear off) to tmux.
-- Per-pane titles (`#{pane_title}`) on splits.
-- A session picker / dashboard: list sessions, attach, choose which windows
-  to show, hide windows (iTerm2's tmux dashboard).
-- Options: open tmux windows as separate windows or tabs, hide the host
-  terminal while attached, cap history read on attach, mirror tmux paste
-  buffers to the clipboard, extra client flags (`active-pane`,
-  `no-detach-on-destroy`).
-- `refresh-client -B` subscriptions (pane titles, working directory,
-  activity) and turning off output for panes not on screen.
-- A "paused, catching up" indicator per pane when `tmux-pause-after`
-  kicks in, and reading history lazily so big sessions attach faster.
-- Swap, rotate, break and join panes from the GUI.
-- Mirroring tmux's status line, and a "run tmux command" prompt.
-- Restoring keyboard protocol modes (modifyOtherKeys, kitty keyboard) and
-  passing through DCS/image passthrough sequences.
-- A clear message for tmux older than 3.2, and a reconnect helper for
-  dropped connections.
 - New splits and tabs start in the working directory of the pane they
   were made from, as they do in plain Ghostty (`split-window -c`,
   `new-window -c` with `#{pane_current_path}`).
 - Auto-update: the app's updater is disabled so it never updates itself
   into the official release; it should update from this fork's releases
   instead.
+- Reading history on demand as it is scrolled into, rather than all of it
+  after the screen, and re-reading history (not just the screen) after a
+  resize.
+- Moving a tab into a window of another session, or between sessions.
+- Restoring kitty keyboard flags, which tmux neither implements nor keeps.
+- Reconnecting without shell integration, or after `ssh host` followed by
+  `tmux -CC` typed on the remote side.
+- tmux's own colours and styles in the mirrored status line.
+- The GTK app: the dashboard, the command prompt, the status bar and the
+  pane status badges are macOS only.
 
 ## About
 
