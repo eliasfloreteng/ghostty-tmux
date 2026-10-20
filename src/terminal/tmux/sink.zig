@@ -93,6 +93,27 @@ pub const Adjacent = enum {
     next,
 };
 
+/// How current a pane's display is with tmux, beyond what its content
+/// shows. Displays that have room to say so should: a pane that is not
+/// `live` can look complete and not be.
+///
+/// Sync with: ghostty_action_tmux_pane_status_e
+pub const PaneStatus = enum(c_int) {
+    /// Up to date: everything tmux has for the pane is here.
+    live,
+
+    /// The screen is shown and the history above it is still being
+    /// read, so scrolling up finds less than tmux has. It arrives on its
+    /// own; nothing is wrong.
+    loading_history,
+
+    /// tmux paused the pane because we fell too far behind it
+    /// (`tmux-pause-after`), and it is being read again. What is on
+    /// screen may be stale until it is, and output from while it was
+    /// paused is gone for good.
+    catching_up,
+};
+
 pub const Op = union(enum) {
     /// Raw VT bytes: `%output` data, or capture-pane replay content.
     ///
@@ -169,6 +190,10 @@ pub const Op = union(enum) {
     /// report from that host, and so ignore it unless the host is ours.
     pwd: Pwd,
 
+    /// The pane's display is now this current with tmux. Not terminal
+    /// state: `applyOp` ignores it, and a consumer with a GUI shows it.
+    pane_status: PaneStatus,
+
     pub const Pwd = struct {
         host: []const u8,
         path: []const u8,
@@ -215,6 +240,7 @@ pub const Op = union(enum) {
             .erase_and_home,
             .erase_all,
             .resize,
+            .pane_status,
             => self,
         };
     }
@@ -323,6 +349,9 @@ pub fn applyOp(
             .cols = v.cols,
             .rows = v.rows,
         }),
+
+        // For whoever displays the terminal, not for the terminal.
+        .pane_status => {},
     }
 }
 
@@ -529,6 +558,7 @@ test "cloning a payload-free op copies it as-is" {
         .erase_and_home,
         .erase_all,
         .{ .resize = .{ .cols = 80, .rows = 24 } },
+        .{ .pane_status = .catching_up },
     };
 
     for (ops) |op| {

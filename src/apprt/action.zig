@@ -384,6 +384,12 @@ pub const Action = union(Key) {
     /// belong to a session.
     prompt_tmux_command,
 
+    /// How current the target tmux pane surface is with tmux: whether
+    /// its history is still loading, or tmux paused it and it is being
+    /// read again. Sent on every change, starting from `live`. See
+    /// `TmuxPaneStatus`.
+    tmux_pane_status: TmuxPaneStatus,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -460,6 +466,7 @@ pub const Action = union(Key) {
         tmux_notice,
         tmux_status,
         prompt_tmux_command,
+        tmux_pane_status,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1144,6 +1151,18 @@ pub const TmuxWindows = struct {
 ///     "detached" or "server exited". Sent only when tmux gives one,
 ///     right before the session's pane surfaces are closed, so a GUI that
 ///     wants to show it should not attach it to a pane surface.
+///   - `unsupported`: the tmux server is too old to be shown, so the
+///     client detached before anything was built. The text is ours and
+///     names the version found and the one needed; the session ends
+///     right after, and keeps running in tmux. Worth more than a toast:
+///     without it the user only sees `tmux -CC` return.
+///   - `connection_lost`: the connection to tmux dropped (no `%exit`
+///     came before control mode ended), so the session is likely still
+///     running. The text is the command line that started it in the
+///     host's terminal, read back from shell integration's marks; the
+///     GUI may offer to run it again with `ghostty_surface_tmux_reattach`.
+///     Sent just before the session's windows go. A drop with no such
+///     command is reported as `exit` instead.
 ///
 /// The text is tmux's, UTF-8 in practice but not guaranteed to be, and
 /// not localized. It is only valid for the duration of the action call.
@@ -1199,6 +1218,14 @@ pub const TmuxStatus = struct {
         };
     }
 };
+
+/// How current a tmux pane surface is with tmux. See
+/// `terminal.tmux.sink.PaneStatus`.
+pub const TmuxPaneStatus = terminal.tmux.sink.PaneStatus;
+
+test "ghostty.h TmuxPaneStatus" {
+    try lib.checkGhosttyHEnum(TmuxPaneStatus, "GHOSTTY_TMUX_PANE_");
+}
 
 pub const SearchSelected = struct {
     selected: ?usize,

@@ -1033,7 +1033,26 @@ typedef enum {
   GHOSTTY_TMUX_NOTICE_COMMAND_ERROR,
   GHOSTTY_TMUX_NOTICE_EXIT,
   GHOSTTY_TMUX_NOTICE_COMMAND_OUTPUT,
+  GHOSTTY_TMUX_NOTICE_UNSUPPORTED,
+  GHOSTTY_TMUX_NOTICE_CONNECTION_LOST,
 } ghostty_tmux_notice_kind_e;
+
+// apprt.action.TmuxPaneStatus
+//
+// How current a tmux pane surface is with tmux, beyond what its content
+// shows. The target is the pane's surface. Sent on every change.
+//
+//   LIVE             up to date.
+//   LOADING_HISTORY  the screen is shown and its history is still being
+//                    read, so scrollback is short for now.
+//   CATCHING_UP      tmux paused the pane because we fell behind it
+//                    (tmux-pause-after) and it is being read again; the
+//                    screen may be stale until it is.
+typedef enum {
+  GHOSTTY_TMUX_PANE_LIVE,
+  GHOSTTY_TMUX_PANE_LOADING_HISTORY,
+  GHOSTTY_TMUX_PANE_CATCHING_UP,
+} ghostty_action_tmux_pane_status_e;
 
 // apprt.action.TmuxNotice.C
 //
@@ -1052,6 +1071,15 @@ typedef enum {
 //                  pane surfaces are closed.
 //   COMMAND_OUTPUT what a command line the user typed printed; may be
 //                  several lines. Its errors come as COMMAND_ERROR.
+//   UNSUPPORTED    the tmux server is too old to be shown; the text names
+//                  its version and the one needed. The client has been
+//                  detached and the session keeps running in tmux. Sent
+//                  just before the session ends.
+//   CONNECTION_LOST the connection to tmux dropped without the session
+//                  ending, so it is likely still running. The text is
+//                  the command line that started it in this surface's
+//                  terminal; ghostty_surface_tmux_reattach runs it again.
+//                  Sent just before the session's windows go.
 typedef struct {
   ghostty_tmux_notice_kind_e kind;
   const char* text;
@@ -1146,6 +1174,7 @@ typedef enum {
   GHOSTTY_ACTION_TMUX_NOTICE,
   GHOSTTY_ACTION_TMUX_STATUS,
   GHOSTTY_ACTION_PROMPT_TMUX_COMMAND,
+  GHOSTTY_ACTION_TMUX_PANE_STATUS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1193,6 +1222,7 @@ typedef union {
   ghostty_action_tmux_windows_s tmux_windows;
   ghostty_action_tmux_notice_s tmux_notice;
   ghostty_action_tmux_status_s tmux_status;
+  ghostty_action_tmux_pane_status_e tmux_pane_status;
 } ghostty_action_u;
 
 typedef struct {
@@ -1349,6 +1379,11 @@ GHOSTTY_API bool ghostty_surface_tmux_break_pane(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_tmux_command(ghostty_surface_t,
                                               const char*,
                                               uintptr_t);
+// Run again, in this surface's terminal, the command that started a tmux
+// session it hosted whose connection dropped (see the CONNECTION_LOST
+// notice), to reattach it. Returns false if there is nothing to run,
+// including when it already ran once.
+GHOSTTY_API bool ghostty_surface_tmux_reattach(ghostty_surface_t);
 GHOSTTY_API void ghostty_tmux_router_free(void*);
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,

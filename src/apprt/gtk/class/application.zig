@@ -821,6 +821,7 @@ pub const Application = extern struct {
             .tmux_notice,
             .tmux_status,
             .prompt_tmux_command,
+            .tmux_pane_status,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;

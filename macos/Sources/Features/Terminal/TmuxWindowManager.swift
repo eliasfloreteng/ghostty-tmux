@@ -344,6 +344,10 @@ class TmuxWindowManager {
     ///   per error, and say the session may not be set up as intended.
     /// - The reason a session ended goes on the host, since the session's
     ///   own windows are about to close.
+    /// - A tmux too old to be shown is an alert on the host: nothing else
+    ///   opened, and otherwise all the user sees is `tmux -CC` returning.
+    /// - A dropped connection is an offer, on the host, to run the command
+    ///   that started the session again and so reattach it.
     @objc private func ghosttyTmuxNotice(_ notification: Notification) {
         guard let hostView = notification.object as? Ghostty.SurfaceView else { return }
         guard let notice = notification.userInfo?[
@@ -368,6 +372,12 @@ class TmuxWindowManager {
 
         case .commandOutput:
             tmuxCommandOutput(notice.text, hostedBy: hostView)
+
+        case .unsupported:
+            presentUnsupported(notice.text, hostedBy: hostView)
+
+        case .connectionLost:
+            offerReattach(notice.text, hostedBy: hostView)
         }
     }
 
@@ -424,6 +434,69 @@ class TmuxWindowManager {
             alert.beginSheetModal(for: window)
         } else {
             alert.runModal()
+        }
+    }
+
+    /// Offer to reattach a session whose connection dropped, by running
+    /// the command that started it again in the host's terminal.
+    ///
+    /// Asked rather than done: the drop may be the network going away
+    /// for a while, the command may prompt for a password, and the user
+    /// may have meant to leave. The session's name is read before the
+    /// window list that ends it clears it from the host.
+    private func offerReattach(_ command: String, hostedBy hostView: Ghostty.SurfaceView) {
+        let session = hostView.hostedTmuxSession ?? ""
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Lost Connection to tmux"
+        alert.informativeText = """
+            The connection to \(session.isEmpty ? "the session" : "session “\(session)”") \
+            dropped, but the session is probably still running. Run the \
+            command that started it again in this terminal to reattach?
+
+            \(command)
+            """
+        alert.addButton(withTitle: "Reconnect")
+        alert.addButton(withTitle: "Not Now")
+
+        let reattach = { [weak hostView] (response: NSApplication.ModalResponse) in
+            guard response == .alertFirstButtonReturn,
+                  let hostView, let surface = hostView.surface else { return }
+            guard ghostty_surface_tmux_reattach(surface) else { return }
+            if let controller = hostView.window?.windowController as? BaseTerminalController {
+                controller.focusSurface(hostView)
+            }
+        }
+
+        // On the host's window, where the command will run and where the
+        // user is taken back to as the session's windows close.
+        guard let window = hostView.window, window.attachedSheet == nil else {
+            hostView.showTransientNotice("tmux: lost the connection", level: .error, duration: 8)
+            return
+        }
+        alert.beginSheetModal(for: window, completionHandler: reattach)
+    }
+
+    /// Say that the session could not be shown because its tmux is too
+    /// old, and what to do about it.
+    private func presentUnsupported(_ text: String, hostedBy hostView: Ghostty.SurfaceView) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "tmux Is Too Old"
+        alert.informativeText = """
+            \(text).
+
+            Ghostty detached without opening the session, which is still \
+            running. Update tmux where it runs, or attach to it with plain \
+            `tmux attach` instead.
+            """
+        alert.addButton(withTitle: "OK")
+
+        if let window = hostView.window, window.attachedSheet == nil {
+            alert.beginSheetModal(for: window)
+        } else {
+            hostView.showTransientNotice("tmux: \(text)", level: .error, duration: 10)
         }
     }
 

@@ -156,6 +156,11 @@ config_conditional_state: configpkg.ConditionalState,
 /// This is used to determine if we need to confirm, hold open, etc.
 child_exited: bool = false,
 
+/// The command line to run again to reattach a tmux session hosted here
+/// whose connection dropped, until it is run. Owned. See `tmuxReattach`.
+tmux_reattach_command: if (terminal.options.tmux_control_mode) ?[]const u8 else void =
+    if (terminal.options.tmux_control_mode) null else {},
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -864,6 +869,9 @@ pub fn deinit(self: *Surface) void {
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     self.io.deinit();
+    if (comptime terminal.options.tmux_control_mode) {
+        if (self.tmux_reattach_command) |v| self.alloc.free(v);
+    }
 
     if (self.inspector) |v| {
         v.deinit(self.alloc);
@@ -1211,6 +1219,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .tmux_pane_status => |status| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_pane_status,
+                status,
+            );
+        },
+
         .tmux_notice => |notice| tmux: {
             if (comptime !terminal.options.tmux_control_mode) break :tmux;
             defer notice.text.deinit();
@@ -1219,6 +1236,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const alloc = stack.get();
             const text = try alloc.dupeZ(u8, notice.text.slice());
             defer alloc.free(text);
+
+            // Kept for `tmuxReattach`, so that what is run in our shell
+            // is what the core read back from it, not whatever the GUI
+            // hands us.
+            if (notice.kind == .connection_lost) {
+                const command = try self.alloc.dupe(u8, text);
+                if (self.tmux_reattach_command) |old| self.alloc.free(old);
+                self.tmux_reattach_command = command;
+            }
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2529,6 +2555,37 @@ fn tmuxSplit(
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
     pane.router.splitPane(pane.id, direction);
+    return true;
+}
+
+/// Run again the command that started a tmux session hosted here whose
+/// connection dropped, to reattach it. See the `connection_lost` tmux
+/// notice, which carries the same command for the GUI to show.
+///
+/// Typed into the host's terminal as if by the user, Enter and all, so
+/// it runs in whatever shell is there now: the one ssh returned to. Not
+/// a paste, because a shell that brackets pastes would hold it at the
+/// prompt rather than run it.
+///
+/// Returns false if there is nothing to run: no connection dropped, the
+/// command was already run again, or a session is attached here right
+/// now. Once only, so a stale offer cannot start a second session.
+pub fn tmuxReattach(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+    if (self.tmuxHosting()) return false;
+    const command = self.tmux_reattach_command orelse return false;
+    self.tmux_reattach_command = null;
+    defer self.alloc.free(command);
+
+    const line = std.mem.concat(self.alloc, u8, &.{ command, "\r" }) catch |err| {
+        log.warn("failed to reattach tmux err={}", .{err});
+        return false;
+    };
+    defer self.alloc.free(line);
+    self.queueIo(termio.Message.writeReq(self.alloc, line) catch |err| {
+        log.warn("failed to reattach tmux err={}", .{err});
+        return false;
+    }, .unlocked);
     return true;
 }
 

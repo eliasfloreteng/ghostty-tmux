@@ -154,6 +154,11 @@ pub const StreamHandler = struct {
     /// `%output`, and something mid-sequence is by definition mid-stream.
     tmux_attach_retry: if (tmux_enabled) bool else void = if (tmux_enabled) false else {},
 
+    /// Set while the DCS carrying control mode is ending with the viewer
+    /// still alive, i.e. without tmux having said `%exit`. See
+    /// `dcsUnhook`.
+    tmux_lost: if (tmux_enabled) bool else void = if (tmux_enabled) false else {},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -634,6 +639,19 @@ pub const StreamHandler = struct {
     pub inline fn dcsUnhook(self: *StreamHandler) !void {
         var cmd = self.dcs.unhook() orelse return;
         defer cmd.deinit();
+
+        // tmux says `%exit` before it ends the DCS, however its client
+        // leaves, and the viewer is gone by the time the DCS ends. One
+        // ending with the viewer still here never heard from tmux: what
+        // ended it is whatever the host printed once the connection to
+        // tmux broke, typically a shell's prompt after ssh died.
+        if (comptime tmux_enabled) {
+            self.tmux_lost = cmd == .tmux and self.tmux_viewer != null;
+        }
+        defer if (comptime tmux_enabled) {
+            self.tmux_lost = false;
+        };
+
         try self.dcsCommand(&cmd);
     }
 
@@ -650,6 +668,15 @@ pub const StreamHandler = struct {
                     .enter => {
                         // Setup our viewer state
                         assert(self.tmux_viewer == null);
+                        // What was typed to start this, for the user to
+                        // run again if the connection drops. Read now,
+                        // while it is still the last thing on screen.
+                        const reattach = terminal.tmux.host_command.read(
+                            self.alloc,
+                            self.terminal.screens.active,
+                        ) catch null;
+                        defer if (reattach) |command| self.alloc.free(command);
+
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(global.io(), self.alloc, .{
@@ -657,6 +684,8 @@ pub const StreamHandler = struct {
                             .hidden_output_off_after = self.tmux_hidden_output_off_after,
                             .follow_window_order = true,
                             .status_line = self.tmux_status_bar,
+                            .lazy_history = true,
+                            .reattach_command = reattach orelse "",
                         });
                         errdefer viewer.deinit();
 
@@ -712,7 +741,12 @@ pub const StreamHandler = struct {
                     break :tmux;
                 };
 
-                for (viewer.next(.{ .tmux = tmux })) |action| {
+                const input: terminal.tmux.Viewer.Input = if (tmux == .exit and
+                    self.tmux_lost)
+                    .connection_lost
+                else
+                    .{ .tmux = tmux };
+                for (viewer.next(input)) |action| {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
                         // The viewer has already closed every pane's sink

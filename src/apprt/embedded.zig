@@ -1981,6 +1981,15 @@ pub const CAPI = struct {
         return surface.core_surface.tmuxCommandLine(ptr[0..len]);
     }
 
+    /// Run again the command that started a tmux session hosted by this
+    /// surface whose connection dropped, to reattach it. See the
+    /// `connection_lost` tmux notice. Returns false if there is nothing to
+    /// run, including when it already ran.
+    export fn ghostty_surface_tmux_reattach(surface: *Surface) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxReattach();
+    }
+
     /// Release a reference from ghostty_surface_tmux_router that was not
     /// handed to a surface config.
     export fn ghostty_tmux_router_free(router_: ?*anyopaque) void {

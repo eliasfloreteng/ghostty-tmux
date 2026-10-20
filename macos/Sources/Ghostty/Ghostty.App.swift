@@ -806,6 +806,9 @@ extension Ghostty {
                 surfaceView.promptTmuxCommand()
                 return true
 
+            case GHOSTTY_ACTION_TMUX_PANE_STATUS:
+                tmuxPaneStatus(app, target: target, v: action.action.tmux_pane_status)
+
             default:
                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue, privacy: .public)")
                 return false
@@ -2288,6 +2291,28 @@ extension Ghostty {
             default:
                 assertionFailure()
                 return false
+            }
+        }
+
+        private static func tmuxPaneStatus(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_tmux_pane_status_e) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("tmux pane status does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                let status = Ghostty.Action.TmuxPaneStatus(v)
+                if surfaceView.tmuxPaneStatus != status {
+                    surfaceView.tmuxPaneStatus = status
+                }
+
+            default:
+                assertionFailure()
             }
         }
 

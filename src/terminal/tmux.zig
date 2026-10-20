@@ -12,6 +12,7 @@ pub const sink = @import("tmux/sink.zig");
 pub const Router = @import("tmux/router.zig").Router;
 pub const layout_plan = @import("tmux/layout_plan.zig");
 pub const passthrough = @import("tmux/passthrough.zig");
+pub const host_command = @import("tmux/host_command.zig");
 pub const Op = sink.Op;
 pub const Sink = sink.Sink;
 

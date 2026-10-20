@@ -65,6 +65,10 @@ extension Ghostty {
         /// otherwise. An unnamed session is an empty string.
         @Published var hostedTmuxSession: String?
 
+        /// How current this surface is with tmux, when it displays a tmux
+        /// pane. Always live otherwise.
+        @Published var tmuxPaneStatus: Action.TmuxPaneStatus = .live
+
         var surface: ghostty_surface_t? {
             nil
         }

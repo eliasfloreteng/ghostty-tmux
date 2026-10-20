@@ -434,6 +434,10 @@ fn tmuxEndpointClose(ctx: *anyopaque) void {
 ///
 /// tmux owns this grid: a `.resize` op is the only thing that resizes it.
 pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
+    // The last status in the batch, told to the surface once our lock is
+    // released: the mailbox can block, and only ever frees up our lock.
+    var status: ?terminalpkg.tmux.sink.PaneStatus = null;
+
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
@@ -485,6 +489,8 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
 
             .pwd => |pwd| self.tmuxPanePwd(pwd),
 
+            .pane_status => |v| status = v,
+
             else => terminalpkg.tmux.sink.applyOp(
                 self.alloc,
                 &self.terminal,
@@ -499,6 +505,11 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
     // Ops other than bytes schedule no render of their own, so one
     // wakeup covers the batch.
     self.terminal_stream.handler.queueRender() catch unreachable;
+
+    if (status) |v| _ = self.surface_mailbox.push(
+        .{ .tmux_pane_status = v },
+        .{ .forever = {} },
+    );
 }
 
 /// Report a tmux pane's working directory as an OSC 7 from the tmux
