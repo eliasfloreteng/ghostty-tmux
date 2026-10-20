@@ -214,7 +214,10 @@ pub const Router = struct {
                     self.closed = true;
                     return;
                 };
-                if (copy == .bytes) self.buffer_bytes += copy.bytes.len;
+                switch (copy) {
+                    .bytes, .replay => |b| self.buffer_bytes += b.len,
+                    else => {},
+                }
                 self.buffer.appendAssumeCapacity(copy);
             }
         }

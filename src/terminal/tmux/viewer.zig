@@ -642,6 +642,10 @@ pub const Viewer = struct {
         /// the alternate screen or the primary. See `paneCaptures`.
         visible_screen: ScreenSet.Key = .primary,
 
+        /// tmux resized this pane, and what is on display has to be read
+        /// again. See `syncLayouts`.
+        reread: bool = false,
+
         pub fn create(
             io: std.Io,
             alloc: Allocator,
@@ -673,6 +677,7 @@ pub const Viewer = struct {
             self.last_resize_sent = null;
             self.stale_size = null;
             self.visible_screen = .primary;
+            self.reread = false;
 
             return self;
         }
@@ -2627,16 +2632,50 @@ pub const Viewer = struct {
         {
             var panes_it = panes.iterator();
             var added: bool = false;
+            var reread: bool = false;
             while (panes_it.next()) |kv| {
                 const pane_id: usize = kv.key_ptr.*;
-                if (self.panes.contains(pane_id)) continue;
+                if (self.panes.contains(pane_id)) {
+                    // tmux resized this pane, and so did we, but not the
+                    // same way. Each side reflows the primary screen by
+                    // its own rules (which lines come back out of the
+                    // history when it grows, where the cursor's line
+                    // ends up, whether a shell prompt is cleared for the
+                    // shell to redraw) and resizes the alternate screen
+                    // without reflow by its own rules too. The program
+                    // in the pane then repaints for the new size, and a
+                    // TUI repaints only what it thinks changed, relative
+                    // to tmux's idea of the screen. Wherever ours
+                    // differs, the difference stays, which is the mess
+                    // left behind by fullscreening a window, dragging a
+                    // divider, or anything else that resizes a pane.
+                    //
+                    // So read back what tmux has on display, exactly as
+                    // on attach. The reply is a snapshot taken in order
+                    // with the pane's output, so it replaces our screen
+                    // at the same point in the stream that tmux's screen
+                    // was at. History is left alone: it is not on
+                    // display, and reading it again is the expensive
+                    // part of an attach.
+                    const pane = kv.value_ptr.*;
+                    if (pane.reread) {
+                        pane.reread = false;
+                        reread = true;
+                        try self.queueCommands(&.{
+                            .{ .pane_saved = pane_id },
+                            .{ .pane_visible = pane_id },
+                        });
+                    }
+                    continue;
+                }
                 added = true;
                 try self.queueCommands(&paneCaptures(pane_id));
             }
 
-            // If we added any panes, then we also want to resync the pane
-            // state (terminal modes and cursor positions and so on).
-            if (added) try self.queueCommands(&.{.pane_state});
+            // If we added or re-read any panes, then we also want to
+            // resync the pane state (terminal modes and cursor positions
+            // and so on).
+            if (added or reread) try self.queueCommands(&.{.pane_state});
 
             // A pane appearing or disappearing moves tmux's active pane,
             // and we are not told where it went until inbound sync
@@ -3139,7 +3178,7 @@ pub const Viewer = struct {
         try self.paneOps(pane, &.{
             .{ .switch_screen = .primary },
             .erase_all,
-            .{ .bytes = control.unescape(buf, content) },
+            .{ .replay = control.unescape(buf, content) },
             .scroll_into_history,
         });
 
@@ -3187,7 +3226,7 @@ pub const Viewer = struct {
         try self.paneOps(pane, &.{
             .{ .switch_screen = .primary },
             .erase_and_home,
-            .{ .bytes = control.unescape(buf, saved) },
+            .{ .replay = control.unescape(buf, saved) },
             .trim_trailing_blanks,
         });
     }
@@ -3214,7 +3253,7 @@ pub const Viewer = struct {
         try self.paneOps(pane, &.{
             .{ .switch_screen = screen_key },
             .erase_and_home,
-            .{ .bytes = control.unescape(buf, content) },
+            .{ .replay = control.unescape(buf, content) },
             .trim_trailing_blanks,
         });
     }
@@ -3308,6 +3347,7 @@ pub const Viewer = struct {
                             .cols = cols,
                             .rows = rows,
                         });
+                        pane.reread = true;
 
                         // Whatever we last asked for, this is the answer,
                         // so forget the request. Leaving it would let a
@@ -4230,8 +4270,10 @@ test "layout change" {
                     try testing.expectEqual(2, v.panes.count());
                     try testing.expect(v.panes.contains(0));
                     try testing.expect(v.panes.contains(2));
-                    // Commands should be queued for the new pane (3 capture-pane + 1 pane_state)
-                    try testing.expectEqual(4, v.command_queue.len());
+                    // Commands should be queued for the new pane (3
+                    // capture-pane), to re-read pane 0, which the split
+                    // resized (2 capture-pane), and 1 pane_state.
+                    try testing.expectEqual(6, v.command_queue.len());
                 }
             }).check,
         },
@@ -4285,6 +4327,9 @@ test "layout_change does not wait for commands already in flight" {
             } } },
             .contains_tags = &.{.windows},
             .commands = &.{
+                // Pane 0 was resized by the split, so it is read again.
+                "capture-pane -p -e -C -N -a -t %0",
+                "capture-pane -p -e -C -N -q -t %0",
                 "capture-pane -p -e -C -q -S - -E -1 -t %2",
                 "capture-pane -p -e -C -N -a -t %2",
                 "capture-pane -p -e -C -N -q -t %2",
@@ -4293,9 +4338,10 @@ test "layout_change does not wait for commands already in flight" {
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(2, v.panes.count());
-                    // The first pane's four and the new pane's four.
-                    try testing.expectEqual(8, v.command_queue.len());
-                    try testing.expectEqual(8, v.commands_sent);
+                    // The first pane's four, its re-read, and the new
+                    // pane's four.
+                    try testing.expectEqual(10, v.command_queue.len());
+                    try testing.expectEqual(10, v.commands_sent);
                 }
             }).check,
         },
@@ -5645,6 +5691,16 @@ test "a report from the layout tmux just replaced does not complete a set" {
             .raw_flags = "*",
         } } } },
 
+        // Both panes were resized, so both are read again: the saved
+        // grid (none, they are on the primary screen) and what is on
+        // display for each, then the pane state. Answer them all, so
+        // the queue says only what the reports below send.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
         // Pane 1's surface reports the 41 columns it computed from the
         // layout that was just replaced: the report was already in
         // flight when the new one arrived. It is a stale echo and must
@@ -6532,6 +6588,11 @@ test "a size tmux will not give us is not asked for twice" {
                 .raw_flags = "*",
             } } },
         },
+
+        // The pane was resized, so it is read again. Answer that.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
 
         // The surface has not moved, so it asks for the same size again.
         // Asking tmux again would be asking a question we have already
@@ -7800,5 +7861,85 @@ test "a split names the side the new pane goes" {
             },
             .{ .input = .{ .tmux = .{ .block_end = "" } } },
         });
+    }
+}
+
+test "a pane tmux resizes is read again, without breaking a sequence in flight" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try viewer.attachPane(0, mirror.sink());
+    try testViewer(&viewer, &.{
+        // pane_state, so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // A colour, then an underline cut off by tmux after "\x1b[4".
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "old\x1b[32m\x1b[4",
+        } } } },
+
+        // tmux shrinks the pane, and we ask what it now has on display:
+        // ours was resized by our own rules, not tmux's.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "a1dd,60x20,0,0,0",
+                .visible_layout = "a1dd,60x20,0,0,0",
+                .raw_flags = "*",
+            } } },
+            .commands = &.{
+                "capture-pane -p -e -C -N -a -t %0",
+                "capture-pane -p -e -C -N -q -t %0",
+                "list-panes",
+            },
+        },
+
+        // The answers: no alternate screen, what tmux has on display (in
+        // tmux's escaping), and the cursor after it.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end = "\\033[44mfrom tmux\\033[49m   ",
+        } } },
+        .{ .input = .{ .tmux = .{
+            .block_end = "%0;12;0;1;block;;0;0;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;19;",
+        } } },
+
+        // The rest of the underline, then text in it.
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "mX",
+        } } } },
+    });
+
+    inline for (.{ &viewer.panes.get(0).?.terminal, &mirror.terminal }) |t| {
+        const text = try t.screens.active.dumpStringAlloc(
+            testing.allocator,
+            .{ .active = .{} },
+        );
+        defer testing.allocator.free(text);
+
+        // The capture replaced the screen, the underline was not
+        // printed as text, its tail took effect, and the colour the
+        // program set before the capture is still the one it draws
+        // with: the capture's own colours ended with it.
+        try testing.expectEqualStrings("from tmux   X", text);
+        const screen = t.screens.active;
+        const cell = screen.pages.getCell(.{ .active = .{ .x = 12, .y = 0 } }).?;
+        const page = cell.node.page();
+        const style = page.styles.get(page.memory, cell.cell.style_id);
+        try testing.expectEqual(@as(u8, 2), style.fg_color.palette);
+        try testing.expect(style.bg_color == .none);
+        try testing.expect(style.flags.underline != .none);
+
+        // The capture's styled cells survived, its plain padding did
+        // not: the trailing blank after X is empty.
+        const blue = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(blue.cell.style_id != 0);
     }
 }

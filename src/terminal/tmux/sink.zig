@@ -25,6 +25,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const assert = @import("../../quirks.zig").inlineAssert;
 
 const Terminal = @import("../Terminal.zig");
 const ScreenSet = @import("../ScreenSet.zig");
@@ -74,6 +75,21 @@ pub const Op = union(enum) {
     /// These must go through a stream whose parser state persists across
     /// ops, because a sequence can be split across notifications.
     bytes: []const u8,
+
+    /// VT bytes that are a capture of the pane rather than its output:
+    /// the replay of a `capture-pane` reply.
+    ///
+    /// Parsed on their own, by a parser of their own, rather than by the
+    /// stream the pane's output goes through. A capture is a snapshot
+    /// taken between two `%output` notifications, and tmux cuts output
+    /// wherever its read of the pty ended, so the pane's stream can be
+    /// part way through an escape sequence when a capture arrives. Fed
+    /// through that stream, the capture's first escape would abort the
+    /// sequence, and its tail, arriving in the next notification, would
+    /// be printed as text (the `;79;82;88m` left on screen by a resize
+    /// that landed in the middle of a colour). Kept apart, the live
+    /// sequence resumes where it was once the capture is in.
+    replay: []const u8,
 
     /// Make the given screen active, without any of the side effects that
     /// the DECSET alternate-screen modes carry.
@@ -139,6 +155,7 @@ pub const Op = union(enum) {
     pub fn clone(self: Op, alloc: Allocator) Allocator.Error!Op {
         return switch (self) {
             .bytes => |b| .{ .bytes = try alloc.dupe(u8, b) },
+            .replay => |b| .{ .replay = try alloc.dupe(u8, b) },
 
             // The parsed pane state is a flat struct of scalars and
             // slices, so walk it rather than naming the string fields:
@@ -172,7 +189,7 @@ pub const Op = union(enum) {
     /// straight from the viewer; those payloads are not ours.
     pub fn deinit(self: Op, alloc: Allocator) void {
         switch (self) {
-            .bytes => |b| alloc.free(b),
+            .bytes, .replay => |b| alloc.free(b),
             .pane_state => |data| freePaneState(alloc, data, null),
             else => {},
         }
@@ -235,6 +252,23 @@ pub fn applyOp(
 ) !void {
     switch (op) {
         .bytes => unreachable,
+
+        .replay => |b| {
+            // The pen too is the live stream's and not the capture's:
+            // the program in the pane chose the colours it is drawing
+            // with and will not say so again, so whatever the capture
+            // last set must not outlive it.
+            const screen = t.screens.active;
+            const pen = screen.cursor.style;
+            {
+                var stream = t.vtStream();
+                defer stream.deinit();
+                stream.nextSlice(b);
+            }
+            assert(screen == t.screens.active);
+            screen.cursor.style = pen;
+            try screen.manualStyleUpdate();
+        },
 
         .switch_screen => |key| _ = try t.switchScreen(key),
 
