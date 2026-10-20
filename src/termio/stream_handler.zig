@@ -678,7 +678,14 @@ pub const StreamHandler = struct {
                 // If tmux control mode is disabled at the build level,
                 // then this whole block shouldn't be analyzed.
                 if (comptime !tmux_enabled) break :tmux;
-                log.info("tmux control mode event cmd={f}", .{tmux});
+                // Debug, not info: info is compiled into release builds,
+                // and this runs for every notification, every `%output`
+                // line of every pane included. Formatting one prints its
+                // payload byte by byte, and on macOS each line then goes
+                // to the unified log: more than the rest of the pane's
+                // processing put together, on the thread that reads the
+                // host's pty.
+                log.debug("tmux control mode event cmd={f}", .{tmux});
 
                 switch (tmux) {
                     .enter => {
@@ -769,7 +776,7 @@ pub const StreamHandler = struct {
                 else
                     .{ .tmux = tmux };
                 for (viewer.next(input)) |action| {
-                    log.info("tmux viewer action={f}", .{action});
+                    log.debug("tmux viewer action={f}", .{action});
                     switch (action) {
                         // The viewer has already closed every pane's sink
                         // and is freed at the end of this block. The GUI

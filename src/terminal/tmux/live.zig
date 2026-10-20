@@ -41,6 +41,8 @@ const build_options = @import("terminal_options");
 
 const Parser = @import("../Parser.zig");
 const Screen = @import("../Screen.zig");
+const Terminal = @import("../Terminal.zig");
+const Style = @import("../style.zig").Style;
 const dcs = @import("../dcs.zig");
 const ptypkg = @import("../../pty.zig");
 const osfile = @import("../../os/file.zig");
@@ -653,6 +655,186 @@ fn spawn(pty: *ptypkg.Pty, argv: []const []const u8) !posix.pid_t {
 fn attached(self: *Session) bool {
     return self.viewer.panes.count() > 0 and
         self.viewer.command_queue.empty();
+}
+
+/// What one cell looks like, as far as both tmux and we can say: the
+/// character in it and how it is drawn. Background-only cells (an erase
+/// in a colour) and styled blanks compare as the same thing, because a
+/// capture cannot tell them apart and neither can the person looking.
+const CellLook = struct {
+    cp: u21,
+    fg: Style.Color,
+    bg: Style.Color,
+    flags: u16,
+
+    fn of(t: *Terminal, x: usize, y: usize) CellLook {
+        const screen = t.screens.active;
+        const c = screen.pages.getCell(.{ .active = .{
+            .x = @intCast(x),
+            .y = @intCast(y),
+        } }).?;
+        const page = c.node.page();
+        const style: Style = if (c.cell.style_id == 0)
+            .{}
+        else
+            page.styles.get(page.memory, c.cell.style_id).*;
+
+        const bg: Style.Color = switch (c.cell.content_tag) {
+            .bg_color_palette => .{ .palette = c.cell.content.color_palette.data },
+            .bg_color_rgb => .{ .rgb = .{
+                .r = c.cell.content.color_rgb.r,
+                .g = c.cell.content.color_rgb.g,
+                .b = c.cell.content.color_rgb.b,
+            } },
+            else => style.bg_color,
+        };
+
+        const cp: u21 = switch (c.cell.content_tag) {
+            .codepoint, .codepoint_grapheme => cp: {
+                const raw = c.cell.codepoint();
+                break :cp if (raw == 0) ' ' else raw;
+            },
+            else => ' ',
+        };
+
+        return .{
+            .cp = cp,
+            // A blank's foreground cannot be seen, and tmux writes
+            // whatever SGR was current for the spaces it pads with.
+            .fg = if (cp == ' ') .none else style.fg_color,
+            .bg = bg,
+            .flags = if (cp == ' ')
+                @as(u16, @bitCast(@TypeOf(style.flags){ .inverse = style.flags.inverse }))
+            else
+                @bitCast(style.flags),
+        };
+    }
+
+    fn eql(a: CellLook, b: CellLook) bool {
+        return a.cp == b.cp and a.fg.eql(b.fg) and a.bg.eql(b.bg) and
+            a.flags == b.flags;
+    }
+};
+
+/// One row of a terminal as text, for a failure message.
+fn rowText(alloc: Allocator, t: *Terminal, y: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (0..t.cols) |x| {
+        const look = CellLook.of(t, x, y);
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(look.cp, &buf) catch 1;
+        try out.appendSlice(alloc, buf[0..n]);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Assert that what we have for a pane is what tmux has: every visible
+/// cell's character, colours and attributes, the cursor, and which screen
+/// is up.
+///
+/// tmux is asked through its CLI, which unlike a control mode reply may
+/// carry raw escapes, with `-N` so that trailing blanks (and the colour
+/// they are painted in) come along. The reply is replayed one line at a
+/// time onto a terminal of tmux's size, each line placed by an absolute
+/// cursor move so that nothing about how the replay wraps or scrolls can
+/// make two different grids look alike.
+fn expectMatchesTmux(session: *Session, pane_id: usize) !void {
+    const alloc = session.alloc;
+    const target = try std.fmt.allocPrint(alloc, "%{d}", .{pane_id});
+    defer alloc.free(target);
+
+    const geometry = try session.ask(&.{
+        "display-message",                                                                     "-p", "-t", target,
+        "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag}",
+    });
+    defer alloc.free(geometry);
+    var fields = std.mem.tokenizeAny(u8, geometry, " \r\n");
+    var nums: [6]usize = undefined;
+    for (&nums) |*n| n.* = try std.fmt.parseInt(usize, fields.next().?, 10);
+    const cols = nums[0];
+    const rows = nums[1];
+
+    const capture = try session.ask(&.{
+        "capture-pane", "-p", "-e", "-N", "-t", target,
+    });
+    defer alloc.free(capture);
+
+    var want: Terminal = try .init(session.io, alloc, .{
+        .cols = @intCast(cols),
+        .rows = @intCast(rows),
+        .default_modes = .{ .grapheme_cluster = true },
+    });
+    defer want.deinit(alloc);
+    {
+        var stream = want.vtStream();
+        defer stream.deinit();
+        var lines = std.mem.splitScalar(u8, capture, '\n');
+        var y: usize = 0;
+        while (lines.next()) |line| : (y += 1) {
+            if (y >= rows) break;
+            var cup: [32]u8 = undefined;
+            stream.nextSlice(try std.fmt.bufPrint(&cup, "\x1b[{d};1H", .{y + 1}));
+            stream.nextSlice(line);
+        }
+    }
+
+    const pane = session.viewer.panes.get(pane_id) orelse return error.NoSuchPane;
+    const got = &pane.terminal;
+
+    var failed = false;
+    if (got.cols != cols or got.rows != rows) {
+        log.err("pane %{d}: tmux is {d}x{d}, we are {d}x{d}", .{
+            pane_id, cols, rows, got.cols, got.rows,
+        });
+        return error.GridMismatch;
+    }
+
+    const alt_want = nums[4] == 1;
+    const alt_got = got.screens.active_key == .alternate;
+    if (alt_want != alt_got) {
+        log.err("pane %{d}: tmux alternate_on={} we have {t}", .{
+            pane_id, alt_want, got.screens.active_key,
+        });
+        failed = true;
+    }
+
+    var bad_rows: usize = 0;
+    for (0..rows) |y| {
+        const col: ?usize = for (0..cols) |x| {
+            if (!CellLook.of(&want, x, y).eql(CellLook.of(got, x, y))) break x;
+        } else null;
+        const x = col orelse continue;
+        failed = true;
+        bad_rows += 1;
+        if (bad_rows > 8) continue;
+
+        const w = try rowText(alloc, &want, y);
+        defer alloc.free(w);
+        const g = try rowText(alloc, got, y);
+        defer alloc.free(g);
+        log.err(
+            "pane %{d} row {d} differs from column {d}:\n tmux: |{s}|\n   us: |{s}|\n tmux cell {any}\n   us cell {any}",
+            .{ pane_id, y, x, w, g, CellLook.of(&want, x, y), CellLook.of(got, x, y) },
+        );
+    }
+    if (bad_rows > 8) log.err("pane %{d}: {d} rows differ in all", .{ pane_id, bad_rows });
+
+    const cursor = got.screens.active.cursor;
+    if (cursor.x != @min(nums[2], cols - 1) or cursor.y != nums[3]) {
+        log.err("pane %{d}: tmux has the cursor at {d},{d}, we have {d},{d}", .{
+            pane_id, nums[2], nums[3], cursor.x, cursor.y,
+        });
+        failed = true;
+    }
+    if (got.modes.get(.cursor_visible) != (nums[5] == 1)) {
+        log.err("pane %{d}: tmux cursor_flag={d}, we have visible={}", .{
+            pane_id, nums[5], got.modes.get(.cursor_visible),
+        });
+        failed = true;
+    }
+
+    if (failed) return error.GridMismatch;
 }
 
 test "live: pane output arrives unescaped" {
@@ -3296,4 +3478,261 @@ test "live: with no-detach-on-destroy, losing the session moves us to another" {
         }
     }.pred);
     try testing.expect(!session.exited);
+}
+
+test "live: an attach shows exactly what tmux has, background colours included" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // What a TUI paints: a full-width bar in a colour (a status or
+    // selection line), a row erased in a colour (background colour erase),
+    // a coloured block in the middle of a row, and text after a blank gap.
+    var session = try Session.startWith(alloc, testing.io, 40, 8,
+        \\printf '\033[44mblue bg    \033[0m\r\nline2 \033[1;31mred\033[0m'; printf '\033[3;5H\033[42m   \033[0m'; printf '\033[5;1H\033[45m%40s\033[0m' ''; printf '\033[6;1H\033[46m\033[K\033[0m'; printf '\033[7;1Hleft\033[7;30Hright'; printf '\033[2;3H'; sleep 60
+    , .{ .ready = .{
+        .target = ":0",
+        .format = "#{cursor_y}",
+        .expect = "1",
+    } });
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    try expectMatchesTmux(&session, 0);
+    try testing.expect(!session.exited);
+}
+
+/// Pump until tmux has been quiet for a while: nothing read for
+/// `quiet_ms`, and nothing of ours waiting on a reply. A TUI repaints in
+/// bursts, and comparing in the middle of one compares two moments.
+fn settle(session: *Session, quiet_ms: u64) !void {
+    var quiet: u64 = 0;
+    var rounds: usize = 0;
+    while (rounds < timeout_ms / poll_ms) : (rounds += 1) {
+        if (try session.pump() or !session.viewer.command_queue.empty()) {
+            quiet = 0;
+        } else {
+            quiet += poll_ms;
+            if (quiet >= quiet_ms) return;
+        }
+    }
+    return error.TimedOutWaitingForTmux;
+}
+
+/// Resize a lone pane the way its surface would, and wait until tmux
+/// has done it and the program in it has repainted.
+fn resizeAndSettle(session: *Session, pane_id: usize, cols: u16, rows: u16) !void {
+    try session.input(.{ .resize = .{
+        .pane_id = pane_id,
+        .cols = cols,
+        .rows = rows,
+    } });
+
+    const target = try std.fmt.allocPrint(session.alloc, "%{d}", .{pane_id});
+    defer session.alloc.free(target);
+    var want_buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{d}x{d}", .{ cols, rows });
+
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        if (rounds >= timeout_ms / poll_ms) return error.TimedOutWaitingForTmux;
+        _ = try session.pump();
+        const out = try session.ask(&.{
+            "display-message", "-p", "-t", target, "#{pane_width}x#{pane_height}",
+        });
+        defer session.alloc.free(out);
+        if (std.mem.eql(u8, std.mem.trim(u8, out, " \r\n"), want)) break;
+    }
+    try settle(session, 400);
+}
+
+/// Attach to `command`, check the pane against tmux, then put it through
+/// the resizes a window goes through (growing to fullscreen, shrinking
+/// back, a narrower window) and check it after each.
+fn expectFollowsTmuxThroughResizes(command: []const u8, ready: []const u8) !void {
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, command, .{
+        .ready = .{ .target = ":0", .format = "#{alternate_on}", .expect = ready },
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+    const pane_id = session.viewer.windows.items[0].layout.content.pane;
+    try settle(&session, 400);
+
+    try expectMatchesTmux(&session, pane_id);
+
+    const sizes = [_][2]u16{ .{ 132, 40 }, .{ 80, 24 }, .{ 60, 30 }, .{ 100, 18 } };
+    for (sizes) |s| {
+        resizeAndSettle(&session, pane_id, s[0], s[1]) catch |err| {
+            log.err("resizing to {d}x{d} failed", .{ s[0], s[1] });
+            return err;
+        };
+        expectMatchesTmux(&session, pane_id) catch |err| {
+            log.err("after resizing to {d}x{d}", .{ s[0], s[1] });
+            return err;
+        };
+    }
+    try testing.expect(!session.exited);
+}
+
+/// A throwaway git repository with something to show, and lazygit in it
+/// with a config directory of its own, so nothing about the machine
+/// leaks in and nothing is fetched.
+const lazygit_command =
+    \\d=$(mktemp -d) && cd "$d" && git init -q && printf 'one\n' > a && git add a && git -c user.name=t -c user.email=t@t commit -qm first && printf 'two\n' >> a && printf 'new\n' > b && mkdir cfg && printf 'git:\n  autoFetch: false\nupdate:\n  method: never\ndisableStartupPopups: true\n' > cfg/config.yml && exec lazygit -ucd "$d/cfg"
+;
+
+test "live: lazygit looks the same here as in tmux, through resizes" {
+    if (!enabled()) return error.SkipZigTest;
+    if (!haveCommand("lazygit")) return error.SkipZigTest;
+    try expectFollowsTmuxThroughResizes(lazygit_command, "1");
+}
+
+test "live: neovim looks the same here as in tmux, through resizes" {
+    if (!enabled()) return error.SkipZigTest;
+    if (!haveCommand("nvim")) return error.SkipZigTest;
+    try expectFollowsTmuxThroughResizes(
+        \\d=$(mktemp -d) && seq -f 'line %g of a file long enough to need wrapping when the window is narrow' 1 200 > "$d/f" && exec nvim --clean -c 'set number cursorline laststatus=2 wrap' -c 'normal 40G' "$d/f"
+    , "1");
+}
+
+test "live: a shell with long wrapped lines looks the same here as in tmux, through resizes" {
+    if (!enabled()) return error.SkipZigTest;
+
+    // The primary screen, which both sides reflow on a resize. Lines long
+    // enough to wrap at every width used, so the wrap of each one decides
+    // where everything after it lands.
+    try expectFollowsTmuxThroughResizes(
+        \\seq -f 'a long line number %g that goes on and on and wraps at narrower widths for sure' 1 30; printf '\033[44mtail\033[K\033[0m\n$ '; exec sleep 60
+    , "0");
+}
+
+/// Whether a program is on PATH, for tests that drive one.
+fn haveCommand(name: []const u8) bool {
+    const out = run(testing.allocator, &.{ "sh", "-c", "command -v \"$0\"", name }) catch return false;
+    testing.allocator.free(out);
+    return true;
+}
+
+test "live: split panes look the same here as in tmux when their window grows and shrinks" {
+    if (!enabled()) return error.SkipZigTest;
+    if (!haveCommand("nvim")) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24,
+        \\d=$(mktemp -d) && seq -f 'line %g of a file long enough to need wrapping when the window is narrow' 1 200 > "$d/f" && exec nvim --clean -c 'set number cursorline laststatus=2 wrap' "$d/f"
+    , .{ .ready = .{ .target = ":0", .format = "#{alternate_on}", .expect = "1" } });
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // A shell with wrapped lines beside it, the way a split is made from
+    // the GUI.
+    {
+        const out = try session.ask(&.{
+            "split-window",                                                                                        "-h", "-t", "%0",
+            "seq -f 'a long line number %g that goes on and on and wraps at narrower widths' 1 40; exec sleep 60",
+        });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try settle(&session, 400);
+
+    var ids: [2]usize = undefined;
+    for (session.viewer.panes.keys(), &ids) |k, *id| id.* = k;
+    for (ids) |id| try expectMatchesTmux(&session, id);
+
+    // Fullscreen, back, and a narrow window. Both surfaces report, as
+    // they do when their window resizes: the left one keeps half and
+    // the right one the rest, less the divider.
+    const sizes = [_][2]u16{ .{ 160, 48 }, .{ 80, 24 }, .{ 61, 30 } };
+    for (sizes) |s| {
+        const left: u16 = (s[0] - 1) / 2;
+        try session.input(.{ .resize = .{ .pane_id = ids[0], .cols = left, .rows = s[1] } });
+        try session.input(.{ .resize = .{ .pane_id = ids[1], .cols = s[0] - 1 - left, .rows = s[1] } });
+
+        var want_buf: [32]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, "{d}x{d}", .{ s[0], s[1] });
+        var rounds: usize = 0;
+        while (true) : (rounds += 1) {
+            if (rounds >= timeout_ms / poll_ms) return error.TimedOutWaitingForTmux;
+            _ = try session.pump();
+            if (std.mem.eql(u8, try session.windowSize(session.viewer.windows.items[0].id), want)) break;
+        }
+        try settle(&session, 400);
+
+        for (ids) |id| expectMatchesTmux(&session, id) catch |err| {
+            log.err("pane %{d} after resizing the window to {d}x{d}", .{ id, s[0], s[1] });
+            return err;
+        };
+    }
+    try testing.expect(!session.exited);
+}
+
+test "live: dragging a divider that leaves a pane alone still moves it" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 81, 24, "sleep 60");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // {A | [B / C]}: A on the left, B above C on the right.
+    for ([_][]const []const u8{
+        &.{ "split-window", "-h", "-t", "%0", "sleep 60" },
+        &.{ "split-window", "-v", "-t", "%1", "sleep 60" },
+    }) |argv| {
+        const out = try session.ask(argv);
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 3 and v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const height = struct {
+        fn of(s: *Session, comptime target: []const u8) !usize {
+            const out = try s.ask(&.{ "display-message", "-p", "-t", target, "#{pane_height}" });
+            defer s.alloc.free(out);
+            return std.fmt.parseInt(usize, std.mem.trim(u8, out, " \r\n"), 10);
+        }
+    }.of;
+    const b = try height(&session, "%1");
+    const c = try height(&session, "%2");
+    const width = blk: {
+        const out = try session.ask(&.{ "display-message", "-p", "-t", "%1", "#{pane_width}" });
+        defer alloc.free(out);
+        break :blk try std.fmt.parseInt(u16, std.mem.trim(u8, out, " \r\n"), 10);
+    };
+
+    // The B/C divider moves down three rows. A's surface did not change
+    // size, so it says nothing.
+    try session.input(.{ .resize = .{ .pane_id = 1, .cols = width, .rows = b + 3 } });
+    try session.input(.{ .resize = .{ .pane_id = 2, .cols = width, .rows = c - 3 } });
+
+    var rounds: usize = 0;
+    while (try height(&session, "%1") != b + 3) : (rounds += 1) {
+        if (rounds >= timeout_ms / poll_ms) return error.TimedOutWaitingForTmux;
+        _ = try session.pump();
+    }
+    try testing.expectEqual(c - 3, try height(&session, "%2"));
+    try testing.expect(!session.exited);
+}
+
+test "live: a synchronized, relatively positioned redraw looks the same here as in tmux" {
+    if (!enabled()) return error.SkipZigTest;
+
+    // How an Ink app (Claude Code) redraws: each frame inside a
+    // synchronized update (2026), moving the cursor back up over the
+    // last frame and erasing each line before drawing it, in box drawing
+    // characters with colours. Relative moves mean any line out of place
+    // or any frame lost shows. Frames keep coming through the attach and
+    // a resize, then stop so the result can be compared.
+    try expectFollowsTmuxThroughResizes(
+        \\printf 'prompt$ claude\r\n'; i=0; while [ $i -lt 60 ]; do printf '\033[?2026h'; [ $i -gt 0 ] && printf '\033[6A\r'; printf '\033[2K\033[38;5;174m╭──────────────────────────────╮\033[0m\r\n'; printf '\033[2K\033[38;5;174m│\033[0m \033[1mframe %03d\033[0m                   \033[38;5;174m│\033[0m\r\n' $i; printf '\033[2K\033[38;5;174m│\033[0m \033[48;5;236m> type here               \033[0m   \033[38;5;174m│\033[0m\r\n'; printf '\033[2K\033[38;5;174m╰──────────────────────────────╯\033[0m\r\n'; printf '\033[2K  \033[2m? for shortcuts\033[0m\r\n\033[2K\r\n'; printf '\033[?2026l'; i=$((i+1)); sleep 0.05; done; exec sleep 60
+    , "0");
 }

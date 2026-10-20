@@ -270,6 +270,16 @@ pub const Parser = struct {
         return terminator;
     }
 
+    /// Parse the " %<id>" that follows a pane notification's name,
+    /// returning the id and everything after it.
+    fn parsePaneArg(s: []u8) ?struct { id: usize, rest: []u8 } {
+        if (s.len < 3 or s[0] != ' ' or s[1] != '%') return null;
+        const end = std.mem.indexOfNonePos(u8, s, 2, "0123456789") orelse s.len;
+        if (end == 2) return null;
+        const id = std.fmt.parseInt(usize, s[2..end], 10) catch return null;
+        return .{ .id = id, .rest = s[end..] };
+    }
+
     fn parseNotification(self: *Parser) ParseError!?Notification {
         assert(self.state == .notification);
 
@@ -300,39 +310,30 @@ pub const Parser = struct {
             self.block_trimmed = false;
             return null;
         } else if (std.mem.eql(u8, cmd, "%output")) cmd: {
-            var re = oni.Regex.init(
-                "^%output %([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // By hand, not by regex: the payload is raw bytes, not text.
+            // tmux escapes only what is below a space, and cuts a pane's
+            // output wherever its read of the pty ended, so a multibyte
+            // character is routinely split between two notifications.
+            // A UTF-8 regex refuses such a line, which dropped the whole
+            // notification and left the rest of the pane's output
+            // drawing in the wrong places. (It also compiled the regex
+            // for every line of output.)
+            const pane = parsePaneArg(line[cmd.len..]) orelse {
+                log.warn("failed to parse notification line=\"{s}\"", .{line});
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
+            if (pane.rest.len == 0 or pane.rest[0] != ' ') {
+                log.warn("failed to parse notification line=\"{s}\"", .{line});
+                break :cmd;
+            }
+            const raw = pane.rest[1..];
 
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const data = data: {
-                const raw = line[@intCast(starts[2])..@intCast(ends[2])];
-                break :data unescape(raw, raw);
-            };
-
-            // Important: do not clear buffer here since name points to it
+            // Important: do not clear buffer here since data points to it
             self.state = .idle;
-            return .{ .output = .{ .pane_id = id, .data = data } };
+            return .{ .output = .{
+                .pane_id = pane.id,
+                .data = unescape(raw, raw),
+            } };
         } else if (std.mem.eql(u8, cmd, "%session-changed")) cmd: {
             var re = oni.Regex.init(
                 "^%session-changed \\$([0-9]+) (.+)$",
@@ -448,50 +449,37 @@ pub const Parser = struct {
             else
                 .{ .@"continue" = .{ .pane_id = id } };
         } else if (std.mem.eql(u8, cmd, "%extended-output")) cmd: {
-            var re = oni.Regex.init(
-                // tmux(1) reserves room for arguments after the age
-                // ("pane-id age ... : value") and says to ignore them.
-                // They come before the first " : ", and the value is
-                // everything after it.
-                "^%extended-output %([0-9]+) ([0-9]+)(?: [^:]*)? : (.*)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // By hand for the same reason as `%output`. The shape is
+            // "%extended-output %<pane> <age>[ <args>] : <value>":
+            // tmux(1) reserves room for arguments after the age and says
+            // to ignore them, and they never contain a colon, so the
+            // value is everything after the first " : ".
+            const pane = parsePaneArg(line[cmd.len..]) orelse {
+                log.warn("failed to parse notification line=\"{s}\"", .{line});
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const age = std.fmt.parseInt(
-                u64,
-                line[@intCast(starts[2])..@intCast(ends[2])],
-                10,
-            ) catch unreachable;
-            const data = data: {
-                const raw = line[@intCast(starts[3])..@intCast(ends[3])];
-                break :data unescape(raw, raw);
+            const after = pane.rest;
+            const age_end = std.mem.indexOfNonePos(u8, after, 1, "0123456789") orelse after.len;
+            const colon = std.mem.indexOfScalar(u8, after, ':') orelse after.len;
+            if (after.len < 2 or after[0] != ' ' or age_end == 1 or
+                colon < age_end + 1 or colon + 1 >= after.len or
+                after[colon - 1] != ' ' or after[colon + 1] != ' ' or
+                after[age_end] != ' ')
+            {
+                log.warn("failed to parse notification line=\"{s}\"", .{line});
+                break :cmd;
+            }
+            const age = std.fmt.parseInt(u64, after[1..age_end], 10) catch {
+                log.warn("failed to parse notification line=\"{s}\"", .{line});
+                break :cmd;
             };
+            const raw = after[colon + 2 ..];
 
             // Important: do not clear buffer here since data points to it
             self.state = .idle;
             return .{ .output = .{
-                .pane_id = id,
-                .data = data,
+                .pane_id = pane.id,
+                .data = unescape(raw, raw),
                 .age_ms = age,
             } };
         } else if (std.mem.eql(u8, cmd, "%exit")) {
@@ -1447,6 +1435,45 @@ test "tmux output passes utf8 through" {
     for ("%output %0 caf\u{00e9}") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expectEqualStrings("caf\u{00e9}", n.output.data);
+}
+
+test "tmux output carries a character split across notifications" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    // tmux cuts a pane's output wherever its read of the pty ended, so a
+    // multibyte character -- every box drawing line in a TUI is three
+    // bytes -- is routinely split between two notifications, each of
+    // which is then not valid UTF-8 on its own. Both halves are output.
+    const first = (try testLine(&c, "%output %1 ab\xe2\x94")).?;
+    try testing.expect(first == .output);
+    try testing.expectEqual(1, first.output.pane_id);
+    try testing.expectEqualStrings("ab\xe2\x94", first.output.data);
+
+    const second = (try testLine(&c, "%output %1 \x80cd")).?;
+    try testing.expect(second == .output);
+    try testing.expectEqualStrings("\x80cd", second.output.data);
+
+    const extended = (try testLine(&c, "%extended-output %1 7 : \x94\x80\xe2")).?;
+    try testing.expect(extended == .output);
+    try testing.expectEqual(7, extended.output.age_ms.?);
+    try testing.expectEqualStrings("\x94\x80\xe2", extended.output.data);
+}
+
+test "tmux output takes any byte tmux does not escape" {
+    const testing = std.testing;
+    var c: Parser = .{ .buffer = .init(testing.allocator) };
+    defer c.deinit();
+
+    // Everything from a space up is sent as is, including bytes that are
+    // not UTF-8 at all.
+    var line: [11 + 0x100 - 0x20]u8 = undefined;
+    @memcpy(line[0..11], "%output %0 ");
+    for (0x20..0x100, 11..) |b, i| line[i] = @intCast(b);
+    const n = (try testLine(&c, &line)).?;
+    try testing.expect(n == .output);
+    try testing.expectEqualStrings(line[11..], n.output.data);
 }
 
 test "tmux unescape decodes a doubled backslash" {
