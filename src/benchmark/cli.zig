@@ -19,6 +19,7 @@ pub const Action = enum {
     @"terminal-resize",
     @"terminal-snapshot",
     @"terminal-stream",
+    @"tmux-control",
     @"is-symbol",
     @"osc-parser",
 
@@ -38,6 +39,7 @@ pub const Action = enum {
             .@"page-compression" => @import("PageCompression.zig"),
             .@"scrollback-compression" => @import("ScrollbackCompression.zig"),
             .@"terminal-stream" => @import("TerminalStream.zig"),
+            .@"tmux-control" => @import("TmuxControl.zig"),
             .@"codepoint-width" => @import("CodepointWidth.zig"),
             .@"grapheme-break" => @import("GraphemeBreak.zig"),
             .@"terminal-formatter" => @import("TerminalFormatter.zig"),
