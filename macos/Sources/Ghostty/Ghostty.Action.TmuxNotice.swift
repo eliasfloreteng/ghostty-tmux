@@ -21,12 +21,17 @@ extension Ghostty.Action {
             /// session's windows go.
             case exit
 
+            /// What a command line the user typed printed. May be several
+            /// lines; its errors come as `commandError`.
+            case commandOutput
+
             init?(_ c: ghostty_tmux_notice_kind_e) {
                 switch c {
                 case GHOSTTY_TMUX_NOTICE_MESSAGE: self = .message
                 case GHOSTTY_TMUX_NOTICE_CONFIG_ERROR: self = .configError
                 case GHOSTTY_TMUX_NOTICE_COMMAND_ERROR: self = .commandError
                 case GHOSTTY_TMUX_NOTICE_EXIT: self = .exit
+                case GHOSTTY_TMUX_NOTICE_COMMAND_OUTPUT: self = .commandOutput
                 default: return nil
                 }
             }

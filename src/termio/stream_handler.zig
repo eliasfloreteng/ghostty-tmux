@@ -53,6 +53,9 @@ pub const StreamHandler = struct {
     /// output, before its output is turned off, or 0 never to. Read when
     /// a control mode session starts.
     tmux_hidden_output_off_after: u32 = 0,
+    /// Whether to mirror tmux's status line. Read when a control mode
+    /// session starts.
+    tmux_status_bar: bool = false,
 
     /// The color reporting format for OSC requests.
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
@@ -297,6 +300,7 @@ pub const StreamHandler = struct {
         self.xt_checksum_report = config.xt_checksum_report;
         self.tmux_pause_after = config.tmux_pause_after;
         self.tmux_hidden_output_off_after = config.tmux_hidden_output_off_after;
+        self.tmux_status_bar = config.tmux_status_bar;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
@@ -644,6 +648,8 @@ pub const StreamHandler = struct {
                         viewer.* = try .init(global.io(), self.alloc, .{
                             .pause_after = self.tmux_pause_after,
                             .hidden_output_off_after = self.tmux_hidden_output_off_after,
+                            .follow_window_order = true,
+                            .status_line = self.tmux_status_bar,
                         });
                         errdefer viewer.deinit();
 
@@ -727,6 +733,30 @@ pub const StreamHandler = struct {
                                 .kind = notice.kind,
                                 .text = text,
                             } });
+                        },
+
+                        // Copied out of the viewer's buffers, as for a
+                        // notice: one string, the parts separated by NUL,
+                        // which tmux's status text cannot contain.
+                        .status => |status| {
+                            var buf: std.ArrayList(u8) = .empty;
+                            defer buf.deinit(self.alloc);
+                            buf.print(self.alloc, "{s}\x00{s}\x00{s}", .{
+                                status.left,
+                                status.windows,
+                                status.right,
+                            }) catch |err| {
+                                log.warn("failed to report tmux status err={}", .{err});
+                                continue;
+                            };
+                            const joined = apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                buf.items,
+                            ) catch |err| {
+                                log.warn("failed to report tmux status err={}", .{err});
+                                continue;
+                            };
+                            self.surfaceMessageWriter(.{ .tmux_status = joined });
                         },
 
                         .command => |command| {

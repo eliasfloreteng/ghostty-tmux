@@ -1032,6 +1032,7 @@ typedef enum {
   GHOSTTY_TMUX_NOTICE_CONFIG_ERROR,
   GHOSTTY_TMUX_NOTICE_COMMAND_ERROR,
   GHOSTTY_TMUX_NOTICE_EXIT,
+  GHOSTTY_TMUX_NOTICE_COMMAND_OUTPUT,
 } ghostty_tmux_notice_kind_e;
 
 // apprt.action.TmuxNotice.C
@@ -1049,10 +1050,25 @@ typedef enum {
 //   EXIT           the session ended and this is tmux's reason. Sent
 //                  only when tmux gives one, just before the session's
 //                  pane surfaces are closed.
+//   COMMAND_OUTPUT what a command line the user typed printed; may be
+//                  several lines. Its errors come as COMMAND_ERROR.
 typedef struct {
   ghostty_tmux_notice_kind_e kind;
   const char* text;
 } ghostty_action_tmux_notice_s;
+
+// apprt.action.TmuxStatus.C
+//
+// tmux's status line, when tmux-status-bar is on: status-left, the window
+// list and status-right as tmux formats them, without tmux's styles. The
+// target is the surface hosting the session. All three are NUL
+// terminated, possibly empty, and only valid for the duration of the
+// action callback.
+typedef struct {
+  const char* left;
+  const char* windows;
+  const char* right;
+} ghostty_action_tmux_status_s;
 
 // apprt.Action.Key
 typedef enum {
@@ -1128,6 +1144,8 @@ typedef enum {
   GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_TMUX_WINDOWS,
   GHOSTTY_ACTION_TMUX_NOTICE,
+  GHOSTTY_ACTION_TMUX_STATUS,
+  GHOSTTY_ACTION_PROMPT_TMUX_COMMAND,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1174,6 +1192,7 @@ typedef union {
   ghostty_action_open_config_e open_config;
   ghostty_action_tmux_windows_s tmux_windows;
   ghostty_action_tmux_notice_s tmux_notice;
+  ghostty_action_tmux_status_s tmux_status;
 } ghostty_action_u;
 
 typedef struct {
@@ -1308,6 +1327,28 @@ GHOSTTY_API bool ghostty_surface_tmux_close_tab(ghostty_surface_t);
 // anything that is not a tmux pane, and for a pane tmux already closed;
 // remove it as usual.
 GHOSTTY_API bool ghostty_surface_tmux_close_pane(ghostty_surface_t);
+// Move the tmux pane the first surface displays beside the one the
+// second displays, on the given side (a split dropped onto another).
+//
+// Returns true if tmux was asked; the caller must NOT also rearrange its
+// split trees, which follow tmux's layouts. Returns false if either is
+// not a tmux pane or they belong to different sessions.
+GHOSTTY_API bool ghostty_surface_tmux_move_pane(ghostty_surface_t,
+                                                ghostty_surface_t,
+                                                ghostty_action_split_direction_e);
+// Take the tmux pane this surface displays out into a tmux window of its
+// own (a split dragged out of its window).
+//
+// Returns true if tmux was asked; the caller must NOT also move the
+// split. Returns false for anything that is not a tmux pane.
+GHOSTTY_API bool ghostty_surface_tmux_break_pane(ghostty_surface_t);
+// Run a command line in the tmux session this surface belongs to, as a
+// pane or as the surface hosting it, as tmux's own command prompt would.
+// What it prints comes back as GHOSTTY_ACTION_TMUX_NOTICE. Returns false
+// if the surface belongs to no session.
+GHOSTTY_API bool ghostty_surface_tmux_command(ghostty_surface_t,
+                                              const char*,
+                                              uintptr_t);
 GHOSTTY_API void ghostty_tmux_router_free(void*);
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,

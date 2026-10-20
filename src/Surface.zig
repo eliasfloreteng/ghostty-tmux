@@ -1227,6 +1227,28 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .tmux_status => |status| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            defer status.deinit();
+
+            var it = std.mem.splitScalar(u8, status.slice(), 0);
+            var parts: [3][:0]const u8 = undefined;
+            var stack = std.heap.stackFallback(512, self.alloc);
+            const alloc = stack.get();
+            var made: usize = 0;
+            defer for (parts[0..made]) |p| alloc.free(p);
+            for (&parts) |*part| {
+                part.* = try alloc.dupeZ(u8, it.next() orelse "");
+                made += 1;
+            }
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_status,
+                .{ .left = parts[0], .windows = parts[1], .right = parts[2] },
+            );
+        },
+
         .child_exited => |v| self.childExited(v),
 
         .desktop_notification => |notification| {
@@ -2363,6 +2385,115 @@ fn tmuxZoom(self: *Surface) bool {
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
     pane.router.zoomPane(pane.id);
+    return true;
+}
+
+/// Ask tmux to swap this pane with another of its window, if this
+/// surface is a pane.
+fn tmuxSwapPane(self: *Surface, target: terminal.tmux.sink.SwapTarget) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.swapPane(pane.id, target);
+    return true;
+}
+
+/// Ask tmux to rotate the panes of this pane's window, if this surface
+/// is a pane.
+fn tmuxRotateWindow(self: *Surface, direction: terminal.tmux.sink.Adjacent) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.rotateWindow(pane.id, direction);
+    return true;
+}
+
+/// Ask tmux to give this pane a window of its own, if this surface is a
+/// pane.
+///
+/// Public because the embedded apprt calls it when a split is dragged
+/// out of its window, which AppKit handles without a binding.
+pub fn tmuxBreakPane(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.breakPane(pane.id);
+    return true;
+}
+
+/// Ask tmux to move this pane into a neighbouring window, if this
+/// surface is a pane.
+fn tmuxJoinPane(self: *Surface, window: terminal.tmux.sink.Adjacent) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.joinPane(pane.id, window);
+    return true;
+}
+
+/// Ask tmux to move this surface's pane beside `target`'s, if both are
+/// panes of the same session.
+///
+/// Public because the embedded apprt calls it for a split dragged onto
+/// another one, which AppKit handles without a binding: rearranging the
+/// split tree locally tells tmux nothing, and tmux's next layout would
+/// put the panes back where they were.
+///
+/// Returns false when either is not a tmux pane, or they are panes of
+/// different sessions -- which a GUI can drag between, but tmux cannot
+/// move a pane between.
+pub fn tmuxMovePane(
+    self: *Surface,
+    target: *Surface,
+    direction: terminal.tmux.sink.SplitDirection,
+) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    const target_pane = target.tmuxPane() orelse return false;
+    defer target_pane.router.unref();
+    if (pane.router != target_pane.router) return false;
+
+    pane.router.movePane(pane.id, target_pane.id, direction);
+    return true;
+}
+
+/// Whether this surface belongs to a tmux session: is one of its panes,
+/// or hosts it.
+fn tmuxSession(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    if (self.tmuxPane()) |pane| {
+        pane.router.unref();
+        return true;
+    }
+    return self.tmuxHosting();
+}
+
+/// Run a command line in the tmux session this surface belongs to, if
+/// it belongs to one. Like detaching, this is about the session rather
+/// than the pane, so the surface hosting it can do it too.
+///
+/// Public because the embedded apprt calls it with what its prompt for
+/// `prompt_tmux_command` was given.
+pub fn tmuxCommandLine(self: *Surface, text: []const u8) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    if (self.tmuxPane()) |pane| {
+        defer pane.router.unref();
+        pane.router.commandLine(text);
+        return true;
+    }
+
+    if (!self.tmuxHosting()) return false;
+    const router = self.tmuxRouter() orelse return false;
+    defer router.unref();
+    router.commandLine(text);
     return true;
 }
 
@@ -5711,6 +5842,40 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .tmux_detach => return self.tmuxDetach(),
+
+        .tmux_swap_pane => |v| return self.tmuxSwapPane(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.SwapTarget,
+                @tagName(tag),
+            ),
+        }),
+
+        .tmux_rotate_window => |v| return self.tmuxRotateWindow(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.Adjacent,
+                @tagName(tag),
+            ),
+        }),
+
+        .tmux_break_pane => return self.tmuxBreakPane(),
+
+        .tmux_command => |v| return self.tmuxCommandLine(v),
+
+        .prompt_tmux_command => {
+            if (!self.tmuxSession()) return false;
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .prompt_tmux_command,
+                {},
+            );
+        },
+
+        .tmux_join_pane => |v| return self.tmuxJoinPane(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.Adjacent,
+                @tagName(tag),
+            ),
+        }),
 
         .new_tab => {
             // On a tmux pane, a new tab is a new tmux window: the point

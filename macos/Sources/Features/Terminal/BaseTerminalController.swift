@@ -56,6 +56,10 @@ class BaseTerminalController: NSWindowController,
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
 
+    /// tmux's status line, shown along the bottom, for a tmux window whose
+    /// session mirrors it (`tmux-status-bar`). Set by `TmuxWindowManager`.
+    @Published var tmuxStatus: Ghostty.Action.TmuxStatus?
+
     /// Set if the terminal view should show the update overlay.
     @Published var updateOverlayIsVisible: Bool = false
 
@@ -868,6 +872,17 @@ class BaseTerminalController: NSWindowController,
         // it is already a single split.
         guard surfaceTree.isSplit else { return }
 
+        // A tmux pane goes where tmux puts it. Breaking it out into a
+        // window of its own is tmux's `break-pane`, and the new tmux window
+        // opens as a window where the split was dropped.
+        if target.tmuxPaneId != nil {
+            let appDelegate = NSApplication.shared.delegate as? AppDelegate
+            appDelegate?.tmuxWindowManager.breakOut(
+                target,
+                at: notification.userInfo?[Notification.Name.ghosttySurfaceDragEndedNoTargetPointKey] as? NSPoint)
+            return
+        }
+
         // If we are removing our focused surface then we move it. We need to
         // keep track of our old one so undo sends focus back to the right place.
         let oldFocusedSurface = focusedSurface
@@ -1029,6 +1044,26 @@ class BaseTerminalController: NSWindowController,
         case .bottom: .down
         case .left: .left
         case .right: .right
+        }
+
+        // tmux panes are arranged by tmux. Moving one in the tree would be
+        // undone by tmux's next layout, so tmux moves it and the trees
+        // follow. A tmux pane cannot go anywhere tmux does not have -- a
+        // local split, another session's window -- nor can a local
+        // surface go into a tmux window, so those drops do nothing.
+        if source.tmuxPaneId != nil || destination.tmuxPaneId != nil {
+            guard let sourceSurface = source.surface,
+                  let destinationSurface = destination.surface else { return }
+            let tmuxDirection: ghostty_action_split_direction_e = switch zone {
+            case .top: GHOSTTY_SPLIT_DIRECTION_UP
+            case .bottom: GHOSTTY_SPLIT_DIRECTION_DOWN
+            case .left: GHOSTTY_SPLIT_DIRECTION_LEFT
+            case .right: GHOSTTY_SPLIT_DIRECTION_RIGHT
+            }
+            if !ghostty_surface_tmux_move_pane(sourceSurface, destinationSurface, tmuxDirection) {
+                Ghostty.logger.info("not dropping a split between tmux and elsewhere")
+            }
+            return
         }
 
         // Check if source is in our tree

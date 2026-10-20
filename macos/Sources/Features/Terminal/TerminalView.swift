@@ -38,6 +38,10 @@ protocol TerminalViewModel: ObservableObject {
 
     /// The surface in the tree to have focus, if one was chosen.
     var focusedSurface: Ghostty.SurfaceView? { get }
+
+    /// tmux's status line, to show along the bottom, if this shows a tmux
+    /// window whose session mirrors it.
+    var tmuxStatus: Ghostty.Action.TmuxStatus? { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -120,6 +124,12 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         }
                         .frame(idealWidth: lastFocusedSurface?.value?.initialSize?.width,
                                idealHeight: lastFocusedSurface?.value?.initialSize?.height)
+
+                    // Below the panes, where tmux puts it: the panes give
+                    // up the room, and tmux is told their new size.
+                    if let status = viewModel.tmuxStatus {
+                        TmuxStatusBarView(status: status)
+                    }
                 }
                 // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
                 .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
@@ -141,6 +151,37 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
         }
+    }
+}
+
+/// tmux's status line: `status-left`, the window list and `status-right`,
+/// as tmux formats them, in one line of monospaced text the way tmux lays
+/// its own out. The window list gives way first when there is no room.
+private struct TmuxStatusBarView: View {
+    let status: Ghostty.Action.TmuxStatus
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(status.left)
+                .lineLimit(1)
+                .layoutPriority(2)
+            Text(status.windows)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(0)
+            Text(status.right)
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+        .font(.system(size: NSFont.smallSystemFontSize, design: .monospaced))
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .frame(maxWidth: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("tmux status line")
     }
 }
 
