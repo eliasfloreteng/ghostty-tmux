@@ -138,6 +138,7 @@ pub const Action = union(Key) {
     xt_checksum_extension: XtChecksumExtension,
     program_status: ProgramStatus,
     soft_reset,
+    kitty_desktop_notification: KittyDesktopNotification,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -246,6 +247,7 @@ pub const Action = union(Key) {
             "xt_checksum_extension",
             "program_status",
             "soft_reset",
+            "kitty_desktop_notification",
         },
     );
 
@@ -485,6 +487,7 @@ pub const Action = union(Key) {
     pub const SemanticPrompt = osc.Command.SemanticPrompt;
 
     pub const KittyClipboard = osc.Command.KittyClipboardProtocol;
+    pub const KittyDesktopNotification = osc.Command.KittyDesktopNotification;
 
     pub const KittyDnd = osc.Command.KittyDndProtocol;
 
@@ -2818,6 +2821,10 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.program_status, v);
                 },
 
+                .kitty_desktop_notification => |v| {
+                    self.handler.vt(.kitty_desktop_notification, v);
+                },
+
                 .unknown => |v| {
                     @branchHint(.unlikely);
                     self.handler.vt(.osc_unknown, v);
@@ -2833,7 +2840,6 @@ pub fn Stream(comptime H: type) type {
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,
-                .kitty_desktop_notification,
                 .hierarchical_context,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});

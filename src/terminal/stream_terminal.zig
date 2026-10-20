@@ -805,6 +805,7 @@ pub const Handler = struct {
             // Have no terminal-modifying effect
             .title_push,
             .title_pop,
+            .kitty_desktop_notification,
             => {},
         }
     }
