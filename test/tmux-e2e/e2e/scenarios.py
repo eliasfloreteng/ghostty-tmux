@@ -8,7 +8,9 @@ screen reading, private tmux socket) and should pass on any recent build.
 from __future__ import annotations
 
 import base64
+import os
 import re
+import signal
 import secrets
 import time
 from dataclasses import dataclass
@@ -406,6 +408,54 @@ def detach_client(ctx: Context) -> None:
         ctx.tmux.run("detach-client", "-t", client)
     expect_gateway_back(ctx, "detach-client")
     check(ctx.tmux.alive(), "tmux server should survive a detach")
+
+
+@scenario
+def connection_lost_reattach(ctx: Context) -> None:
+    """A control client that dies without `%exit` (a dropped connection) offers to reattach, and does.
+
+    SIGKILL is the closest stand-in for ssh dying: tmux never gets to say
+    `%exit`, and the gateway's shell prints its prompt into the DCS that
+    never ended. Needs the gateway shell's Ghostty shell integration, which
+    is what tells the app which command started the session.
+    """
+    two_window_layout(ctx)
+    enter_session(ctx)
+    out = ctx.tmux.run("list-clients", "-F", "#{client_pid}\t#{client_control_mode}")
+    pids = [int(line.split("\t")[0]) for line in out.splitlines() if line.endswith("\t1")]
+    check(pids, f"no control client to kill: {out!r}")
+    for pid in pids:
+        os.kill(pid, signal.SIGKILL)
+
+    wait_until(
+        lambda: not ctx.tmux_tabs(),
+        timeout=ctx.timeout,
+        desc="tmux tabs to close after the connection dropped",
+        describe_state=ctx.describe,
+    )
+    check(ctx.tmux.alive(), "the tmux server should outlive its client")
+
+    def offer() -> list[str] | None:
+        for sheet in ax.sheet_texts(ctx.app.pid):
+            if any("Lost Connection to tmux" in t for t in sheet):
+                return sheet
+        ctx.app.activate()
+        return None
+
+    sheet = wait_until(offer, timeout=ctx.timeout, desc="an offer to reattach")
+    check(
+        any("-CC" in t for t in sheet),
+        f"the offer does not show the command it would run: {sheet}",
+    )
+    ax.dismiss_sheets(ctx.app.pid, "Reconnect")
+
+    wait_until(
+        ctx.tmux.control_clients,
+        timeout=ctx.timeout,
+        desc="the session to be reattached in control mode",
+        describe_state=lambda: f"tmux clients: {ctx.tmux.clients()}",
+    )
+    ctx.wait_synced("GUI to mirror the tmux session after reattaching")
 
 
 @scenario

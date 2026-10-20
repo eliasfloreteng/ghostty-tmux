@@ -129,6 +129,10 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   without a prompt, Ghostty keeps running, the gateway comes to the front
   with its title back, and its shell still answers. (No reason bar is
   expected: tmux 3.6 ends these with a bare `%exit`.)
+- `connection_lost_reattach`: a control client killed with SIGKILL (no
+  `%exit`, as when ssh dies) closes the tabs and offers to reattach;
+  accepting runs the attach command again in the gateway and the session
+  comes back. Needs the gateway shell's Ghostty shell integration.
 - `switch_client`: the tabs become the other session's, the gateway is
   retitled and stays behind.
 - `resize_window`: resizing the GUI changes the tmux window size.
