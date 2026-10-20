@@ -100,6 +100,10 @@ const Session = struct {
     /// means to provoke one should check that it did.
     pauses: usize = 0,
 
+    /// The last paste buffer the viewer passed on for the clipboard,
+    /// owned. See `Viewer.Options.mirror_paste_buffers`.
+    paste_buffer: ?[]u8 = null,
+
     /// The notices the viewer has reported, by kind.
     notices: [std.meta.fields(Viewer.Notice.Kind).len]struct {
         count: usize = 0,
@@ -328,6 +332,7 @@ const Session = struct {
     }
 
     fn deinit(self: *Session) void {
+        if (self.paste_buffer) |b| self.alloc.free(b);
         self.viewer.deinit();
         self.dcs_handler.deinit();
         posix.kill(self.pid, .KILL) catch {};
@@ -458,6 +463,10 @@ const Session = struct {
                 const len = @min(n.text.len, kind.last.len);
                 @memcpy(kind.last[0..len], n.text[0..len]);
                 kind.last_len = len;
+            },
+            .paste_buffer => |data| {
+                if (self.paste_buffer) |b| self.alloc.free(b);
+                self.paste_buffer = try self.alloc.dupe(u8, data);
             },
             else => {},
         };
@@ -2439,5 +2448,239 @@ test "live: characters are as wide here as tmux makes them" {
 
         try session.input(.{ .write = .{ .pane_id = pane_id, .data = "\r" } });
     }
+    try testing.expect(!session.exited);
+}
+
+test "live: hiding a window keeps it in tmux and showing it reads it again" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "cat", .{
+        .extra_windows = &.{"cat"},
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+    try testing.expectEqual(2, session.viewer.windows.items.len);
+    const window_id = session.viewer.windows.items[1].id;
+    const pane_id = firstPane(session.viewer.windows.items[1].layout);
+
+    try session.input(.{ .hide_window = .{ .window_id = window_id, .hidden = true } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.windows.items[1].hidden and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // Kept on the window in tmux, where the next attach will find it.
+    const target = try std.fmt.allocPrint(alloc, "@{d}", .{window_id});
+    defer alloc.free(target);
+    {
+        const out = try session.ask(&.{
+            "show-options", "-w", "-v", "-t", target, "@ghostty-hidden",
+        });
+        defer alloc.free(out);
+        try testing.expectEqualStrings("1", std.mem.trim(u8, out, " \r\n"));
+    }
+
+    // Still running: typing into it from outside works, and once shown
+    // again its pane is read from tmux with what it printed meanwhile.
+    {
+        const pane_target = try std.fmt.allocPrint(alloc, "%{d}", .{pane_id});
+        defer alloc.free(pane_target);
+        const out = try session.ask(&.{
+            "send-keys", "-t", pane_target, "while hidden", "Enter",
+        });
+        alloc.free(out);
+    }
+
+    try session.input(.{ .hide_window = .{ .window_id = window_id, .hidden = false } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                !v.viewer.windows.items[1].hidden;
+        }
+    }.pred);
+    try session.waitForPaneText(pane_id, "while hidden");
+
+    {
+        const out = try session.ask(&.{
+            "show-options", "-w", "-v", "-q", "-t", target, "@ghostty-hidden",
+        });
+        defer alloc.free(out);
+        try testing.expectEqualStrings("", std.mem.trim(u8, out, " \r\n"));
+    }
+    try testing.expect(!session.exited);
+}
+
+fn firstPane(node: @import("layout.zig").Layout) usize {
+    return switch (node.content) {
+        .pane => |id| id,
+        .horizontal, .vertical => |children| firstPane(children[0]),
+    };
+}
+
+test "live: the session list is read, and switching to another session works" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "cat");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    try session.input(.list_sessions);
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.sessions.items.len == 1;
+        }
+    }.pred);
+    try testing.expectEqual(1, session.viewer.sessions.items[0].attached);
+
+    // Another session appears, and the list follows without being asked.
+    {
+        const out = try session.ask(&.{ "new-session", "-d", "-s", "second one", "cat" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.sessions.items.len == 2;
+        }
+    }.pred);
+
+    const other = for (session.viewer.sessions.items) |s| {
+        if (std.mem.eql(u8, s.name, "second one")) break s.id;
+    } else return error.TestExpectedSession;
+
+    try session.input(.{ .switch_session = .{ .session_id = other } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return std.mem.eql(u8, v.viewer.session_name, "second one") and
+                v.viewer.panes.count() == 1 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try testing.expectEqual(other, session.viewer.session_id);
+    try testing.expect(!session.exited);
+
+    // The list says where we are now.
+    for (session.viewer.sessions.items) |s| {
+        try testing.expectEqual(
+            @as(usize, if (s.id == other) 1 else 0),
+            s.attached,
+        );
+    }
+}
+
+test "live: a paste buffer arrives for the clipboard exactly as it was set" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "cat", .{
+        .viewer = .{ .mirror_paste_buffers = true },
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // Everything that would break control mode or the block it arrives
+    // in: escape sequences, CAN and SUB, a backslash that looks like an
+    // escape, and a line that looks like the end of the block.
+    const content = "red \x1b[31mtext\x1b[m \x18\x1a a\\033b\n%end 1 2 1\n\ttabbed\r\n";
+    {
+        const out = try session.ask(&.{ "set-buffer", "-b", "copied", content });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.paste_buffer != null;
+        }
+    }.pred);
+    try testing.expectEqualStrings(content, session.paste_buffer.?);
+
+    // And the session is fine afterwards.
+    try session.input(.{ .write = .{ .pane_id = 0, .data = "still here\r" } });
+    try session.waitForPaneText(0, "still here");
+    try testing.expect(!session.exited);
+}
+
+test "live: history is read only as far back as the limit" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "seq 5000; exec cat",
+        .{ .viewer = .{ .history_limit = 100 }, .history_limit = 10000, .min_history = 4000 },
+    );
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    const pane = session.viewer.panes.get(0).?;
+    const screen = pane.terminal.screens.get(.primary).?;
+    const history = screen.pages.total_rows - pane.terminal.rows;
+    try testing.expect(history <= 100);
+    try testing.expect(history >= 90);
+    try testing.expect(!session.exited);
+}
+
+test "live: tmux takes the client flags we ask for" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "cat", .{
+        .viewer = .{ .client_flags = .{
+            .active_pane = true,
+            .no_detach_on_destroy = true,
+        } },
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const flags = try session.ask(&.{ "list-clients", "-F", "#{client_flags}" });
+    defer alloc.free(flags);
+    try testing.expect(std.mem.indexOf(u8, flags, "active-pane") != null);
+    try testing.expect(std.mem.indexOf(u8, flags, "no-detach-on-destroy") != null);
+    try testing.expect(!session.exited);
+}
+
+test "live: with no-detach-on-destroy, losing the session moves us to another" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "cat", .{
+        .viewer = .{ .client_flags = .{ .no_detach_on_destroy = true } },
+    });
+    defer session.deinit();
+    {
+        const out = try session.ask(&.{ "new-session", "-d", "-s", "survivor", "cat" });
+        alloc.free(out);
+    }
+    try session.waitFor(attached);
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const first = try std.fmt.allocPrint(alloc, "${d}", .{session.viewer.session_id});
+    defer alloc.free(first);
+    {
+        const out = try session.ask(&.{ "kill-session", "-t", first });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return std.mem.eql(u8, v.viewer.session_name, "survivor") and
+                v.viewer.panes.count() == 1;
+        }
+    }.pred);
     try testing.expect(!session.exited);
 }
