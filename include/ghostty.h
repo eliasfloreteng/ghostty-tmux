@@ -1028,6 +1028,23 @@ typedef enum {
   GHOSTTY_TMUX_NOTICE_CONNECTION_LOST,
 } ghostty_tmux_notice_kind_e;
 
+// apprt.action.TmuxPaneStatus
+//
+// How current a tmux pane surface is with tmux, beyond what its content
+// shows. The target is the pane's surface. Sent on every change.
+//
+//   LIVE             up to date.
+//   LOADING_HISTORY  the screen is shown and its history is still being
+//                    read, so scrollback is short for now.
+//   CATCHING_UP      tmux paused the pane because we fell behind it
+//                    (tmux-pause-after) and it is being read again; the
+//                    screen may be stale until it is.
+typedef enum {
+  GHOSTTY_TMUX_PANE_LIVE,
+  GHOSTTY_TMUX_PANE_LOADING_HISTORY,
+  GHOSTTY_TMUX_PANE_CATCHING_UP,
+} ghostty_action_tmux_pane_status_e;
+
 // apprt.action.TmuxNotice.C
 //
 // Text from a tmux control mode session meant for the user, which a
@@ -1131,6 +1148,7 @@ typedef enum {
   GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_TMUX_WINDOWS,
   GHOSTTY_ACTION_TMUX_NOTICE,
+  GHOSTTY_ACTION_TMUX_PANE_STATUS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1177,6 +1195,7 @@ typedef union {
   ghostty_action_open_config_e open_config;
   ghostty_action_tmux_windows_s tmux_windows;
   ghostty_action_tmux_notice_s tmux_notice;
+  ghostty_action_tmux_pane_status_e tmux_pane_status;
 } ghostty_action_u;
 
 typedef struct {

@@ -670,6 +670,32 @@ pub const Viewer = struct {
         /// the alternate screen or the primary. See `paneCaptures`.
         visible_screen: ScreenSet.Key = .primary,
 
+        /// The history and saved grid of the read in flight, decoded and
+        /// held until the grid on display arrives, so that the whole
+        /// read is applied at once. Owned.
+        ///
+        /// A read replaces the pane's content wholesale, scrollback and
+        /// all. Applied reply by reply, a pane read again while it is on
+        /// screen, after a pause say, would show an empty screen in
+        /// between, for as long as a large history took to arrive.
+        ///
+        /// `read_history` is only set for a full read, one that started
+        /// with the history; an empty slice is a history tmux could not
+        /// give us. See `paneCaptures`.
+        read_history: ?[]u8 = null,
+        read_saved: ?[]u8 = null,
+
+        /// Full reads queued for this pane and not yet applied. While
+        /// there are any, the pane's history is not all here yet.
+        full_reads: u32 = 0,
+
+        /// Whether tmux paused this pane and the read that recovers it
+        /// has not been applied yet. See `Viewer.pauseRecover`.
+        paused: bool = false,
+
+        /// The status last sent to the sink. See `Viewer.updatePaneStatus`.
+        status: sinkpkg.PaneStatus = .live,
+
         pub fn create(
             io: std.Io,
             alloc: Allocator,
@@ -701,12 +727,19 @@ pub const Viewer = struct {
             self.last_resize_sent = null;
             self.stale_size = null;
             self.visible_screen = .primary;
+            self.read_history = null;
+            self.read_saved = null;
+            self.full_reads = 0;
+            self.paused = false;
+            self.status = .live;
 
             return self;
         }
 
         pub fn destroy(self: *Pane, alloc: Allocator) void {
             if (self.sink) |s| s.close();
+            if (self.read_history) |v| alloc.free(v);
+            if (self.read_saved) |v| alloc.free(v);
             self.stream.deinit();
             self.terminal.deinit(alloc);
             alloc.destroy(self);
@@ -2555,11 +2588,15 @@ pub const Viewer = struct {
     /// carried on would be quietly wrong from then on.
     ///
     /// Re-read the pane instead, exactly as if it were new.
+    ///
+    /// The pane's display says it is catching up until that read has
+    /// been applied: until then it shows what it had when tmux stopped
+    /// sending, which may be well behind.
     fn pauseRecover(self: *Viewer, pane_id: usize) !void {
-        if (!self.panes.contains(pane_id)) {
+        const pane = self.panes.get(pane_id) orelse {
             log.info("pause for untracked pane id={}, dropping", .{pane_id});
             return;
-        }
+        };
 
         const resume_cmd = try self.userCommand(
             "refresh-client -A '%{d}:continue'\n",
@@ -2570,6 +2607,9 @@ pub const Viewer = struct {
         try self.queueCommands(&([_]Command{resume_cmd} ++
             paneCaptures(pane_id) ++
             [_]Command{.pane_state}));
+        pane.full_reads += 1;
+        pane.paused = true;
+        try self.updatePaneStatus(pane);
     }
 
     /// The captures that read a pane's content from scratch, in the order
@@ -2597,9 +2637,18 @@ pub const Viewer = struct {
     /// grid on display, written to that screen. tmux runs commands that
     /// arrive together back to back, without reading pane output in
     /// between, so the screen cannot flip between the last two.
+    ///
+    /// Each reply is held, and the read applied as a whole once the last
+    /// one arrives. See `Pane.read_history`.
     fn paneCaptures(pane_id: usize) [3]Command {
+        return [_]Command{.{ .pane_history = pane_id }} ++
+            screenCaptures(pane_id);
+    }
+
+    /// The captures that read a pane's screens without its history: the
+    /// tail of `paneCaptures`.
+    fn screenCaptures(pane_id: usize) [2]Command {
         return .{
-            .{ .pane_history = pane_id },
             .{ .pane_saved = pane_id },
             .{ .pane_visible = pane_id },
         };
@@ -2705,18 +2754,16 @@ pub const Viewer = struct {
         // to populate them.
         // TODO: errdefer cleanup
         {
+            var added_ids: std.ArrayList(usize) = .empty;
+            defer added_ids.deinit(self.alloc);
             var panes_it = panes.iterator();
-            var added: bool = false;
             while (panes_it.next()) |kv| {
                 const pane_id: usize = kv.key_ptr.*;
                 if (self.panes.contains(pane_id)) continue;
-                added = true;
-                try self.queueCommands(&paneCaptures(pane_id));
+                try added_ids.append(self.alloc, pane_id);
             }
-
-            // If we added any panes, then we also want to resync the pane
-            // state (terminal modes and cursor positions and so on).
-            if (added) try self.queueCommands(&.{.pane_state});
+            const added = added_ids.items.len > 0;
+            if (added) try self.queuePaneReads(&panes, added_ids.items);
 
             // A pane appearing or disappearing moves tmux's active pane,
             // and we are not told where it went until inbound sync
@@ -2752,6 +2799,22 @@ pub const Viewer = struct {
             self.panes.deinit(self.alloc);
             self.panes = panes;
         }
+    }
+
+    /// Read new panes from tmux, whole: their content, then their state
+    /// (terminal modes, cursor positions and so on).
+    fn queuePaneReads(
+        self: *Viewer,
+        panes: *const PanesMap,
+        ids: []const usize,
+    ) !void {
+        for (ids) |id| {
+            try self.queueCommands(&paneCaptures(id));
+            const pane = panes.get(id) orelse continue;
+            pane.full_reads += 1;
+            try self.updatePaneStatus(pane);
+        }
+        try self.queueCommands(&.{.pane_state});
     }
 
     /// When a session changes, we have to basically reset our whole state.
@@ -2914,10 +2977,11 @@ pub const Viewer = struct {
             ),
 
             // These only fail for a pane that has gone, and the error
-            // text is not content.
-            .pane_history => |id| if (!is_err) {
-                try self.receivedPaneHistory(id, content);
-            },
+            // text is not content. They are still a read finishing.
+            .pane_history => |id| try self.receivedPaneHistory(
+                id,
+                if (is_err) null else content,
+            ),
 
             // Failing is the answer here: no saved grid means the pane
             // is on its primary screen.
@@ -2926,9 +2990,10 @@ pub const Viewer = struct {
                 if (is_err) null else content,
             ),
 
-            .pane_visible => |id| if (!is_err) {
-                try self.receivedPaneVisible(id, content);
-            },
+            .pane_visible => |id| try self.receivedPaneVisible(
+                id,
+                if (is_err) null else content,
+            ),
 
             .tmux_version => try self.receivedTmuxVersion(
                 arena_alloc,
@@ -3205,6 +3270,10 @@ pub const Viewer = struct {
             .cols = pane.terminal.cols,
             .rows = pane.terminal.rows,
         } }});
+
+        // A display starts out live, and this one may be attached to a
+        // pane whose history is still on its way.
+        if (pane.status != .live) s.send(&.{.{ .pane_status = pane.status }});
     }
 
     /// Stop mirroring a pane. Closes the sink. Safe to call for a pane
@@ -3241,7 +3310,7 @@ pub const Viewer = struct {
     fn receivedPaneHistory(
         self: *Viewer,
         id: usize,
-        content: []const u8,
+        content: ?[]const u8,
     ) !void {
         // Get our pane
         const entry = self.panes.getEntry(id) orelse {
@@ -3250,39 +3319,11 @@ pub const Viewer = struct {
         };
         const pane: *Pane = entry.value_ptr.*;
 
-        // The replay populates the active area too, so it won't be exactly
-        // correct, but scrolling it into history leaves only the scrollback
-        // we were after and we'll get the active contents soon.
-        //
-        // It replaces whatever the primary screen held, scrollback and
-        // all: this is the pane's whole history, and a pane read again
-        // (resumed from a pause, say) already has the older part of it.
-        //
-        // The captures ask tmux to escape everything non-printable so that
-        // no raw ESC ever reaches the DCS carrying control mode, so the
-        // escape sequences `-e` asked for arrive as text and have to be
-        // turned back into bytes here. A block payload is const, unlike an
-        // %output payload, so this decodes into a scratch buffer; decoding
-        // never grows the input, so the reply's own length is enough room.
-        const buf = try self.alloc.alloc(u8, content.len);
-        defer self.alloc.free(buf);
-        try self.paneOps(pane, &.{
-            .{ .switch_screen = .primary },
-            .erase_all,
-            .{ .bytes = control.unescape(buf, content) },
-            .scroll_into_history,
-        });
-
-        // Our active area should be empty
-        if (comptime std.debug.runtime_safety) {
-            const screen: *Screen = pane.terminal.screens.active;
-            var discarding: std.Io.Writer.Discarding = .init(&.{});
-            screen.dumpString(&discarding.writer, .{
-                .tl = screen.pages.getTopLeft(.active),
-                .unwrap = false,
-            }) catch unreachable;
-            assert(discarding.count == 0);
-        }
+        // Held until the grid on display arrives: see `Pane.read_history`.
+        // An empty history still marks this as a full read.
+        const history = try self.decodeCapture(content orelse "");
+        if (pane.read_history) |old| self.alloc.free(old);
+        pane.read_history = history;
     }
 
     /// The saved grid: the primary screen's content while the pane is
@@ -3299,34 +3340,24 @@ pub const Viewer = struct {
         };
         const pane: *Pane = entry.value_ptr.*;
 
+        if (pane.read_saved) |old| self.alloc.free(old);
+        pane.read_saved = null;
+
         const saved = content orelse {
-            // tmux has no alternate screen to show us, so whatever ours
-            // holds is stale: a re-read can find a pane that has left
-            // the alternate screen since we last looked.
             pane.visible_screen = .primary;
-            try self.paneOps(pane, &.{
-                .{ .switch_screen = .alternate },
-                .erase_and_home,
-            });
             return;
         };
-
         pane.visible_screen = .alternate;
-        const buf = try self.alloc.alloc(u8, saved.len);
-        defer self.alloc.free(buf);
-        try self.paneOps(pane, &.{
-            .{ .switch_screen = .primary },
-            .erase_and_home,
-            .{ .bytes = control.unescape(buf, saved) },
-        });
+        pane.read_saved = try self.decodeCapture(saved);
     }
 
     /// The grid on display, for whichever screen the saved-grid capture
-    /// before it said that is.
+    /// before it said that is, or null if tmux could not give it. This
+    /// ends a read, and applies all of it at once.
     fn receivedPaneVisible(
         self: *Viewer,
         id: usize,
-        content: []const u8,
+        content: ?[]const u8,
     ) !void {
         // Get our pane
         const entry = self.panes.getEntry(id) orelse {
@@ -3334,17 +3365,107 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
-        const screen_key = pane.visible_screen;
 
-        // Erase the active area and reset the cursor to the top-left
-        // before writing the visible content.
+        const history = pane.read_history;
+        pane.read_history = null;
+        defer if (history) |v| self.alloc.free(v);
+        const saved = pane.read_saved;
+        pane.read_saved = null;
+        defer if (saved) |v| self.alloc.free(v);
+
+        if (content) |visible_raw| {
+            const visible = try self.decodeCapture(visible_raw);
+            defer self.alloc.free(visible);
+
+            var ops: [11]sinkpkg.Op = undefined;
+            var len: usize = 0;
+
+            // The history, which always goes to the primary screen. Its
+            // replay populates the active area too, but scrolling that
+            // into history leaves only the scrollback we were after, and
+            // the active contents follow. It replaces whatever the
+            // primary screen held, scrollback and all: this is the
+            // pane's whole history, and a pane read again already has
+            // the older part of it.
+            if (history) |v| for ([_]sinkpkg.Op{
+                .{ .switch_screen = .primary },
+                .erase_all,
+                .{ .bytes = v },
+                .scroll_into_history,
+            }) |op| {
+                ops[len] = op;
+                len += 1;
+            };
+
+            // The saved grid, or, when there is none, an alternate
+            // screen emptied: whatever ours holds is stale, since a
+            // re-read can find a pane that has left the alternate screen
+            // since we last looked.
+            const saved_ops: []const sinkpkg.Op = switch (pane.visible_screen) {
+                .primary => &.{
+                    .{ .switch_screen = .alternate },
+                    .erase_and_home,
+                },
+                .alternate => &.{
+                    .{ .switch_screen = .primary },
+                    .erase_and_home,
+                    .{ .bytes = saved orelse "" },
+                },
+            };
+            for (saved_ops) |op| {
+                ops[len] = op;
+                len += 1;
+            }
+
+            // Then the grid on display, on top.
+            for ([_]sinkpkg.Op{
+                .{ .switch_screen = pane.visible_screen },
+                .erase_and_home,
+                .{ .bytes = visible },
+            }) |op| {
+                ops[len] = op;
+                len += 1;
+            }
+
+            try self.paneOps(pane, ops[0..len]);
+        }
+
+        if (history != null) {
+            pane.full_reads -|= 1;
+            try self.updatePaneStatus(pane);
+        }
+    }
+
+    /// A capture's payload decoded into bytes for the terminal. Owned.
+    ///
+    /// The captures ask tmux to escape everything non-printable so that
+    /// no raw ESC ever reaches the DCS carrying control mode, so the
+    /// escape sequences `-e` asked for arrive as text and have to be
+    /// turned back into bytes here. Decoding never grows the input, so
+    /// the reply's own length is enough room.
+    fn decodeCapture(self: *Viewer, content: []const u8) Allocator.Error![]u8 {
         const buf = try self.alloc.alloc(u8, content.len);
-        defer self.alloc.free(buf);
-        try self.paneOps(pane, &.{
-            .{ .switch_screen = screen_key },
-            .erase_and_home,
-            .{ .bytes = control.unescape(buf, content) },
-        });
+        errdefer self.alloc.free(buf);
+        const len = control.unescape(buf, content).len;
+        return try self.alloc.realloc(buf, len);
+    }
+
+    /// Tell the pane's display how current it is, if that changed. See
+    /// `sinkpkg.PaneStatus`.
+    fn updatePaneStatus(self: *Viewer, pane: *Pane) !void {
+        // A pause is over once every read queued for the pane has been
+        // applied, the one queued to recover it being the last.
+        if (pane.full_reads == 0) pane.paused = false;
+
+        const status: sinkpkg.PaneStatus = if (pane.paused)
+            .catching_up
+        else if (pane.full_reads > 0)
+            .loading_history
+        else
+            .live;
+        if (status == pane.status) return;
+        pane.status = status;
+        try self.paneOps(pane, &.{.{ .pane_status = status }});
     }
 
     fn receivedOutput(
@@ -4241,7 +4362,8 @@ test "initial flow" {
                 "list-panes -s -F",
             },
         },
-        // pane_history for pane 0 (primary)
+        // pane_history for pane 0 (primary), held until the rest of
+        // the pane's read arrives, so it is applied in one go.
         .{
             .input = .{ .tmux = .{
                 .block_end =
@@ -4252,6 +4374,22 @@ test "initial flow" {
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expectEqualStrings("Hello, world!", pane.read_history.?);
+                    try testing.expectEqual(.loading_history, pane.status);
+                }
+            }).check,
+        },
+        // The rest of the captures and the pane state. Neither pane is
+        // in the alternate screen, so tmux has no saved grid for either
+        // and says so.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } }, .commands = &.{} },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .commands = &.{},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expectEqual(.live, pane.status);
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -4272,11 +4410,6 @@ test "initial flow" {
                 }
             }).check,
         },
-        // The rest of the captures and the pane state. Neither pane is
-        // in the alternate screen, so tmux has no saved grid for either
-        // and says so.
-        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } }, .commands = &.{} },
-        .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } }, .commands = &.{} },
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .commands = &.{} },
@@ -4347,22 +4480,9 @@ test "capture replay decodes escaped escape sequences" {
                 }
             }).check,
         },
-        // The history response, escaped the same way.
-        .{
-            .input = .{ .tmux = .{ .block_end = "\\033[32mOLD" } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
-                    const screen: *Screen = pane.terminal.screens.active;
-                    const str = try screen.dumpStringAlloc(
-                        testing.allocator,
-                        .{ .history = .{} },
-                    );
-                    defer testing.allocator.free(str);
-                    try testing.expectEqualStrings("OLD", str);
-                }
-            }).check,
-        },
+        // The history response, escaped the same way. Held until the
+        // rest of the read arrives.
+        .{ .input = .{ .tmux = .{ .block_end = "\\033[32mOLD" } } },
         // No saved grid: the pane is on its primary screen.
         .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
         // The visible response, as tmux escapes it under `-e -C`.
@@ -4372,6 +4492,14 @@ test "capture replay decodes escaped escape sequences" {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
+                    {
+                        const str = try screen.dumpStringAlloc(
+                            testing.allocator,
+                            .{ .history = .{} },
+                        );
+                        defer testing.allocator.free(str);
+                        try testing.expectEqualStrings("OLD", str);
+                    }
                     const str = try screen.dumpStringAlloc(
                         testing.allocator,
                         .{ .active = .{} },
@@ -6918,6 +7046,44 @@ test "a paused pane is resumed and re-read" {
     });
 }
 
+test "a paused pane says it is catching up until it is read again" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the queue is empty.
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.get(0).?;
+                    try testing.expectEqual(.live, pane.status);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 0 } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.get(0).?;
+                    try testing.expectEqual(.catching_up, pane.status);
+                }
+            }).check,
+        },
+        // The resume, and tmux saying so.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .@"continue" = .{ .pane_id = 0 } } } },
+    });
+
+    // Still catching up until the read that recovers the pane is in.
+    const read = testPrimaryCaptureSteps("old", "new");
+    try testViewer(&viewer, read[0..2]);
+    try testing.expectEqual(.catching_up, viewer.panes.get(0).?.status);
+    try testViewer(&viewer, read[2..]);
+    try testing.expectEqual(.live, viewer.panes.get(0).?.status);
+}
+
 test "a layout change keeps the window name" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
@@ -7923,7 +8089,8 @@ test "a read-only client watches but does not touch the session" {
         };
         try testing.expect(windows_first);
     }
-    try testViewer(&viewer, &testPrimaryCaptureSteps("", ""));
+    const second = testPrimaryCaptureSteps("", "");
+    try testViewer(&viewer, &second);
     try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
     try testing.expect(viewer.command_queue.empty());
 

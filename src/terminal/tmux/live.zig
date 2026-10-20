@@ -1083,6 +1083,9 @@ test "live: a paused pane is resumed and re-read" {
         }
     }.pred);
 
+    // Its display is told it is behind until the re-read lands.
+    try testing.expectEqual(.catching_up, session.viewer.panes.get(0).?.status);
+
     // The recovery is a resume plus a full re-read of the pane, because
     // tmux discards a paused pane's output rather than buffering it. It
     // has landed once the queue drains.
@@ -1094,6 +1097,7 @@ test "live: a paused pane is resumed and re-read" {
 
     try testing.expect(!session.exited);
     try testing.expect(session.viewer.panes.contains(0));
+    try testing.expectEqual(.live, session.viewer.panes.get(0).?.status);
 
     // The re-read half of the recovery. What the pane printed while it
     // was paused never came to us as %output -- tmux threw it away -- so

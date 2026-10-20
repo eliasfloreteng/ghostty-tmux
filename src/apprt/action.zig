@@ -374,6 +374,12 @@ pub const Action = union(Key) {
     /// tmux has something to tell the user. See `TmuxNotice`.
     tmux_notice: TmuxNotice,
 
+    /// How current the target tmux pane surface is with tmux: whether
+    /// its history is still loading, or tmux paused it and it is being
+    /// read again. Sent on every change, starting from `live`. See
+    /// `TmuxPaneStatus`.
+    tmux_pane_status: TmuxPaneStatus,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -448,6 +454,7 @@ pub const Action = union(Key) {
         resize_window,
         tmux_windows,
         tmux_notice,
+        tmux_pane_status,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1170,6 +1177,14 @@ pub const TmuxNotice = struct {
         try lib.checkGhosttyHEnum(Kind, "GHOSTTY_TMUX_NOTICE_");
     }
 };
+
+/// How current a tmux pane surface is with tmux. See
+/// `terminal.tmux.sink.PaneStatus`.
+pub const TmuxPaneStatus = terminal.tmux.sink.PaneStatus;
+
+test "ghostty.h TmuxPaneStatus" {
+    try lib.checkGhosttyHEnum(TmuxPaneStatus, "GHOSTTY_TMUX_PANE_");
+}
 
 pub const SearchSelected = struct {
     selected: ?usize,

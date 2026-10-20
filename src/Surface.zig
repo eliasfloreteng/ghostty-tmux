@@ -1219,6 +1219,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .tmux_pane_status => |status| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_pane_status,
+                status,
+            );
+        },
+
         .tmux_notice => |notice| tmux: {
             if (comptime !terminal.options.tmux_control_mode) break :tmux;
             defer notice.text.deinit();
