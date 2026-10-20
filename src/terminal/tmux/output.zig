@@ -23,11 +23,11 @@ pub fn parseFormatStruct(
     var it = std.mem.splitScalar(u8, str, delimiter);
     var result: T = undefined;
 
-    // A window name is any valid UTF-8, so it can contain the delimiter
-    // and cannot be split on it. Such a variable is only allowed last,
-    // where "the rest of the line" is unambiguous.
+    // A window or session name is any valid UTF-8, so it can contain the
+    // delimiter and cannot be split on it. Such a variable is only allowed
+    // last, where "the rest of the line" is unambiguous.
     const rest_last = fields.len > 0 and
-        @field(Variable, fields[fields.len - 1].name) == .window_name;
+        @field(Variable, fields[fields.len - 1].name).restOfLine();
 
     inline for (fields, 0..) |field, i| {
         const part = if (rest_last and i == fields.len - 1)
@@ -160,6 +160,13 @@ pub const Variable = enum {
     scroll_region_upper,
     /// Unique session ID prefixed with `$` (e.g., `$0`, `$42`).
     session_id,
+    /// Session name. Like `window_name`, it can hold the delimiter, so it
+    /// must be the last variable in a format.
+    session_name,
+    /// Number of windows in the session.
+    session_windows,
+    /// Number of clients attached to the session.
+    session_attached,
     /// Server version (e.g., `3.5a`).
     version,
     /// Unique window ID prefixed with `@` (e.g., `@0`, `@42`).
@@ -175,6 +182,11 @@ pub const Variable = enum {
     window_height,
     /// Whether a pane in this window is zoomed.
     window_zoomed_flag,
+    /// Our own window option, set while the user has hidden the window
+    /// from the GUI. A user option rather than anything of tmux's, so it
+    /// lives with the window on the server and is empty when unset. See
+    /// `Viewer.Window.hidden`.
+    @"@ghostty-hidden",
     /// Window layout description as it is actually displayed. Identical to
     /// `window_layout` unless a pane is zoomed, in which case it is a
     /// single leaf holding only the zoomed pane. Parse it for that pane
@@ -210,6 +222,7 @@ pub const Variable = enum {
             .origin_flag,
             .window_active,
             .window_zoomed_flag,
+            .@"@ghostty-hidden",
             .wrap_flag,
             => std.mem.eql(u8, value, "1"),
             .alternate_saved_x,
@@ -231,8 +244,11 @@ pub const Variable = enum {
                 try std.fmt.parseInt(usize, value[1..], 10)
             else
                 return error.FormatError,
-            .window_width => try std.fmt.parseInt(usize, value, 10),
-            .window_height => try std.fmt.parseInt(usize, value, 10),
+            .window_width,
+            .window_height,
+            .session_windows,
+            .session_attached,
+            => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
@@ -240,7 +256,18 @@ pub const Variable = enum {
             .window_layout,
             .window_visible_layout,
             .window_name,
+            .session_name,
             => value,
+        };
+    }
+
+    /// Whether this variable takes the rest of the line, delimiters and
+    /// all. Names are free text, so a format may hold at most one of
+    /// these, and only last. See `parseFormatStruct`.
+    pub fn restOfLine(self: Variable) bool {
+        return switch (self) {
+            .window_name, .session_name => true,
+            else => false,
         };
     }
 
@@ -249,6 +276,7 @@ pub const Variable = enum {
         return switch (self) {
             .window_active,
             .window_zoomed_flag,
+            .@"@ghostty-hidden",
             .alternate_on,
             .bracketed_paste,
             .client_readonly,
@@ -277,6 +305,8 @@ pub const Variable = enum {
             .pane_id,
             .window_width,
             .window_height,
+            .session_windows,
+            .session_attached,
             => usize,
             .cursor_colour,
             .cursor_shape,
@@ -285,6 +315,7 @@ pub const Variable = enum {
             .window_layout,
             .window_visible_layout,
             .window_name,
+            .session_name,
             => []const u8,
         };
     }

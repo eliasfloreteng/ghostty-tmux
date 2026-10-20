@@ -221,6 +221,34 @@ pub const Viewer = struct {
     /// 0 for tmux's own behaviour. See `Options.pause_after`.
     pause_after: u32 = 0,
 
+    /// How many lines of a pane's history to read, or null for all of
+    /// them. See `Options.history_limit`.
+    history_limit: ?u32 = null,
+
+    /// Whether tmux's paste buffers are passed on as they change. See
+    /// `Options.mirror_paste_buffers`.
+    mirror_paste_buffers: bool = false,
+
+    /// Client flags asked for on attach. See `Options.client_flags`.
+    client_flags: ClientFlags = .{},
+
+    /// Every session on the server, ours included, as of the last
+    /// `list-sessions`. Owned, names and all.
+    ///
+    /// Empty until something asks for it with `.list_sessions`: a GUI
+    /// that never shows other sessions should not pay a round trip on
+    /// attach and another on every session coming and going. Once asked
+    /// for, it is kept current: see `sessions_wanted`.
+    sessions: std.ArrayList(Session) = .empty,
+
+    /// Whether anything has asked for `sessions`. From then on it is
+    /// listed again whenever tmux says the set of sessions changed.
+    ///
+    /// tmux has no notification for a window opening or closing in a
+    /// session other than ours, so their window counts can go stale in
+    /// between. Asking again with `.list_sessions` refreshes them.
+    sessions_wanted: bool = false,
+
     /// Whether tmux has made this client read-only, by `attach -r` or
     /// `switch-client -r`. See `refuseReadOnly`.
     ///
@@ -306,7 +334,17 @@ pub const Viewer = struct {
         /// the prior one. Remember that for a given Viewer, window IDs
         /// are guaranteed to be stable. Additionally, tmux (as of Dec 2025)
         /// never reuses window IDs within a server process lifetime.
+        ///
+        /// The session list, `Viewer.sessions`, is part of what this
+        /// announces: a change to it is sent as one of these too.
         windows: []const Window,
+
+        /// One of tmux's paste buffers changed, and this is what it now
+        /// holds, for the system clipboard. Only with
+        /// `Options.mirror_paste_buffers`. The bytes are the buffer's,
+        /// exactly: not NUL terminated, not necessarily UTF-8, never
+        /// empty.
+        paste_buffer: []const u8,
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -321,7 +359,11 @@ pub const Viewer = struct {
                 inline for (info.fields) |u_field| {
                     if (self == @field(TagType, u_field.name)) {
                         const value = @field(self, u_field.name);
-                        switch (u_field.type) {
+                        // What the user copied is nobody's business,
+                        // least of all the log's.
+                        if (comptime std.mem.eql(u8, u_field.name, "paste_buffer")) {
+                            try writer.print("[{d} bytes]", .{value.len});
+                        } else switch (u_field.type) {
                             []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
                             // Window embeds ArenaAllocator.State; dumping
                             // `{any}` walks freed/poisoned arena nodes.
@@ -427,6 +469,17 @@ pub const Viewer = struct {
 
         kill_pane: KillPane,
 
+        /// Hide a window from the GUI, or show it again. See
+        /// `Window.hidden`.
+        hide_window: HideWindow,
+
+        /// Move this client to another session on the same server.
+        switch_session: SwitchSession,
+
+        /// Read the server's sessions into `sessions`, and keep them
+        /// current from now on. See `sessions_wanted`.
+        list_sessions: void,
+
         pub const Write = struct {
             pane_id: usize,
             data: []const u8,
@@ -493,6 +546,52 @@ pub const Viewer = struct {
         pub const KillPane = struct {
             pane_id: usize,
         };
+
+        pub const HideWindow = struct {
+            /// The tmux window, by id rather than by a pane in it: a
+            /// hidden window has no surface to ask from.
+            window_id: usize,
+            hidden: bool,
+        };
+
+        pub const SwitchSession = struct {
+            session_id: usize,
+        };
+    };
+
+    /// A session on the server we are attached to, ours or another.
+    pub const Session = struct {
+        id: usize,
+
+        /// Owned by the viewer's allocator.
+        name: []const u8,
+
+        /// How many windows it has.
+        windows: usize,
+
+        /// How many clients are attached to it, us included if it is
+        /// the one we are on.
+        attached: usize,
+    };
+
+    /// Flags for this client that change how tmux treats it, set with
+    /// `refresh-client -f` on attach. Each is off unless asked for.
+    pub const ClientFlags = packed struct {
+        /// The client has an active pane of its own, so moving between
+        /// panes here does not move the active pane every other client
+        /// sees. tmux still moves the window's shared active pane for a
+        /// split or a pane closing, and we follow that. See
+        /// `nextSelectPane`.
+        active_pane: bool = false,
+
+        /// When the session we are on is destroyed, tmux moves us to
+        /// another session if there is one rather than ending control
+        /// mode. It arrives as an ordinary session change.
+        no_detach_on_destroy: bool = false,
+
+        pub fn any(self: ClientFlags) bool {
+            return self.active_pane or self.no_detach_on_destroy;
+        }
     };
 
     pub const Window = struct {
@@ -534,6 +633,23 @@ pub const Viewer = struct {
         /// the GUI reads it in, and it cannot then disagree with the set
         /// it arrived with.
         active: bool = false,
+
+        /// Whether the user has hidden this window from the GUI. It is
+        /// still in the session and still running; it just has no tab.
+        ///
+        /// Kept in tmux, as a user option on the window
+        /// (`@ghostty-hidden`), rather than here: it then survives
+        /// detaching and attaching again, from this machine or another,
+        /// the way the user would expect of something they set on a
+        /// window. tmux sends no notification when an option changes,
+        /// so another client hiding a window shows here the next time
+        /// the window list is read.
+        ///
+        /// Nothing is read for a hidden window's panes, and nothing is
+        /// mirrored to anything displaying them: `attachPane` is for
+        /// panes that are shown. Showing the window again reads its panes
+        /// from scratch, as on attach. See `syncHidden`.
+        hidden: bool = false,
 
         width: usize,
         height: usize,
@@ -703,6 +819,29 @@ pub const Viewer = struct {
         /// means re-reading the pane and losing whatever scrolled past.
         /// Which of the two is worse belongs to the user.
         pause_after: u32 = 0,
+
+        /// How many lines of a pane's history to read when it is read
+        /// from scratch (on attach, for a new pane, and for one resumed
+        /// from a pause), counted back from the screen. Null reads all of
+        /// it; 0 reads none.
+        ///
+        /// The whole history of every pane is the largest thing an
+        /// attach reads by far, and over a slow link it is what the user
+        /// waits for. Whatever is left out stays in tmux; it is only not
+        /// in our scrollback.
+        history_limit: ?u32 = null,
+
+        /// Pass tmux's paste buffers on as `.paste_buffer` actions as
+        /// they change, so that copying in tmux (copy mode, or
+        /// `set-buffer` from a script) reaches the system clipboard.
+        /// Needs tmux 3.2, the first to announce buffer changes.
+        mirror_paste_buffers: bool = false,
+
+        /// Further client flags to ask tmux for on attach. Needs tmux
+        /// 3.2 for `refresh-client -f`; an older server is not asked. A
+        /// flag a newer tmux added and an older one does not know is
+        /// ignored by tmux without complaint.
+        client_flags: ClientFlags = .{},
     };
 
     pub fn init(
@@ -729,6 +868,9 @@ pub const Viewer = struct {
             .windows = .empty,
             .panes = .empty,
             .pause_after = opts.pause_after,
+            .history_limit = opts.history_limit,
+            .mirror_paste_buffers = opts.mirror_paste_buffers,
+            .client_flags = opts.client_flags,
             .paste_buffer = paste_buffer: {
                 var token: [8]u8 = undefined;
                 io.random(&token);
@@ -770,7 +912,26 @@ pub const Viewer = struct {
         if (self.session_name.len > 0) {
             self.alloc.free(self.session_name);
         }
+        self.clearSessions();
+        self.sessions.deinit(self.alloc);
         self.action_arena.promote(self.alloc).deinit();
+    }
+
+    /// The options this viewer was made with. They come from the user's
+    /// config, not from the session, so a session change carries them
+    /// over.
+    fn options(self: *const Viewer) Options {
+        return .{
+            .pause_after = self.pause_after,
+            .history_limit = self.history_limit,
+            .mirror_paste_buffers = self.mirror_paste_buffers,
+            .client_flags = self.client_flags,
+        };
+    }
+
+    fn clearSessions(self: *Viewer) void {
+        for (self.sessions.items) |session| self.alloc.free(session.name);
+        self.sessions.clearRetainingCapacity();
     }
 
     /// Remember the session's name, replacing the one we had.
@@ -807,6 +968,9 @@ pub const Viewer = struct {
             .split => self.nextSplit(input.split),
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
+            .hide_window => self.nextHideWindow(input.hide_window),
+            .switch_session => self.nextSwitchSession(input.switch_session),
+            .list_sessions => self.nextListSessions(),
         };
     }
 
@@ -844,6 +1008,13 @@ pub const Viewer = struct {
             .detach,
             => return null,
 
+            // Also what a read-only client may do: tmux lets its keys
+            // run `switch-client`, and reading the session list is only
+            // looking.
+            .switch_session,
+            .list_sessions,
+            => return null,
+
             // Side effects of the GUI, not something the user asked
             // tmux for: a surface being laid out or focused. Nothing to
             // tell them, and focus still moves here, just not in tmux.
@@ -874,6 +1045,11 @@ pub const Viewer = struct {
             .split,
             .kill_windows,
             .kill_pane,
+            => return self.singleAction(.{ .notice = refusal }),
+
+            // Only our view of the session, but kept on the window in
+            // tmux, where every other client of ours would see it.
+            .hide_window,
             => return self.singleAction(.{ .notice = refusal }),
         }
     }
@@ -1570,6 +1746,12 @@ pub const Viewer = struct {
             return &.{};
         };
 
+        // With an active pane of our own, a select moves only ours, and
+        // tmux says nothing about it: no answer is coming, and waiting
+        // for one would mistake the next move of the window's shared
+        // active pane for it.
+        if (self.client_flags.active_pane) return actions;
+
         // Remembered once it is on its way, so the answer is known for
         // what it is.
         if (self.selects_unanswered_len == self.selects_unanswered.len) {
@@ -1784,6 +1966,257 @@ pub const Viewer = struct {
             log.warn("failed to queue kill for pane id={}", .{k.pane_id});
             return &.{};
         };
+    }
+
+    /// Hide a window from the GUI, or show it again.
+    ///
+    /// Set on the window in tmux and then read back, rather than changed
+    /// here first: the window list that answers is what carries it to the
+    /// GUI, through the same comparison as any other list (`syncHidden`).
+    /// Changed here first, a list already on its way when the user asked
+    /// would land after the change and quietly undo it.
+    fn nextHideWindow(self: *Viewer, req: Input.HideWindow) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        for (self.windows.items) |w| {
+            if (w.id == req.window_id) break;
+        } else {
+            log.info("hide of unknown window id={}, dropping", .{req.window_id});
+            return &.{};
+        }
+
+        // `-u` unsets rather than setting it to 0: a window nobody ever
+        // hid should look the same in tmux as one that was shown again.
+        const set = (if (req.hidden)
+            self.userCommand("set-option -w -t @{d} @ghostty-hidden 1\n", .{req.window_id})
+        else
+            self.userCommand("set-option -w -u -t @{d} @ghostty-hidden\n", .{req.window_id})) catch {
+            log.warn("failed to queue hiding window id={}", .{req.window_id});
+            return &.{};
+        };
+
+        return self.queueUserCommands(&.{ set, .list_windows }) catch {
+            log.warn("failed to queue hiding window id={}", .{req.window_id});
+            return &.{};
+        };
+    }
+
+    /// Move to another session.
+    ///
+    /// tmux answers with `%session-changed`, which starts this viewer
+    /// over for that session (`sessionChanged`), as when anything else
+    /// moves this client. Asking for the session we are already on is
+    /// harmless: tmux announces it the same way, and the session's
+    /// windows are read again.
+    fn nextSwitchSession(self: *Viewer, req: Input.SwitchSession) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        // Quoted: unquoted, tmux would read `$3` as an environment
+        // variable.
+        return self.queueUserCommand("switch-client -t '${d}'\n", .{
+            req.session_id,
+        }) catch {
+            log.warn("failed to queue switch to session id={}", .{req.session_id});
+            return &.{};
+        };
+    }
+
+    /// Read the server's sessions, and keep reading them as they change.
+    fn nextListSessions(self: *Viewer) []const Action {
+        if (self.state != .command_queue) return &.{};
+        self.sessions_wanted = true;
+
+        return self.queueUserCommands(&.{.list_sessions}) catch {
+            log.warn("failed to queue list-sessions", .{});
+            return &.{};
+        };
+    }
+
+    /// Read the session list again, if anything wants it.
+    fn sessionsChanged(self: *Viewer) Allocator.Error!void {
+        if (!self.sessions_wanted) return;
+        try self.queueCommands(&.{.list_sessions});
+    }
+
+    /// The longest paste buffer we mirror, in bytes.
+    ///
+    /// A buffer arrives inside a `%begin` block, and a block line longer
+    /// than `control.Parser.max_line_bytes` (1 MiB) ends the session. A
+    /// buffer with no newline is one line, and every control byte in it
+    /// is written as four (see `Command.paste_buffer`), so this leaves
+    /// room for the worst case. tmux is asked to leave out anything
+    /// longer rather than send it.
+    pub const max_mirrored_buffer_bytes = 192 * 1024;
+
+    /// One of tmux's paste buffers changed: read it, for the clipboard.
+    fn pasteBufferChanged(self: *Viewer, name: []const u8) Allocator.Error!void {
+        if (!self.mirror_paste_buffers) return;
+
+        // Our own pastes go through a buffer, and so do every other
+        // ghostty's. Those hold something being pasted, which came from
+        // a clipboard in the first place.
+        if (std.mem.startsWith(u8, name, paste_buffer_prefix)) return;
+
+        // The name goes into a format inside a quoted argument (see
+        // `Command.paste_buffer`). tmux's own names (`buffer0`) and any
+        // sensible one fit in this; anything else is not worth the
+        // escaping it would take.
+        for (name) |c| switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {},
+            else => {
+                log.info("not mirroring a paste buffer with an unusual name", .{});
+                return;
+            },
+        };
+        if (name.len == 0) return;
+
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.queueCommands(&.{.{ .paste_buffer = owned }});
+    }
+
+    /// The paste buffer asked for by `pasteBufferChanged`, as
+    /// `Command.paste_buffer` frames and escapes it.
+    fn receivedPasteBuffer(
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        content: []const u8,
+    ) Allocator.Error!void {
+        // Nothing at all: the buffer was deleted before we asked, or is
+        // too long to mirror and tmux left it out.
+        if (content.len < 2 or content[0] != '>' or content[content.len - 1] != '<') {
+            log.debug("paste buffer gone or too long, not mirrored", .{});
+            return;
+        }
+
+        // Empty between the markers is also a tmux too old to have
+        // `buffer_full`, which expands to nothing. Either way there is
+        // nothing to put on the clipboard, and putting nothing there
+        // would wipe what the user had.
+        const escaped = content[1 .. content.len - 1];
+        if (escaped.len == 0) return;
+
+        const buf = try arena_alloc.alloc(u8, escaped.len);
+        try actions.append(arena_alloc, .{
+            .paste_buffer = control.unescape(buf, escaped),
+        });
+    }
+
+    fn receivedSessions(
+        self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        content: []const u8,
+    ) !void {
+        var sessions: std.ArrayList(Session) = .empty;
+        defer sessions.deinit(self.alloc);
+        errdefer for (sessions.items) |s| self.alloc.free(s.name);
+
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
+            const data = output.parseFormatStruct(
+                Format.list_sessions.Struct(),
+                line,
+                Format.list_sessions.delim,
+            ) catch |err| {
+                log.info("failed to parse list-sessions line: {s}", .{line});
+                return err;
+            };
+
+            const name = try self.alloc.dupe(u8, data.session_name);
+            errdefer self.alloc.free(name);
+            try sessions.append(self.alloc, .{
+                .id = data.session_id,
+                .name = name,
+                .windows = data.session_windows,
+                .attached = data.session_attached,
+            });
+        }
+
+        // Swapped rather than copied, so the old list and its names are
+        // what `sessions` frees on the way out.
+        self.clearSessions();
+        std.mem.swap(std.ArrayList(Session), &self.sessions, &sessions);
+
+        // The session list is part of what the window list announces.
+        try actions.append(arena_alloc, .{ .windows = self.windows.items });
+    }
+
+    /// Whether `pane_id` is in a window of `windows` that is hidden.
+    fn paneHiddenIn(windows: []const Window, pane_id: usize) bool {
+        for (windows) |w| {
+            if (w.hidden and layoutContainsPane(w.layout, pane_id)) return true;
+        }
+        return false;
+    }
+
+    /// Whether `pane_id` is in a hidden window, and so should not be
+    /// displayed. See `Window.hidden`.
+    pub fn paneHidden(self: *const Viewer, pane_id: usize) bool {
+        return paneHiddenIn(self.windows.items, pane_id);
+    }
+
+    /// Act on the windows a new window list hides or shows, compared to
+    /// the list we have. Called before the new list replaces ours.
+    ///
+    /// A window going hidden has its panes' displays told they are gone:
+    /// the GUI drops the tab, and nothing goes on buffering output for a
+    /// display that will never take it. The panes themselves stay, since
+    /// tmux still has them.
+    ///
+    /// A window shown again has its panes read from scratch, exactly as
+    /// on attach. Nothing was mirrored while it was hidden, and its
+    /// displays are new and empty; the captures are queued before the
+    /// window list that tells the GUI to build them goes out, so their
+    /// replies reach the displays (see `attachPane`). Panes new to us are
+    /// left to `syncLayouts`, which captures every new pane.
+    fn syncHidden(self: *Viewer, windows: []const Window) Allocator.Error!void {
+        var reread = false;
+        for (windows) |new| {
+            const old = for (self.windows.items) |w| {
+                if (w.id == new.id) break w;
+            } else continue;
+            if (old.hidden == new.hidden) continue;
+
+            log.info("tmux window id={} hidden={}", .{ new.id, new.hidden });
+            if (new.hidden) {
+                self.detachLayout(new.layout);
+            } else {
+                if (try self.captureLayout(new.layout)) reread = true;
+            }
+        }
+        if (reread) try self.queueCommands(&.{.pane_state});
+    }
+
+    /// Stop mirroring every pane in a layout.
+    fn detachLayout(self: *Viewer, node: Layout) void {
+        switch (node.content) {
+            .pane => |id| self.detachPane(id),
+            .horizontal, .vertical => |children| for (children) |child| {
+                self.detachLayout(child);
+            },
+        }
+    }
+
+    /// Queue captures for every pane in a layout that we already have.
+    /// Returns whether it queued any.
+    fn captureLayout(self: *Viewer, node: Layout) Allocator.Error!bool {
+        switch (node.content) {
+            .pane => |id| {
+                if (!self.panes.contains(id)) return false;
+                try self.queueCommands(&paneCaptures(id));
+                return true;
+            },
+            .horizontal, .vertical => |children| {
+                var any = false;
+                for (children) |child| {
+                    if (try self.captureLayout(child)) any = true;
+                }
+                return any;
+            },
+        }
     }
 
     /// Queue a command for tmux, returning the action that sends it.
@@ -2328,11 +2761,12 @@ pub const Viewer = struct {
                 log.warn("failed to handle window change", .{});
             },
 
-            // We ignore this one. It means a session was created or
-            // destroyed. If it was our own session we will get an exit
-            // notification very soon. If it is another session we don't
-            // care.
-            .sessions_changed => {},
+            // A session was created or destroyed. If it was our own we
+            // will get an exit notification very soon. Otherwise it only
+            // matters to the session list, if anything is keeping one.
+            .sessions_changed => self.sessionsChanged() catch {
+                log.warn("failed to queue list-sessions", .{});
+            },
 
             // Update the name in place rather than re-listing: a rename
             // changes nothing else, and a round trip per keystroke of
@@ -2348,9 +2782,12 @@ pub const Viewer = struct {
 
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.
+            // The session list counts attached clients, though.
             .client_detached,
             .client_session_changed,
-            => {},
+            => self.sessionsChanged() catch {
+                log.warn("failed to queue list-sessions", .{});
+            },
 
             // For the user, not for us.
             .message,
@@ -2364,11 +2801,15 @@ pub const Viewer = struct {
                 ) catch log.warn("failed to report a tmux notice", .{});
             },
 
-            // tmux's paste buffers are not mirrored anywhere yet, so a
-            // change to one is nothing to us.
-            .paste_buffer_changed,
-            .paste_buffer_deleted,
-            => {},
+            // Read for the clipboard, if the user asked for that. A
+            // buffer going away leaves the clipboard as it is: the user
+            // copied it, and still has it.
+            .paste_buffer_changed => |info| self.pasteBufferChanged(
+                info.name,
+            ) catch {
+                log.warn("failed to queue reading a paste buffer", .{});
+            },
+            .paste_buffer_deleted => {},
 
             // A pane entering or leaving copy mode (or any other mode).
             // tmux does not send a control client what the mode looks
@@ -2631,6 +3072,9 @@ pub const Viewer = struct {
                 const pane_id: usize = kv.key_ptr.*;
                 if (self.panes.contains(pane_id)) continue;
                 added = true;
+
+                // Read when the window is shown. See `Window.hidden`.
+                if (paneHiddenIn(windows, pane_id)) continue;
                 try self.queueCommands(&paneCaptures(pane_id));
             }
 
@@ -2686,9 +3130,7 @@ pub const Viewer = struct {
         // Build up a new viewer. Its the easiest way to reset ourselves.
         // Options carry over: they came from the user's config, not from
         // the session that just ended.
-        var replacement: Viewer = try .init(self.io, self.alloc, .{
-            .pause_after = self.pause_after,
-        });
+        var replacement: Viewer = try .init(self.io, self.alloc, self.options());
         errdefer replacement.deinit();
 
         // Not a fact about the session: `switch-client -r` is how tmux
@@ -2696,6 +3138,12 @@ pub const Viewer = struct {
         replacement.read_only = self.read_only;
         replacement.read_only_noticed = self.read_only_noticed;
         replacement.read_only_untold = self.read_only_untold;
+
+        // The server's sessions, which are still the same ones, and
+        // whether anything wants them. Read again below, since which
+        // session we are attached to is part of it.
+        std.mem.swap(std.ArrayList(Session), &replacement.sessions, &self.sessions);
+        replacement.sessions_wanted = self.sessions_wanted;
 
         // Our actions must start out empty so we don't mix arenas
         assert(actions.items.len == 0);
@@ -2709,6 +3157,7 @@ pub const Viewer = struct {
         // Setup our command queue and put ourselves in the command queue
         // state. The list is sent by the caller's flush.
         try replacement.queueCommands(&.{ .client_readonly, .list_windows });
+        try replacement.sessionsChanged();
         replacement.state = .command_queue;
 
         // Everything we sent for the old session is still going to be
@@ -2745,6 +3194,7 @@ pub const Viewer = struct {
         session_id: usize,
         name: []const u8,
     ) Allocator.Error!void {
+        try self.sessionsChanged();
         if (session_id != self.session_id) return;
         if (std.mem.eql(u8, self.session_name, name)) return;
         try self.setSessionName(name);
@@ -2854,6 +3304,19 @@ pub const Viewer = struct {
             .client_readonly => self.receivedReadOnly(
                 std.mem.eql(u8, std.mem.trim(u8, content, " \t\r\n"), "1"),
             ),
+
+            .client_flags => if (is_err) log.warn(
+                "tmux refused our client flags: {s}",
+                .{std.mem.trim(u8, content, " \t\r\n")},
+            ),
+
+            .list_sessions => if (!is_err) {
+                try self.receivedSessions(arena_alloc, actions, content);
+            },
+
+            .paste_buffer => if (!is_err) {
+                try receivedPasteBuffer(arena_alloc, actions, content);
+            },
         }
     }
 
@@ -2884,6 +3347,13 @@ pub const Viewer = struct {
         // error rather than ignoring it.
         if (self.pause_after > 0 and self.tmuxVersionAtLeast(3, 2)) {
             try self.queueCommands(&.{.{ .pause_after = self.pause_after }});
+        }
+
+        // The same command and the same version, but on their own: a
+        // flag tmux does not know is ignored, and pause-after is not
+        // held up by one of these.
+        if (self.client_flags.any() and self.tmuxVersionAtLeast(3, 2)) {
+            try self.queueCommands(&.{.{ .client_flags = self.client_flags }});
         }
     }
 
@@ -2981,6 +3451,7 @@ pub const Viewer = struct {
                 .id = data.window_id,
                 .name = name,
                 .active = data.window_active,
+                .hidden = data.@"@ghostty-hidden",
                 .active_pane_id = data.pane_id,
                 .zoomed_pane_id = if (data.window_zoomed_flag) zoomedPane(
                     window_alloc,
@@ -2993,6 +3464,9 @@ pub const Viewer = struct {
                 .layout = layout,
             });
         }
+
+        // While ours is still the old list, to compare against.
+        try self.syncHidden(windows.items);
 
         // Sync into self.windows first. The `.windows` action must point at
         // `self.windows.items` (stable for the duration of next()), not the
@@ -3368,7 +3842,7 @@ pub const Viewer = struct {
             if (i < self.commands_sent) continue;
 
             var builder: std.Io.Writer.Allocating = .init(alloc);
-            command.formatCommand(&builder.writer) catch
+            command.formatCommand(&builder.writer, self.history_limit) catch
                 return error.OutOfMemory;
             try actions.append(alloc, .{ .command = builder.writer.buffered() });
         }
@@ -3561,6 +4035,17 @@ const Command = union(enum) {
     /// bound. The payload is the age in seconds.
     pause_after: u32,
 
+    /// Ask tmux for the user's other client flags. See
+    /// `Viewer.ClientFlags`.
+    client_flags: Viewer.ClientFlags,
+
+    /// List the server's sessions. See `Viewer.sessions`.
+    list_sessions,
+
+    /// Read a paste buffer, by name (owned), for the clipboard. See
+    /// `Viewer.pasteBufferChanged`.
+    paste_buffer: []const u8,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -3575,17 +4060,23 @@ const Command = union(enum) {
             .tmux_version,
             .client_readonly,
             .pause_after,
+            .client_flags,
+            .list_sessions,
             => {},
-            .user => |v| alloc.free(v),
+            .user, .paste_buffer => |v| alloc.free(v),
         };
     }
 
     /// Format the command into the command that should be executed
     /// by tmux. Trailing newlines are appended so this can be sent as-is
     /// to tmux.
+    ///
+    /// `history_limit` is `Viewer.history_limit`, the one thing about how
+    /// a command is written that is up to the user.
     pub fn formatCommand(
         self: Command,
         writer: *std.Io.Writer,
+        history_limit: ?u32,
     ) std.Io.Writer.Error!void {
         switch (self) {
             // `-f` sets client flags; `pause-after=N` is the one that
@@ -3602,7 +4093,21 @@ const Command = union(enum) {
                 .{comptime Format.list_windows.comptimeFormat()},
             )),
 
-            .pane_history => |id| try writer.print(
+            // Nothing to read, but the reply still has to come, in its
+            // place, for the history to be cleared exactly as when there
+            // is some (`receivedPaneHistory`). A capture cannot ask for
+            // no lines at all -- tmux swaps an empty range around into a
+            // line -- so this asks for an empty line instead.
+            .pane_history => |id| if (history_limit == 0) try writer.print(
+                "display-message -p -t %{d} ''\n",
+                .{id},
+            ) else if (history_limit) |lines| try writer.print(
+                // As below, but from `lines` back from the screen rather
+                // than from the top of the history. A pane with less
+                // history than that gives all of it.
+                "capture-pane -p -e -C -q -S -{d} -E -1 -t %{d}\n",
+                .{ lines, id },
+            ) else try writer.print(
                 // -p = output to stdout instead of buffer
                 // -e = output escape sequences for SGR
                 // -C = escape non-printable bytes as octal. Mandatory
@@ -3652,6 +4157,55 @@ const Command = union(enum) {
 
             .client_readonly => try writer.writeAll(
                 "display-message -p '#{client_readonly}'\n",
+            ),
+
+            // tmux's names for the flags, comma separated (tmux
+            // server-client.c, `server_client_set_flags`).
+            .client_flags => |flags| {
+                try writer.writeAll("refresh-client -f ");
+                var sep: []const u8 = "";
+                if (flags.active_pane) {
+                    try writer.print("{s}active-pane", .{sep});
+                    sep = ",";
+                }
+                if (flags.no_detach_on_destroy) {
+                    try writer.print("{s}no-detach-on-destroy", .{sep});
+                    sep = ",";
+                }
+                try writer.writeByte('\n');
+            },
+
+            .list_sessions => try writer.writeAll(std.fmt.comptimePrint(
+                "list-sessions -F '{s}'\n",
+                .{comptime Format.list_sessions.comptimeFormat()},
+            )),
+
+            // A buffer is read through a format, not with `show-buffer`,
+            // because tmux does not escape a block's payload: a buffer
+            // holding an escape sequence -- anything copied from a
+            // colourful program -- would arrive raw, and a raw ESC, CAN or
+            // SUB ends the DCS that carries control mode. So the format
+            // escapes exactly those, in the octal `control.unescape`
+            // reads, after the backslash itself so that a literal `\033`
+            // in the buffer survives. `%` is escaped too, so that no line
+            // of a multi-line buffer can start `%end` and end the block
+            // early. ESC, CAN and SUB go into the pattern as themselves:
+            // POSIX regexes have no escape for them, and inside single
+            // quotes tmux takes every byte literally.
+            //
+            // `>` and `<` frame the content, since the parser trims the
+            // block's trailing newlines and an empty block cannot be told
+            // from an empty buffer otherwise. The filter picks the buffer
+            // and leaves it out if it is too long to read safely (see
+            // `Viewer.max_mirrored_buffer_bytes`). Names are restricted to
+            // characters that mean nothing in a format before we get here.
+            .paste_buffer => |name| try writer.print(
+                "list-buffers -f '#{{&&:#{{==:#{{buffer_name}},{s}}},#{{e|<=:#{{buffer_size}},{d}}}}}' -F '>{s}<'\n",
+                .{
+                    name,
+                    Viewer.max_mirrored_buffer_bytes,
+                    "#{s/\\\\/\\\\\\\\/;s/%/\\\\045/;s/\x1b/\\\\033/;s/\x18/\\\\030/;s/\x1a/\\\\032/:buffer_full}",
+                },
             ),
 
             .user => |v| try writer.writeAll(v),
@@ -3721,6 +4275,7 @@ const Format = struct {
             .window_layout,
             .window_zoomed_flag,
             .window_visible_layout,
+            .@"@ghostty-hidden",
             // For a window, this is its active pane.
             .pane_id,
             // Last on purpose: a window name can contain spaces, so it
@@ -3732,6 +4287,17 @@ const Format = struct {
     const tmux_version: Format = .{
         .delim = ' ',
         .vars = &.{ .version, .client_readonly },
+    };
+
+    const list_sessions: Format = .{
+        .delim = ' ',
+        .vars = &.{
+            .session_id,
+            .session_windows,
+            .session_attached,
+            // Last: it can contain spaces.
+            .session_name,
+        },
     };
 
     /// The format string, available at comptime.
@@ -3884,7 +4450,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$1 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] %0
+                \\$1 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3960,7 +4526,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$2 @1 0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] %0
+                \\$2 @1 0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4015,7 +4581,7 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] %0
+                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 %0
                 ,
             } },
             .contains_tags = &.{.windows},
@@ -4125,7 +4691,7 @@ test "capture replay decodes escaped escape sequences" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 80 24 b25d,80x24,0,0,0 0 b25d,80x24,0,0,0 %0
+                \\$0 @0 1 80 24 b25d,80x24,0,0,0 0 b25d,80x24,0,0,0 0 %0
                 ,
             } },
             .check_command = (struct {
@@ -4193,7 +4759,7 @@ test "layout change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4261,7 +4827,7 @@ test "layout_change does not wait for commands already in flight" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4325,7 +4891,7 @@ test "layout_change returns command when queue was empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4390,7 +4956,7 @@ test "window_add queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4449,7 +5015,7 @@ test "window_add queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4506,7 +5072,7 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] 0 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] %0
+                \\$0 @0 1 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] 0 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4716,7 +5282,7 @@ test "pane state ignores out of bounds scroll region" {
         .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{
             .input = .{ .tmux = .{
-                .block_end = "$0 @0 1 80 24 b25d,80x24,0,0,0 0 b25d,80x24,0,0,0 %0",
+                .block_end = "$0 @0 1 80 24 b25d,80x24,0,0,0 0 b25d,80x24,0,0,0 0 %0",
             } },
             .contains_tags = &.{ .windows, .command },
         },
@@ -4786,7 +5352,7 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
 
         // Window and pane layout.
         "%begin 3 3 0\n" ++
-        "$42 @0 1 80 24 d962,80x24,0,0,42 0 d962,80x24,0,0,42 %42\n" ++
+        "$42 @0 1 80 24 d962,80x24,0,0,42 0 d962,80x24,0,0,42 0 %42\n" ++
         "%end 3 3 0\n" ++
 
         // History, which is always the primary screen's.
@@ -4851,7 +5417,7 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
                         );
                         command_index += 1;
                     },
-                    .windows, .notice => {},
+                    .windows, .notice, .paste_buffer => {},
                     .exit => {
                         return error.UnexpectedViewerExit;
                     },
@@ -4930,7 +5496,7 @@ test "write sends keys to the target pane" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -4987,7 +5553,7 @@ test "a write does not wait for commands in flight" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -5057,7 +5623,7 @@ test "write to an unknown pane is dropped" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -5285,7 +5851,7 @@ fn testSinglePaneSteps() []const TestStep {
         .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
             ,
         } } },
         // The three capture replies, for a blank pane on its primary
@@ -5324,7 +5890,7 @@ fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
         } } } },
         .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{ .input = .{ .tmux = .{
-            .block_end = "$0 @0 1 83 44 " ++ layout ++ " 0 " ++ layout ++ " %0",
+            .block_end = "$0 @0 1 83 44 " ++ layout ++ " 0 " ++ layout ++ " 0 %0",
         } } },
         // The capture replies for each pane, both blank and on their
         // primary screens.
@@ -6015,9 +6581,9 @@ fn testThreeWindowSteps() []const TestStep {
         .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
-            \\$0 @5 0 83 44 b7de,83x44,0,0,1 0 b7de,83x44,0,0,1 %1
-            \\$0 @9 0 83 44 b7df,83x44,0,0,2 0 b7df,83x44,0,0,2 %2
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
+            \\$0 @5 0 83 44 b7de,83x44,0,0,1 0 b7de,83x44,0,0,1 0 %1
+            \\$0 @9 0 83 44 b7df,83x44,0,0,2 0 b7df,83x44,0,0,2 0 %2
             ,
         } } },
         // The capture replies for each pane, then pane_state.
@@ -6364,7 +6930,7 @@ test "a window already zoomed when we attach arrives zoomed" {
         .{
             .input = .{ .tmux = .{
                 .block_end = "$0 @0 1 83 44 " ++ two_panes_vertical ++
-                    " 1 " ++ zoomed_to_pane_1 ++ " %0",
+                    " 1 " ++ zoomed_to_pane_1 ++ " 0 %0",
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
@@ -6564,7 +7130,7 @@ test "an old tmux sizes windows the old way" {
         .{ .input = .{ .tmux = .{ .block_end = "3.3a 0" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
             ,
         } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
@@ -7079,7 +7645,7 @@ test "layout change resizes a surviving pane" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
                 ,
             } },
             .check = (struct {
@@ -7134,7 +7700,7 @@ test "list-windows windows action outlives the parse" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] %0
+                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 %0
                 ,
             } },
             .contains_tags = &.{.windows},
@@ -7520,7 +8086,7 @@ test "the active pane comes from the window list" {
         .{
             .input = .{ .tmux = .{
                 .block_end = "$0 @0 1 83 44 " ++ two_panes_vertical ++
-                    " 0 " ++ two_panes_vertical ++ " %1",
+                    " 0 " ++ two_panes_vertical ++ " 0 %1",
             } },
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
@@ -7643,7 +8209,7 @@ test "a read-only client watches but does not touch the session" {
     try testing.expect(viewer.read_only);
     {
         const actions = viewer.next(.{ .tmux = .{
-            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0",
         } });
         const notices = testNotices(actions, &buf);
         try testing.expectEqual(1, notices.len);
@@ -7717,7 +8283,7 @@ test "a read-only client watches but does not touch the session" {
     try testing.expect(!viewer.read_only);
     {
         const actions = viewer.next(.{ .tmux = .{
-            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0",
         } });
         const notices = testNotices(actions, &buf);
         try testing.expectEqual(1, notices.len);
@@ -7752,7 +8318,7 @@ test "a writable client is not told it is writable" {
         &buf,
     ).len);
     const actions = viewer.next(.{ .tmux = .{
-        .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+        .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0",
     } });
     try testing.expectEqual(0, testNotices(actions, &buf).len);
     try testing.expect(!viewer.read_only);
@@ -7770,7 +8336,7 @@ test "a read-only client may still detach" {
         } } } },
         .{ .input = .{ .tmux = .{ .block_end = "3.5a 1" } } },
         .{ .input = .{ .tmux = .{
-            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+            .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0",
         } } },
     });
     try testing.expect(viewer.read_only);
@@ -7799,4 +8365,434 @@ test "a split names the side the new pane goes" {
             .{ .input = .{ .tmux = .{ .block_end = "" } } },
         });
     }
+}
+
+test "hiding a window is kept in tmux and read back" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try viewer.attachPane(0, mirror.sink());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Set on the window, then the list read again: the list is what
+        // tells the GUI.
+        .{
+            .input = .{ .hide_window = .{ .window_id = 0, .hidden = true } },
+            .commands = &.{
+                "set-option -w -t @0 @ghostty-hidden 1\n",
+                "list-windows",
+            },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 1 %0
+                ,
+            } },
+            .contains_tags = &.{.windows},
+            // Nothing is read for a pane nobody is shown.
+            .commands = &.{},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.windows.items[0].hidden);
+                    try testing.expect(v.paneHidden(0));
+
+                    // Its display was told it is gone; the pane is not.
+                    const pane = v.panes.get(0).?;
+                    try testing.expect(pane.sink == null);
+                }
+            }).check,
+        },
+
+        // Shown again: unset rather than set to 0, and read from scratch
+        // once the list says so.
+        .{
+            .input = .{ .hide_window = .{ .window_id = 0, .hidden = false } },
+            .commands = &.{
+                "set-option -w -u -t @0 @ghostty-hidden\n",
+                "list-windows",
+            },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
+                ,
+            } },
+            .contains_tags = &.{.windows},
+            .commands = &.{
+                "capture-pane -p -e -C -q -S - -E -1 -t %0\n",
+                "capture-pane -p -e -C -a -t %0\n",
+                "capture-pane -p -e -C -q -t %0\n",
+                "list-panes",
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(!v.windows.items[0].hidden);
+                    try testing.expect(!v.paneHidden(0));
+                }
+            }).check,
+        },
+    });
+}
+
+test "a window hidden before we attach is not read" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
+                \\$0 @1 0 83 44 b7de,83x44,0,0,1 0 b7de,83x44,0,0,1 1 %1
+                ,
+            } },
+            .commands = &.{
+                "capture-pane -p -e -C -q -S - -E -1 -t %0\n",
+                "capture-pane -p -e -C -a -t %0\n",
+                "capture-pane -p -e -C -q -t %0\n",
+                "list-panes",
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Still tracked: tmux has it, and showing it reads it.
+                    try testing.expectEqual(2, v.panes.count());
+                    try testing.expect(v.paneHidden(1));
+                    try testing.expect(!v.paneHidden(0));
+                }
+            }).check,
+        },
+    });
+}
+
+test "hiding a window we do not have is dropped" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .hide_window = .{ .window_id = 7, .hidden = true } },
+            .commands = &.{},
+        },
+    });
+}
+
+test "a read-only client may switch sessions but not hide windows" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 1" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end =
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
+            ,
+        } } },
+        .{
+            .input = .{ .hide_window = .{ .window_id = 0, .hidden = true } },
+            .contains_tags = &.{.notice},
+            .commands = &.{},
+        },
+        .{
+            .input = .{ .switch_session = .{ .session_id = 2 } },
+            .commands = &.{"switch-client -t '$2'\n"},
+        },
+        .{
+            .input = .list_sessions,
+            .commands = &.{"list-sessions -F"},
+        },
+    });
+}
+
+test "switching session names it by id" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .switch_session = .{ .session_id = 3 } },
+            .commands = &.{"switch-client -t '$3'\n"},
+        },
+    });
+}
+
+test "the session list is read when asked for, and kept current" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Nobody has asked yet, so sessions coming and going is nothing.
+        .{ .input = .{ .tmux = .sessions_changed }, .commands = &.{} },
+
+        .{
+            .input = .list_sessions,
+            .commands = &.{
+                "list-sessions -F '#{session_id} #{session_windows} #{session_attached} #{session_name}'\n",
+            },
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$1 1 1 test
+                \\$4 3 0 has spaces in it
+                ,
+            } },
+            .contains_tags = &.{.windows},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(2, v.sessions.items.len);
+                    try testing.expectEqual(1, v.sessions.items[0].id);
+                    try testing.expectEqual(1, v.sessions.items[0].attached);
+                    try testing.expectEqual(4, v.sessions.items[1].id);
+                    try testing.expectEqual(3, v.sessions.items[1].windows);
+                    try testing.expectEqualStrings(
+                        "has spaces in it",
+                        v.sessions.items[1].name,
+                    );
+                }
+            }).check,
+        },
+
+        // Asked for once, followed from then on.
+        .{
+            .input = .{ .tmux = .sessions_changed },
+            .commands = &.{"list-sessions -F"},
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "$1 1 1 test" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, v.sessions.items.len);
+                }
+            }).check,
+        },
+
+        // A session change keeps the list, and reads it again.
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 4,
+                .name = "has spaces in it",
+            } } },
+            .commands = &.{
+                "display-message -p '#{client_readonly}'\n",
+                "list-windows",
+                "list-sessions -F",
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.sessions_wanted);
+                    try testing.expectEqual(1, v.sessions.items.len);
+                }
+            }).check,
+        },
+    });
+}
+
+test "a changed paste buffer is read for the clipboard" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .mirror_paste_buffers = true,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .paste_buffer_changed = .{ .name = "buffer0" } } },
+            .commands = &.{
+                "list-buffers -f '#{&&:#{==:#{buffer_name},buffer0},#{e|<=:#{buffer_size},196608}}' -F '>#{s/\\\\/\\\\\\\\/;s/%/\\\\045/;s/\x1b/\\\\033/;s/\x18/\\\\030/;s/\x1a/\\\\032/:buffer_full}<'\n",
+            },
+        },
+
+        // Escaped as the format asks: the ESC, a literal backslash, and
+        // a line that would otherwise have ended the block.
+        .{
+            .input = .{ .tmux = .{
+                .block_end = ">red \\033[31mtext\\033[m a\\\\b\n\\045end 1 2 1\n<",
+            } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| switch (action) {
+                        .paste_buffer => |data| {
+                            try testing.expectEqualStrings(
+                                "red \x1b[31mtext\x1b[m a\\b\n%end 1 2 1\n",
+                                data,
+                            );
+                            return;
+                        },
+                        else => {},
+                    };
+                    return error.TestExpectedPasteBuffer;
+                }
+            }).check,
+        },
+
+        // Our own pastes, and names we would have to escape, are not read.
+        .{
+            .input = .{ .tmux = .{ .paste_buffer_changed = .{
+                .name = "ghostty-paste-0123456789abcdef",
+            } } },
+            .commands = &.{},
+        },
+        .{
+            .input = .{ .tmux = .{ .paste_buffer_changed = .{ .name = "it's" } } },
+            .commands = &.{},
+        },
+
+        // Gone before we asked, or too long to ask for: nothing, rather
+        // than an empty clipboard.
+        .{
+            .input = .{ .tmux = .{ .paste_buffer_changed = .{ .name = "buffer1" } } },
+            .contains_command = "list-buffers",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .paste_buffer);
+                }
+            }).check,
+        },
+    });
+}
+
+test "paste buffers are not read unless asked for" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .paste_buffer_changed = .{ .name = "buffer0" } } },
+            .commands = &.{},
+        },
+    });
+}
+
+test "client flags are asked for once the version allows it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .client_flags = .{ .active_pane = true, .no_detach_on_destroy = true },
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a 0" } },
+            .commands = &.{"refresh-client -f active-pane,no-detach-on-destroy\n"},
+        },
+    });
+}
+
+test "client flags are not asked of an old tmux" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .client_flags = .{ .no_detach_on_destroy = true },
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.1c 0" } }, .commands = &.{} },
+    });
+}
+
+test "with an active pane of our own, a select awaits no answer" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .client_flags = .{ .active_pane = true },
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 1 } },
+            .contains_command = "select-pane -t %1\n",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, v.selects_unanswered_len);
+                }
+            }).check,
+        },
+    });
+}
+
+test "history is read only as far back as asked" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .history_limit = 500,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps()[0..3]);
+    try testViewer(&viewer, &.{.{
+        .input = .{ .tmux = .{
+            .block_end =
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
+            ,
+        } },
+        .contains_command = "capture-pane -p -e -C -q -S -500 -E -1 -t %0\n",
+    }});
+}
+
+test "a history limit of zero reads no history" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .history_limit = 0,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps()[0..3]);
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 %0
+                ,
+            } },
+            .commands = &.{
+                "display-message -p -t %0 ''\n",
+                "capture-pane -p -e -C -a -t %0\n",
+                "capture-pane -p -e -C -q -t %0\n",
+                "list-panes",
+            },
+        },
+    });
+
+    // The empty answer clears the history like any other.
+    try testViewer(&viewer, &testPrimaryCaptureSteps("", "visible"));
 }
