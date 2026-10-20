@@ -2089,16 +2089,33 @@ pub const Viewer = struct {
             return;
         }
 
+        const escaped = content[1 .. content.len - 1];
+
         // Empty between the markers is also a tmux too old to have
         // `buffer_full`, which expands to nothing. Either way there is
         // nothing to put on the clipboard, and putting nothing there
         // would wipe what the user had.
-        const escaped = content[1 .. content.len - 1];
         if (escaped.len == 0) return;
 
+        // A newline in the buffer cannot be escaped (see
+        // `Command.paste_buffer`), so it crosses the pty tmux -CC writes
+        // to as it is, and that pty's output processing, which tmux
+        // leaves on, makes it a CRLF. One CR is taken off each CRLF to
+        // undo that. A CR of the buffer's own before a newline survives,
+        // as the second of two; only through a pty with output processing
+        // off, which we have not seen, would it be lost.
         const buf = try arena_alloc.alloc(u8, escaped.len);
+        var len: usize = 0;
+        var i: usize = 0;
+        while (i < escaped.len) : (i += 1) {
+            if (escaped[i] == '\r' and
+                i + 1 < escaped.len and escaped[i + 1] == '\n') continue;
+            buf[len] = escaped[i];
+            len += 1;
+        }
+
         try actions.append(arena_alloc, .{
-            .paste_buffer = control.unescape(buf, escaped),
+            .paste_buffer = control.unescape(buf[0..len], buf[0..len]),
         });
     }
 
@@ -4195,7 +4212,10 @@ const Command = union(enum) {
             //
             // `>` and `<` frame the content, since the parser trims the
             // block's trailing newlines and an empty block cannot be told
-            // from an empty buffer otherwise. The filter picks the buffer
+            // from an empty buffer otherwise. Newlines in the buffer
+            // cannot be escaped like the rest: the command has to stay on
+            // one line, and tmux's `#{a:}` will not write one either. See
+            // `receivedPasteBuffer` for what that costs. The filter picks the buffer
             // and leaves it out if it is too long to read safely (see
             // `Viewer.max_mirrored_buffer_bytes`). Names are restricted to
             // characters that mean nothing in a format before we get here.
@@ -8632,17 +8652,19 @@ test "a changed paste buffer is read for the clipboard" {
         },
 
         // Escaped as the format asks: the ESC, a literal backslash, and
-        // a line that would otherwise have ended the block.
+        // a line that would otherwise have ended the block. Through a pty
+        // that turns newlines into CRLF; a CR of the buffer's own
+        // survives.
         .{
             .input = .{ .tmux = .{
-                .block_end = ">red \\033[31mtext\\033[m a\\\\b\n\\045end 1 2 1\n<",
+                .block_end = ">red \\033[31mtext\\033[m a\\\\b\r\n\\045end 1 2 1\r\r\n<",
             } },
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     for (actions) |action| switch (action) {
                         .paste_buffer => |data| {
                             try testing.expectEqualStrings(
-                                "red \x1b[31mtext\x1b[m a\\b\n%end 1 2 1\n",
+                                "red \x1b[31mtext\x1b[m a\\b\n%end 1 2 1\r\n",
                                 data,
                             );
                             return;
