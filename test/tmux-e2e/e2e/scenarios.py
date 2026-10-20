@@ -1294,3 +1294,151 @@ def switch_client_same_session(ctx: Context) -> None:
             f"the panes changed: {before} -> {ctx.describe()}",
         )
     ctx.wait_synced()
+
+
+# -- alerts, titles and working directories ------------------------------------
+
+# What a tab shows in front of the window name for tmux's window flags.
+ALERT_MARKS = {"bell": "🔔", "activity": "•", "silence": "💤"}
+
+
+def tab_marks(ctx: Context, window: str) -> str:
+    """The marks in front of the name of the tab for tmux window `window`."""
+    for tab in ctx.tmux_tabs():
+        if tab.name == window:
+            return ""
+        if tab.name.endswith(" " + window):
+            return tab.name[: -len(window) - 1]
+    raise CheckFailed(f"no tab named {window!r}{ctx.describe()}")
+
+
+def expect_marks(ctx: Context, window: str, want: set[str], desc: str) -> None:
+    """Wait until the tab for `window` carries exactly the marks in `want`."""
+
+    def marked() -> bool:
+        try:
+            marks = tab_marks(ctx, window)
+        except (CheckFailed, AppleScriptError):
+            return False
+        return all(ALERT_MARKS[m] in marks for m in want) and bool(marks) == bool(want)
+
+    wait_until(marked, timeout=ctx.timeout, desc=desc, describe_state=ctx.describe)
+
+
+def select_tab_named(ctx: Context, window: str) -> None:
+    """Select the tab for `window`, whatever marks it carries."""
+    tab = next(t for t in ctx.tmux_tabs() if t.name == window or t.name.endswith(" " + window))
+    ctx.app.select_tab(tab)
+
+
+def window_flag(ctx: Context, window: str, flag: str) -> str:
+    return ctx.tmux.run("display-message", "-p", "-t", f"{SESSION}:{window}", f"#{{{flag}}}").strip()
+
+
+@scenario
+def tmux_bell_marks_tab(ctx: Context) -> None:
+    """A bell in a background tmux window marks its tab until the tab is selected."""
+    two_window_layout(ctx)
+    pane = ctx.tmux.window(SESSION, "beta").panes[0].id
+    ctx.tmux.run("send-keys", "-t", pane, "printf '\\007'", "Enter")
+    wait_until(
+        lambda: window_flag(ctx, "beta", "window_bell_flag") == "1",
+        timeout=ctx.timeout,
+        desc="tmux to flag the bell in window 'beta'",
+    )
+    expect_marks(ctx, "beta", {"bell"}, "the bell mark on tab 'beta'")
+    check(tab_marks(ctx, "alpha") == "", f"tab 'alpha' is marked too{ctx.describe()}")
+
+    # Selecting the tab moves tmux to the window, which is what clears it.
+    select_tab_named(ctx, "beta")
+    expect_marks(ctx, "beta", set(), "the bell mark to clear once tab 'beta' is selected")
+    check(window_flag(ctx, "beta", "window_bell_flag") == "0", "tmux kept the bell flag")
+    ctx.wait_synced()
+
+
+@scenario
+def tmux_activity_marks_tab(ctx: Context) -> None:
+    """With monitor-activity on, output in a background window marks its tab."""
+    ctx.tmux.add_config("set -g monitor-activity on\n")
+    two_window_layout(ctx)
+    pane = ctx.tmux.window(SESSION, "beta").panes[0].id
+    ctx.tmux.run("send-keys", "-t", pane, "echo busy", "Enter")
+    expect_marks(ctx, "beta", {"activity"}, "the activity mark on tab 'beta'")
+    select_tab_named(ctx, "beta")
+    expect_marks(ctx, "beta", set(), "the activity mark to clear once tab 'beta' is selected")
+    ctx.wait_synced()
+
+
+@scenario
+def tmux_pane_title(ctx: Context) -> None:
+    """A pane's tmux title (`select-pane -T`) becomes its terminal's title, live."""
+    ctx.attach()
+    pane = ctx.tmux.window(SESSION, "main").panes[0].id
+    for title in (f"title-{secrets.token_hex(3)}", f"again-{secrets.token_hex(3)}"):
+        ctx.tmux.run("select-pane", "-t", pane, "-T", title)
+        wait_until(
+            lambda: ctx.tab_for_window("main").terminals[0].name == title,
+            timeout=ctx.timeout,
+            desc=f"the terminal's title to become {title!r}",
+            describe_state=lambda: repr(ctx.tab_for_window("main").terminals[0].name),
+        )
+
+
+@scenario
+def tmux_pane_title_on_attach(ctx: Context) -> None:
+    """The title a pane already had before attaching is its terminal's title."""
+    ctx.open_gateway()
+    ctx.create_session()
+    title = f"before-{secrets.token_hex(3)}"
+    ctx.tmux.run("select-pane", "-t", f"{SESSION}:main", "-T", title)
+    ctx.attach_session()
+    wait_until(
+        lambda: ctx.tab_for_window("main").terminals[0].name == title,
+        timeout=ctx.timeout,
+        desc=f"the terminal's title to be {title!r}",
+        describe_state=lambda: repr(ctx.tab_for_window("main").terminals[0].name),
+    )
+
+
+@scenario
+def tmux_pane_working_directory(ctx: Context) -> None:
+    """A pane's working directory, as tmux sees it, is its terminal's."""
+    ctx.attach()
+    pane = ctx.tmux.window(SESSION, "main").panes[0].id
+    ctx.tmux.run("send-keys", "-t", pane, "cd /usr/bin", "Enter")
+    wait_until(
+        lambda: ctx.tab_for_window("main").terminals[0].cwd.rstrip("/").endswith("/usr/bin"),
+        timeout=ctx.timeout,
+        desc="the terminal's working directory to follow the pane's",
+        describe_state=lambda: repr(ctx.tab_for_window("main").terminals[0].cwd),
+    )
+
+
+@scenario
+def hidden_pane_catches_up(ctx: Context) -> None:
+    """With tmux-hidden-output-off-after, a busy background pane is current again once shown."""
+    ctx.app.relaunch("tmux-hidden-output-off-after = 1\n")
+    ctx.attach({"alpha": 1, "beta": 1})
+    pane = ctx.tmux.window(SESSION, "beta").panes[0].id
+    ctx.tmux.run("send-keys", "-t", pane, "i=0; while :; do i=$((i+1)); echo tick-$i; sleep 0.1; done", "Enter")
+
+    # Long enough for the hidden pane to be turned off and to miss output.
+    time.sleep(4)
+    select_tab_named(ctx, "beta")
+    term = ctx.tab_for_window("beta").terminals[0].id
+
+    def last_tick(text: str) -> int:
+        ticks = re.findall(r"tick-(\d+)", text)
+        return int(ticks[-1]) if ticks else -1
+
+    def caught_up() -> bool:
+        gui = last_tick(ctx.app.read_screen(term))
+        return gui > 0 and last_tick(ctx.tmux.capture(pane)) - gui <= 10
+
+    wait_until(
+        caught_up,
+        timeout=ctx.timeout,
+        desc="the pane, shown again, to show what tmux has",
+        describe_state=lambda: f"gui {last_tick(ctx.app.read_screen(term))} tmux {last_tick(ctx.tmux.capture(pane))}",
+    )
+    ctx.tmux.run("send-keys", "-t", pane, "C-c")
