@@ -32,8 +32,9 @@
 #                        Sparkle's `generate_keys -x <file>`
 #
 # The build then carries the matching public key and reads the appcast
-# attached to the latest release, and each release gets an appcast.xml
-# listing itself, signed with the key along with its download. Without
+# attached to the latest release, and each release of main gets an
+# appcast.xml listing itself, signed with the key along with its
+# download. Builds of other branches are prereleases with none. Without
 # the secret a release has no appcast and its app's updater is disabled.
 # Updates work for ad-hoc signed builds too, since Sparkle trusts the
 # EdDSA signature; changing the key later strands every installed build.
@@ -70,6 +71,10 @@ jobs:
       # Secrets cannot be tested in a step's `if`, so expose whether they
       # are set.
       NOTARIZE: ${{ secrets.APPLE_NOTARY_KEY_ID != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+      # Only a build of main becomes the latest release, and so an update.
+      # A build of another branch (by hand) is released as a prerelease,
+      # without an appcast. After a sync, github.ref is main too.
+      MAIN: ${{ github.ref == 'refs/heads/main' }}
     steps:
       # After a sync, build what the sync pushed: the tip of main, not the
       # commit the sync workflow itself ran on.
@@ -217,7 +222,7 @@ jobs:
       # needs. Sparkle's own generate_appcast signs the download and, as
       # the app requires (SURequireSignedFeed), the appcast itself.
       - name: Generate appcast
-        if: steps.release.outputs.exists == 'false' && steps.updates.outputs.public-key != ''
+        if: steps.release.outputs.exists == 'false' && steps.updates.outputs.public-key != '' && env.MAIN == 'true'
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           TAG: ${{ steps.release.outputs.tag }}
@@ -252,24 +257,33 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
           SHA: ${{ steps.release.outputs.sha }}
           IDENTITY: ${{ steps.cert.outputs.identity }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           app="$RUNNER_TEMP/Ghostty tmux.app"
-          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")
-          build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$app/Contents/Info.plist")
+          plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$app/Contents/Info.plist" 2>/dev/null; }
+          version=$(plist CFBundleShortVersionString)
+          build=$(plist CFBundleVersion)
           if [ "$IDENTITY" = "-" ]; then
             signing="Ad-hoc signed. After unzipping, run \`xattr -dr com.apple.quarantine \"Ghostty tmux.app\"\` once."
           else
             signing="Signed as $IDENTITY."
           fi
-          assets=("$RUNNER_TEMP/release/Ghostty-tmux.zip")
-          if [ -f "$RUNNER_TEMP/release/appcast.xml" ]; then
-            assets+=("$RUNNER_TEMP/release/appcast.xml")
-            updates="It updates itself from this fork's releases (Check for Updates…, or the \`auto-update\` option)."
+          if plist SUFeedURL > /dev/null; then
+            updates="It updates itself to the latest build of \`main\` (Check for Updates…, or the \`auto-update\` option)."
           else
             updates="It does not update itself: this build was made without an update key."
           fi
+          assets=("$RUNNER_TEMP/release/Ghostty-tmux.zip")
+          if [ -f "$RUNNER_TEMP/release/appcast.xml" ]; then
+            assets+=("$RUNNER_TEMP/release/appcast.xml")
+          fi
+          if [ "$MAIN" = true ]; then
+            latest=--latest
+          else
+            latest=--prerelease
+          fi
           {
-            echo "Ghostty with native tmux control mode, built from \`main\` at $SHA."
+            echo "Ghostty with native tmux control mode, built from \`$BRANCH\` at $SHA."
             echo
             echo "Version: \`$version\` (build $build)"
             echo
@@ -277,11 +291,11 @@ jobs:
             echo
             echo "$updates"
             echo
-            echo "Changes since the previous build: see the commits of \`main\`."
+            echo "Changes since the previous build: see the commits of \`$BRANCH\`."
           } > "$RUNNER_TEMP/notes.md"
           gh release create "$TAG" "${assets[@]}" \
             --target "$(git rev-parse HEAD)" \
             --title "Ghostty tmux $(date -u +%Y-%m-%d) ($SHA)" \
             --notes-file "$RUNNER_TEMP/notes.md" \
-            --latest
+            "$latest"
           echo "Published $TAG." >> "$GITHUB_STEP_SUMMARY"
