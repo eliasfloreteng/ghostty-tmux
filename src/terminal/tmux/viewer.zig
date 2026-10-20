@@ -562,6 +562,21 @@ pub const Viewer = struct {
         /// read. See `nextHistoryWanted`.
         history_wanted: HistoryWanted,
 
+        /// Whatever displays this pane needs all of its history, as far
+        /// as `Options.history_limit` goes, before it can do what it was
+        /// asked: select all of it, or write it to a file. The pane is
+        /// read from scratch, history and all, and once that is applied
+        /// the display is sent `.history_complete`. Always answered,
+        /// whether or not the history is read on demand.
+        read_history: PaneId,
+
+        /// Whatever displays this pane refused older history because its
+        /// line where the two overlap was not the display's: our
+        /// scrollback and tmux's history no longer agree line for line.
+        /// The pane is read again from scratch, as for a resize. See
+        /// `nextHistoryDrifted`.
+        history_drifted: HistoryDrifted,
+
         /// Trade places with another pane of the same window.
         swap_pane: SwapPane,
 
@@ -671,6 +686,17 @@ pub const Viewer = struct {
         pub const PaneShown = struct {
             pane_id: usize,
             shown: bool,
+        };
+
+        pub const PaneId = struct {
+            pane_id: usize,
+        };
+
+        pub const HistoryDrifted = struct {
+            pane_id: usize,
+
+            /// The `read` of the refused `sinkpkg.Op.OlderHistory`.
+            read: u32,
         };
 
         pub const HistoryWanted = struct {
@@ -1032,6 +1058,31 @@ pub const Viewer = struct {
         /// in flight, to be read once it has landed. The newest ask wins.
         older_wanted: ?Input.HistoryWanted = null,
 
+        /// How many reads from scratch, the ones that replace the
+        /// pane's history, have been applied. A read of older history
+        /// is measured against the history the last of them left, and
+        /// carries this to say which. See `Input.history_drifted`.
+        history_reads: u32 = 0,
+
+        /// Whether a read from scratch was queued because the display's
+        /// history drifted from tmux's, and has not been applied yet.
+        drift_reread: bool = false,
+
+        /// The read from scratch that a drift re-read turned out to be,
+        /// once applied. Drifting again against that one means reading
+        /// again will not help.
+        drift_read: ?u32 = null,
+
+        /// Older history has stopped being read for this pane, because
+        /// it drifted even right after a re-read. Until the next read
+        /// from scratch for some other reason (a resize, a pause).
+        older_off: bool = false,
+
+        /// Whether the read whose history is held in `read_history` is
+        /// one the display asked for all of (`Input.read_history`), to
+        /// be told when it is in.
+        read_all: bool = false,
+
         pub fn create(
             io: std.Io,
             alloc: Allocator,
@@ -1074,6 +1125,11 @@ pub const Viewer = struct {
             self.reread = false;
             self.older_reading = false;
             self.older_wanted = null;
+            self.history_reads = 0;
+            self.drift_reread = false;
+            self.drift_read = null;
+            self.older_off = false;
+            self.read_all = false;
 
             return self;
         }
@@ -1351,6 +1407,8 @@ pub const Viewer = struct {
             .kill_pane => self.nextKillPane(input.kill_pane),
             .pane_shown => self.nextPaneShown(input.pane_shown),
             .history_wanted => self.nextHistoryWanted(input.history_wanted),
+            .read_history => self.nextReadHistory(input.read_history),
+            .history_drifted => self.nextHistoryDrifted(input.history_drifted),
             .swap_pane => self.nextSwapPane(input.swap_pane),
             .rotate_window => self.nextRotateWindow(input.rotate_window),
             .break_pane => self.nextBreakPane(input.break_pane),
@@ -1412,7 +1470,10 @@ pub const Viewer = struct {
             .pane_shown => return null,
 
             // Only reading.
-            .history_wanted => return null,
+            .history_wanted,
+            .read_history,
+            .history_drifted,
+            => return null,
 
             // Side effects of the GUI, not something the user asked
             // tmux for: a surface being laid out or focused. Nothing to
@@ -4142,7 +4203,7 @@ pub const Viewer = struct {
         const pane: *Pane = self.panes.get(req.pane_id) orelse return &.{};
 
         // Nothing to anchor the read to, or nothing more we may read.
-        if (req.held == 0) return &.{};
+        if (req.held == 0 or pane.older_off) return &.{};
         if (self.history_limit) |limit| if (req.held >= limit) return &.{};
         if (self.historyReadPending(req.pane_id)) return &.{};
 
@@ -4175,6 +4236,7 @@ pub const Viewer = struct {
             else
                 oldest,
             .newest = req.held,
+            .read = pane.history_reads,
         } };
     }
 
@@ -4187,7 +4249,9 @@ pub const Viewer = struct {
         }
         var it = self.command_queue.iterator(.forward);
         while (it.next()) |command| switch (command.*) {
-            .pane_history => |id| if (id == pane_id) return true,
+            .pane_history,
+            .pane_history_all,
+            => |id| if (id == pane_id) return true,
             else => {},
         };
         return false;
@@ -4211,6 +4275,7 @@ pub const Viewer = struct {
             try self.paneOps(pane, &.{.{ .older_history = .{
                 .bytes = bytes,
                 .newest = req.newest,
+                .read = req.read,
             } }});
         };
 
@@ -4224,6 +4289,65 @@ pub const Viewer = struct {
             return;
         }
         try self.queueCommands(&.{self.olderHistoryRead(pane, wanted, chunk)});
+    }
+
+    /// The display needs all of the pane's history. See
+    /// `Input.read_history`.
+    ///
+    /// Read from scratch rather than above what the display has: that
+    /// needs nothing from the display, which may be anywhere between
+    /// having asked and having its answer, and lands in order behind
+    /// any read already on its way, whatever it is.
+    fn nextReadHistory(self: *Viewer, req: Input.PaneId) []const Action {
+        if (self.state != .command_queue) return &.{};
+        if (!self.panes.contains(req.pane_id)) return &.{};
+
+        const commands = [_]Command{.{ .pane_history_all = req.pane_id }} ++
+            screenCaptures(req.pane_id) ++
+            [_]Command{.pane_state};
+        return self.queueUserCommands(&commands) catch {
+            log.warn("failed to read all history for pane id={}", .{req.pane_id});
+            return &.{};
+        };
+    }
+
+    /// The display refused older history that did not line up with its
+    /// own. See `Input.history_drifted`.
+    ///
+    /// Read the pane again from scratch, which leaves the two agreeing
+    /// again: the display then holds the newest chunk exactly as tmux has
+    /// it, and asks for the rest from there. Once only, though. Refused
+    /// again right after such a re-read, against the history it left,
+    /// the drift is not something reading again fixes, and asking again
+    /// would only go round in a loop; older history stops being read for
+    /// the pane until it is read from scratch for some other reason.
+    fn nextHistoryDrifted(self: *Viewer, req: Input.HistoryDrifted) []const Action {
+        if (self.state != .command_queue) return &.{};
+        const pane: *Pane = self.panes.get(req.pane_id) orelse return &.{};
+
+        // Measured against a history that has since been replaced, or
+        // one being replaced already.
+        if (req.read != pane.history_reads or pane.drift_reread) return &.{};
+        if (self.historyReadPending(req.pane_id)) return &.{};
+
+        if (pane.drift_read == req.read) {
+            log.warn(
+                "pane id={} history drifted from tmux's again right after a re-read, no longer reading older history",
+                .{req.pane_id},
+            );
+            pane.older_off = true;
+            pane.older_wanted = null;
+            return &.{};
+        }
+
+        log.info("pane id={} history drifted from tmux's, reading it again", .{req.pane_id});
+        const commands = paneCaptures(req.pane_id) ++ [_]Command{.pane_state};
+        const actions = self.queueUserCommands(&commands) catch {
+            log.warn("failed to read pane id={} again", .{req.pane_id});
+            return &.{};
+        };
+        pane.drift_reread = true;
+        return actions;
     }
 
     /// Turn a pane's output off if it has been out of sight for long
@@ -4785,6 +4909,13 @@ pub const Viewer = struct {
             .pane_history => |id| try self.receivedPaneHistory(
                 id,
                 if (is_err) null else content,
+                false,
+            ),
+
+            .pane_history_all => |id| try self.receivedPaneHistory(
+                id,
+                if (is_err) null else content,
+                true,
             ),
 
             // Failing is the answer here: no saved grid means the pane
@@ -5249,6 +5380,7 @@ pub const Viewer = struct {
         self: *Viewer,
         id: usize,
         content: ?[]const u8,
+        all: bool,
     ) !void {
         // Get our pane
         const entry = self.panes.getEntry(id) orelse {
@@ -5262,6 +5394,7 @@ pub const Viewer = struct {
         const history = try self.decodeCapture(content orelse "");
         if (pane.read_history) |old| self.alloc.free(old);
         pane.read_history = history;
+        pane.read_all = all;
     }
 
     /// The saved grid: the primary screen's content while the pane is
@@ -5374,6 +5507,25 @@ pub const Viewer = struct {
             // Anything asked for before is measured against the history
             // this replaced. The display asks again from the new one.
             pane.older_wanted = null;
+            pane.history_reads +%= 1;
+
+            // A drift re-read is remembered, to tell drifting again
+            // right after it. Any other read starts over.
+            if (pane.drift_reread) {
+                pane.drift_reread = false;
+                pane.drift_read = pane.history_reads;
+            } else {
+                pane.drift_read = null;
+                pane.older_off = false;
+            }
+
+            // Told after the read's own ops, so whatever the display was
+            // holding back for it finds all of it there.
+            if (pane.read_all) {
+                pane.read_all = false;
+                try self.paneOps(pane, &.{.history_complete});
+            }
+
             pane.full_reads -|= 1;
             try self.updatePaneStatus(pane);
         }
@@ -5610,7 +5762,10 @@ pub const Viewer = struct {
             if (i < self.commands_sent) continue;
 
             var builder: std.Io.Writer.Allocating = .init(alloc);
-            command.formatCommand(&builder.writer, self.historyReadLines()) catch
+            command.formatCommand(&builder.writer, .{
+                .read = self.historyReadLines(),
+                .all = self.history_limit,
+            }) catch
                 return error.OutOfMemory;
             try actions.append(alloc, .{ .command = builder.writer.buffered() });
         }
@@ -5803,6 +5958,10 @@ const Command = union(enum) {
     /// fit together.
     pane_history: usize,
 
+    /// The same, but all of it as far as `Viewer.history_limit` goes,
+    /// even when history is read in chunks. See `Input.read_history`.
+    pane_history_all: usize,
+
     /// Capture the given pane's saved grid: its primary screen while it
     /// is in the alternate screen. Fails when it is not.
     pane_saved: usize,
@@ -5876,6 +6035,17 @@ const Command = union(enum) {
     /// never queued, only left in place of what was sent.
     orphan,
 
+    /// How many lines of history the reads from scratch take, or null
+    /// for all of them. See `formatCommand`.
+    pub const HistoryLines = struct {
+        /// `pane_history`: the newest chunk, if history is read on
+        /// demand. See `Viewer.historyReadLines`.
+        read: ?u32,
+
+        /// `pane_history_all`: `Viewer.history_limit`.
+        all: ?u32,
+    };
+
     pub const OlderHistory = struct {
         pane_id: usize,
 
@@ -5884,12 +6054,16 @@ const Command = union(enum) {
         /// up to the top of the history.
         oldest: ?usize,
         newest: usize,
+
+        /// `Pane.history_reads` when it was asked for.
+        read: u32,
     };
 
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
             .list_windows,
             .pane_history,
+            .pane_history_all,
             .pane_saved,
             .pane_visible,
             .pane_older_history,
@@ -5916,13 +6090,13 @@ const Command = union(enum) {
     /// by tmux. Trailing newlines are appended so this can be sent as-is
     /// to tmux.
     ///
-    /// `history_limit` is how many lines of history a read from scratch
-    /// takes (see `Viewer.historyReadLines`), the one thing about how a
-    /// command is written that is up to the user.
+    /// `history` is how many lines of history a read from scratch takes,
+    /// the one thing about how a command is written that is up to the
+    /// user.
     pub fn formatCommand(
         self: Command,
         writer: *std.Io.Writer,
-        history_limit: ?u32,
+        history: HistoryLines,
     ) std.Io.Writer.Error!void {
         switch (self) {
             // `-f` sets client flags; `pause-after=N` is the one that
@@ -5944,32 +6118,38 @@ const Command = union(enum) {
             // is some (`receivedPaneHistory`). A capture cannot ask for
             // no lines at all -- tmux swaps an empty range around into a
             // line -- so this asks for an empty line instead.
-            .pane_history => |id| if (history_limit == 0) try writer.print(
-                "display-message -p -t %{d} ''\n",
-                .{id},
-            ) else if (history_limit) |lines| try writer.print(
-                // As below, but from `lines` back from the screen rather
-                // than from the top of the history. A pane with less
-                // history than that gives all of it.
-                "capture-pane -p -e -C -q -S -{d} -E -1 -t %{d}\n",
-                .{ lines, id },
-            ) else try writer.print(
-                // -p = output to stdout instead of buffer
-                // -e = output escape sequences for SGR
-                // -C = escape non-printable bytes as octal. Mandatory
-                //   alongside -e: a reply travels inside a %begin/%end
-                //   block, and unlike %output tmux does not escape block
-                //   payloads, so a raw ESC would terminate the DCS that
-                //   carries control mode and drop us out of the session.
-                // -q = quiet, don't error on a bad range
-                // -S - = start at the top of history ("-")
-                // -E -1 = end at the last line of history (1 before the
-                //   visible area is -1).
-                // -t %{d} = target a specific pane ID
-                // (no -a: the saved grid has no history to capture)
-                "capture-pane -p -e -C -q -S - -E -1 -t %{d}\n",
-                .{id},
-            ),
+            .pane_history, .pane_history_all => |id| {
+                const history_limit = switch (self) {
+                    .pane_history_all => history.all,
+                    else => history.read,
+                };
+                if (history_limit == 0) try writer.print(
+                    "display-message -p -t %{d} ''\n",
+                    .{id},
+                ) else if (history_limit) |lines| try writer.print(
+                    // As below, but from `lines` back from the screen rather
+                    // than from the top of the history. A pane with less
+                    // history than that gives all of it.
+                    "capture-pane -p -e -C -q -S -{d} -E -1 -t %{d}\n",
+                    .{ lines, id },
+                ) else try writer.print(
+                    // -p = output to stdout instead of buffer
+                    // -e = output escape sequences for SGR
+                    // -C = escape non-printable bytes as octal. Mandatory
+                    //   alongside -e: a reply travels inside a %begin/%end
+                    //   block, and unlike %output tmux does not escape block
+                    //   payloads, so a raw ESC would terminate the DCS that
+                    //   carries control mode and drop us out of the session.
+                    // -q = quiet, don't error on a bad range
+                    // -S - = start at the top of history ("-")
+                    // -E -1 = end at the last line of history (1 before the
+                    //   visible area is -1).
+                    // -t %{d} = target a specific pane ID
+                    // (no -a: the saved grid has no history to capture)
+                    "capture-pane -p -e -C -q -S - -E -1 -t %{d}\n",
+                    .{id},
+                );
+            },
 
             .pane_saved => |id| try writer.print(
                 // -a = the saved grid, which only exists while the pane
@@ -7822,6 +8002,12 @@ const MirrorSink = struct {
     /// Everything that arrived as `.passthrough`, in order.
     passthrough: std.ArrayList(u8) = .empty,
 
+    /// How many times it was told all of the history is in.
+    completes: usize = 0,
+
+    /// The `read` of the last older history it refused as drifted.
+    drifted: ?u32 = null,
+
     fn init(
         self: *MirrorSink,
         alloc: Allocator,
@@ -7879,12 +8065,14 @@ const MirrorSink = struct {
             ) catch |err| {
                 log.warn("mirror sink failed to keep passthrough: {}", .{err});
             },
+            .history_complete => self.completes += 1,
             else => sinkpkg.applyOp(
                 self.alloc,
                 &self.terminal,
                 op,
-            ) catch |err| {
-                log.warn("mirror sink failed to apply op: {}", .{err});
+            ) catch |err| switch (err) {
+                error.HistoryDrifted => self.drifted = op.older_history.read,
+                else => log.warn("mirror sink failed to apply op: {}", .{err}),
             },
         };
     }
@@ -12572,4 +12760,163 @@ test "a pane tmux resizes is read again with its history when it is read in chun
     const pane = viewer.panes.get(0).?;
     try testing.expectEqual(0, pane.full_reads);
     try testing.expectEqual(.live, pane.status);
+}
+
+/// A viewer reading history in chunks of three, with `mirror` attached
+/// to its one pane and holding three lines of history, "c" to "e".
+fn testChunkedSteady(viewer: *Viewer, mirror: *MirrorSink) !void {
+    try testViewer(viewer, testSinglePaneSteps()[0..4]);
+    try viewer.attachPane(0, mirror.sink());
+    try testViewer(viewer, &(testPrimaryCaptureSteps("c\r\nd\r\ne", "x") ++
+        testSubscribeSteps()));
+    try testViewer(viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+    try expectMirrorHistory(mirror, "c\nd\ne");
+}
+
+test "a display needing all of its history has it read whole, and is told" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .history_chunk = 3,
+        .history_limit = 1000,
+    });
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.initScrollback(testing.allocator, testing.io, 83, 44, null);
+    defer mirror.deinit();
+    try testChunkedSteady(&viewer, &mirror);
+
+    try testViewer(&viewer, &.{
+        // As far back as the limit, not the chunk, with its screens.
+        .{
+            .input = .{ .read_history = .{ .pane_id = 0 } },
+            .commands = &.{
+                "capture-pane -p -e -C -q -S -1000 -E -1 -t %0\n",
+                "capture-pane -p -e -C -N -a -t %0\n",
+                "capture-pane -p -e -C -N -q -t %0\n",
+                "list-panes",
+            },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "a\r\nb\r\nc\r\nd\r\ne" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+    });
+
+    // Not before the read is all in.
+    try testing.expectEqual(0, mirror.completes);
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "x" } } }});
+    try testing.expectEqual(1, mirror.completes);
+    try expectMirrorHistory(&mirror, "a\nb\nc\nd\ne");
+
+    // The pane state that follows tells it nothing more.
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+    try testing.expectEqual(1, mirror.completes);
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "a display needing all of its history is told even when it is all read already" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.initScrollback(testing.allocator, testing.io, 83, 44, null);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try viewer.attachPane(0, mirror.sink());
+    try testViewer(&viewer, &([_]TestStep{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .read_history = .{ .pane_id = 0 } },
+            .contains_command = "capture-pane -p -e -C -q -S - -E -1 -t %0\n",
+        },
+    } ++ testPrimaryCaptureSteps("all", "x")));
+    try testing.expectEqual(1, mirror.completes);
+}
+
+test "history that drifted from tmux's is read again, once" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .history_chunk = 3,
+    });
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.initScrollback(testing.allocator, testing.io, 83, 44, null);
+    defer mirror.deinit();
+    try testChunkedSteady(&viewer, &mirror);
+
+    const reread_commands: []const []const u8 = &.{
+        "capture-pane -p -e -C -q -S -3 -E -1 -t %0\n",
+        "capture-pane -p -e -C -N -a -t %0\n",
+        "capture-pane -p -e -C -N -q -t %0\n",
+        "list-panes",
+    };
+    const older_command: []const []const u8 = &.{
+        "capture-pane -p -e -C -q -S -6 -E -3 -t %0\n",
+    };
+
+    // tmux's line 3 back is not ours: the display refuses it, against
+    // the one read from scratch it has had.
+    try testViewer(&viewer, &.{
+        .{ .input = testHistoryWanted(3, false), .commands = older_command },
+        .{ .input = .{ .tmux = .{ .block_end = "a\r\nb\r\nq" } } },
+    });
+    try testing.expectEqual(1, mirror.drifted.?);
+    try expectMirrorHistory(&mirror, "c\nd\ne");
+
+    try testViewer(&viewer, &.{
+        // Told so, the pane is read again from scratch, as for a resize.
+        .{
+            .input = .{ .history_drifted = .{ .pane_id = 0, .read = 1 } },
+            .commands = reread_commands,
+        },
+        // Told again while that is on its way: nothing more.
+        .{
+            .input = .{ .history_drifted = .{ .pane_id = 0, .read = 1 } },
+            .commands = &.{},
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "p\r\nq\r\nr" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "x" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // A refusal measured against the history that read replaced
+        // changes nothing.
+        .{
+            .input = .{ .history_drifted = .{ .pane_id = 0, .read = 1 } },
+            .commands = &.{},
+        },
+    });
+    try expectMirrorHistory(&mirror, "p\nq\nr");
+
+    // Refused again, against the history the re-read left: reading
+    // again would only go round, so older history stops.
+    try testViewer(&viewer, &.{
+        .{ .input = testHistoryWanted(3, false), .commands = older_command },
+        .{ .input = .{ .tmux = .{ .block_end = "a\r\nb\r\nz" } } },
+    });
+    try testing.expectEqual(2, mirror.drifted.?);
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .history_drifted = .{ .pane_id = 0, .read = 2 } },
+            .commands = &.{},
+        },
+        .{ .input = testHistoryWanted(3, false), .commands = &.{} },
+    });
+    try testing.expect(viewer.panes.get(0).?.older_off);
+
+    // Until the pane is read from scratch for another reason.
+    try testViewer(&viewer, &([_]TestStep{
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "a1dd,60x20,0,0,0",
+                .visible_layout = "a1dd,60x20,0,0,0",
+                .raw_flags = "*",
+            } } },
+            .commands = reread_commands,
+        },
+    } ++ testPrimaryCaptureSteps("p\r\nq\r\nr", "x") ++ [_]TestStep{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = testHistoryWanted(3, false), .commands = older_command },
+    }));
+    try testing.expect(!viewer.panes.get(0).?.older_off);
 }

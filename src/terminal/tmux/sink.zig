@@ -233,6 +233,13 @@ pub const Op = union(enum) {
     /// state: `applyOp` ignores it, and a consumer with a GUI shows it.
     pane_status: PaneStatus,
 
+    /// The pane's whole history, as far as `tmux-history-limit` goes, is
+    /// in: the read a display asked for with `Viewer.Input.read_history`
+    /// has been applied. Not terminal state; `applyOp` ignores it. A
+    /// display holding back something that needs all of the scrollback
+    /// (select all, writing it to a file) does it now.
+    history_complete,
+
     pub const Pwd = struct {
         host: []const u8,
         path: []const u8,
@@ -254,7 +261,11 @@ pub const Op = union(enum) {
     /// its scrollback, without touching what is there: the viewport,
     /// a selection and search results all stay on the content they were
     /// on. A capture that does not reach down to the terminal's oldest
-    /// line, or whose line there is not the terminal's, adds nothing.
+    /// line adds nothing: it was asked for before the terminal's history
+    /// was replaced, and the display asks again. One whose line there is
+    /// not the terminal's adds nothing either, and fails with
+    /// `error.HistoryDrifted`: the two histories no longer agree line for
+    /// line, and only reading the pane again from scratch fixes that.
     pub const OlderHistory = struct {
         /// The capture, decoded: one line of tmux's history per row,
         /// oldest first.
@@ -263,6 +274,11 @@ pub const Op = union(enum) {
         /// How far back from the screen the capture's last line is.
         /// Always at least 1.
         newest: usize,
+
+        /// Which read from scratch the read was measured against, for
+        /// telling the viewer about it if it does not line up. See
+        /// `Viewer.Input.history_drifted`.
+        read: u32 = 0,
     };
 
     /// Copy an op so it can outlive the sink call that delivered it.
@@ -313,6 +329,7 @@ pub const Op = union(enum) {
             .trim_trailing_blanks,
             .resize,
             .pane_status,
+            .history_complete,
             => self,
         };
     }
@@ -445,7 +462,7 @@ pub fn applyOp(
         }),
 
         // For whoever displays the terminal, not for the terminal.
-        .pane_status => {},
+        .pane_status, .history_complete => {},
     }
 }
 
@@ -504,7 +521,7 @@ fn prependHistory(
         const ours = pages.pin(.{ .screen = .{} }).?;
         if (!sameText(theirs.cells(.all), ours.cells(.all))) {
             log.warn("older history does not line up with ours, dropping it", .{});
-            return;
+            return error.HistoryDrifted;
         }
     }
 
@@ -990,17 +1007,17 @@ test "older history goes in above what is held, past the line they share" {
     try testing.expectEqualStrings("x\ny\nz", screen);
 }
 
-test "older history whose overlap is not ours adds nothing" {
+test "older history whose overlap is not ours adds nothing, and says so" {
     const alloc = testing.allocator;
     var t = try testHistoryTerminal(alloc, "c\r\nd\r\ne", "x");
     defer t.deinit(alloc);
 
     // Line 3 back is "c" here, and tmux says it is "q": the two have
     // drifted apart, and "a" and "b" would go in at the wrong place.
-    try applyOp(alloc, &t, .{ .older_history = .{
+    try testing.expectError(error.HistoryDrifted, applyOp(alloc, &t, .{ .older_history = .{
         .bytes = "a\r\nb\r\nq",
         .newest = 3,
-    } });
+    } }));
     try expectHistory(alloc, &t, "c\nd\ne");
 }
 

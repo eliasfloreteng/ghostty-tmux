@@ -168,6 +168,18 @@ tmux_reattach_command: if (terminal.options.tmux_control_mode) ?[]const u8 else 
 tmux_history_asked: if (terminal.options.tmux_control_mode) ?usize else void =
     if (terminal.options.tmux_control_mode) null else {},
 
+/// Binding actions that need all of a tmux pane's scrollback, held until
+/// tmux has sent the rest of it. See `tmuxDeferForHistory`.
+tmux_deferred: if (terminal.options.tmux_control_mode)
+    std.ArrayList(input.Binding.Action)
+else
+    void = if (terminal.options.tmux_control_mode) .empty else {},
+
+/// Set while the actions in `tmux_deferred` run, so they are not held
+/// again.
+tmux_history_ready: if (terminal.options.tmux_control_mode) bool else void =
+    if (terminal.options.tmux_control_mode) false else {},
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -878,6 +890,7 @@ pub fn deinit(self: *Surface) void {
     self.io.deinit();
     if (comptime terminal.options.tmux_control_mode) {
         if (self.tmux_reattach_command) |v| self.alloc.free(v);
+        self.tmux_deferred.deinit(self.alloc);
     }
 
     if (self.inspector) |v| {
@@ -1250,6 +1263,32 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .tmux_pane_status,
                 status,
             );
+        },
+
+        .tmux_history_complete => tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+
+            // Taken out first: an action run here that is held again,
+            // were the pane to go on asking, starts a list of its own.
+            var actions = self.tmux_deferred;
+            self.tmux_deferred = .empty;
+            defer actions.deinit(self.alloc);
+
+            self.tmux_history_ready = true;
+            defer self.tmux_history_ready = false;
+            for (actions.items) |action| {
+                _ = self.performBindingAction(action) catch |err| log.warn(
+                    "held action failed action={t} err={}",
+                    .{ action, err },
+                );
+            }
+        },
+
+        .tmux_history_drifted => |read| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            const pane = self.tmuxPane() orelse break :tmux;
+            defer pane.router.unref();
+            pane.router.historyDrifted(pane.id, read);
         },
 
         .tmux_notice => |notice| tmux: {
@@ -2662,6 +2701,28 @@ fn tmuxHistory(self: *Surface, scrollbar: terminal.Scrollbar) void {
     if (scrollbar.offset > scrollbar.len * 2) return;
     if (self.tmux_history_asked == scrollbar.total) return;
     if (self.tmuxHistoryWanted(false)) self.tmux_history_asked = scrollbar.total;
+}
+
+/// Hold an action that needs all of the scrollback, if this is a tmux
+/// pane: ask tmux for all of its history, and do it once that is in
+/// (`tmux_history_complete`), rather than on the part read so far.
+/// Returns whether it was held.
+///
+/// The viewer answers every such ask it receives, whatever it has to
+/// read, history read in chunks or not. One it never receives, because
+/// the session ended on the way, ends this surface's pane too, and the
+/// held action with it.
+fn tmuxDeferForHistory(self: *Surface, action: input.Binding.Action) !bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+    if (self.tmux_history_ready) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+
+    // One read covers every action held while it is on its way.
+    try self.tmux_deferred.append(self.alloc, action);
+    if (self.tmux_deferred.items.len == 1) pane.router.readHistory(pane.id);
+    return true;
 }
 
 /// Ask tmux for older history than we hold, if this is a tmux pane on
@@ -5976,10 +6037,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
-        .write_scrollback_file => |v| try self.writeScreenFile(
-            .history,
-            v,
-        ),
+        .write_scrollback_file => |v| {
+            if (try self.tmuxDeferForHistory(action)) return true;
+            try self.writeScreenFile(.history, v);
+        },
 
         .write_selection_file => |v| try self.writeScreenFile(
             .selection,
@@ -6260,6 +6321,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .select_all => {
+            if (try self.tmuxDeferForHistory(action)) return true;
+
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
 
