@@ -151,6 +151,14 @@ pub const Variable = enum {
     origin_flag,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
+    /// The pane's extended key mode, i.e. modifyOtherKeys: `VT10x` for
+    /// none, `Ext 1` or `Ext 2` for that level. tmux 3.5 and later only;
+    /// earlier versions print an empty string.
+    ///
+    /// tmux only records a program's request when its `extended-keys`
+    /// option is not `off`, and with it `always` reports `Ext 1` for
+    /// every pane. It has no notion of the kitty keyboard protocol.
+    pane_key_mode,
     /// Pane tab positions as a comma-separated list of 0-indexed column
     /// numbers (e.g., `8,16,24,32`). Empty string if no tabs are set.
     pane_tabs,
@@ -235,6 +243,7 @@ pub const Variable = enum {
             .window_height => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
             .cursor_shape,
+            .pane_key_mode,
             .pane_tabs,
             .version,
             .window_layout,
@@ -280,6 +289,7 @@ pub const Variable = enum {
             => usize,
             .cursor_colour,
             .cursor_shape,
+            .pane_key_mode,
             .pane_tabs,
             .version,
             .window_layout,

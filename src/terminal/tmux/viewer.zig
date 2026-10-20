@@ -3750,6 +3750,9 @@ const Format = struct {
             .scroll_region_lower,
             // Tab stops
             .pane_tabs,
+            // Keyboard: modifyOtherKeys. Last because it is the newest
+            // (tmux 3.5); older servers print nothing for it.
+            .pane_key_mode,
         },
     };
 
@@ -4655,8 +4658,8 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;0;1;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
-                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
+                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;0;1;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160;VT10x
+                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160;VT10x
                 ,
             } },
             .check = (struct {
@@ -4770,7 +4773,7 @@ test "pane state ignores out of bounds scroll region" {
         // list-panes with a scroll region bottom far past the screen
         .{
             .input = .{ .tmux = .{
-                .block_end = "%0;0;5;1;;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;60000;",
+                .block_end = "%0;0;5;1;;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;60000;;",
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
@@ -4859,7 +4862,7 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
         (if (alternate_on) "1;0;0;" else "0;0;0;") ++
         "0;1;0;0;0;" ++
         "0;0;0;0;0;" ++
-        "0;0;0;23;8,16,24,32,40,48,56,64,72\n" ++
+        "0;0;0;23;8,16,24,32,40,48,56,64,72;Ext 2\n" ++
         "%end 7 7 0\n" ++
 
         // Live output after initialization.
@@ -5397,7 +5400,7 @@ test "pane state maps tmux mouse flags to the right modes" {
         //  ...;mouse_all;mouse_button;mouse_standard;utf8;sgr;...
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;1;0;0;0;0;0;39;8,16
+            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;1;0;0;0;0;0;39;8,16;VT10x
             ,
         } } },
     });
@@ -5442,7 +5445,7 @@ test "attached sink mirrors the pane terminal" {
         // reach the active screen.
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;7;2;1;bar;;;1;5;3;1;1;0;0;1;0;0;0;0;0;;;1;40;8,16,24
+            \\%0;7;2;1;bar;;;1;5;3;1;1;0;0;1;0;0;0;0;0;;;1;40;8,16,24;VT10x
             ,
         } } },
         // Then live output, including a sequence split across two
@@ -7123,7 +7126,7 @@ test "output escape sequence split across notifications" {
         // pane_state, alternate_on = 0.
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16
+            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16;VT10x
             ,
         } } },
 
@@ -7175,7 +7178,7 @@ test "pane state restores the active screen" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16
+                \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16;VT10x
                 ,
             } },
             .check = (struct {
