@@ -49,6 +49,13 @@ pub const StreamHandler = struct {
     /// leave pause mode off. Read when a control mode session starts.
     tmux_pause_after: u32 = 0,
 
+    /// `tmux-history-limit`, `tmux-paste-buffer-clipboard` and
+    /// `tmux-client-flags`, read when a control mode session starts. See
+    /// `terminal.tmux.Viewer.Options`.
+    tmux_history_limit: ?u32 = null,
+    tmux_paste_buffer_clipboard: bool = false,
+    tmux_client_flags: configpkg.Config.TmuxClientFlags = .{},
+
     /// The color reporting format for OSC requests.
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
 
@@ -197,6 +204,11 @@ pub const StreamHandler = struct {
             const pane_id = kv.key_ptr.*;
             if (!router.needsChannel(pane_id)) continue;
 
+            // Nothing displays a pane of a hidden window, and a channel
+            // nobody claims would only buffer its output. It gets one
+            // when the window is shown and the viewer reads it again.
+            if (viewer.paneHidden(pane_id)) continue;
+
             const sink = router.createChannel(pane_id) catch {
                 log.warn(
                     "failed to make a channel for tmux pane id={}",
@@ -224,6 +236,7 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         session_name: []const u8,
         windows: []const terminal.tmux.Viewer.Window,
+        sessions: []const terminal.tmux.Viewer.Session,
     ) void {
         if (comptime !tmux_enabled) return;
 
@@ -236,6 +249,7 @@ pub const StreamHandler = struct {
             self.alloc,
             session_name,
             windows,
+            sessions,
         ) catch |err| {
             log.warn("failed to snapshot tmux windows: {}", .{err});
             return;
@@ -291,6 +305,9 @@ pub const StreamHandler = struct {
         self.enquiry_response = config.enquiry_response;
         self.xt_checksum_report = config.xt_checksum_report;
         self.tmux_pause_after = config.tmux_pause_after;
+        self.tmux_history_limit = config.tmux_history_limit;
+        self.tmux_paste_buffer_clipboard = config.tmux_paste_buffer_clipboard;
+        self.tmux_client_flags = config.tmux_client_flags;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
@@ -636,6 +653,12 @@ pub const StreamHandler = struct {
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(global.io(), self.alloc, .{
                             .pause_after = self.tmux_pause_after,
+                            .history_limit = self.tmux_history_limit,
+                            .mirror_paste_buffers = self.tmux_paste_buffer_clipboard,
+                            .client_flags = .{
+                                .active_pane = self.tmux_client_flags.@"active-pane",
+                                .no_detach_on_destroy = self.tmux_client_flags.@"no-detach-on-destroy",
+                            },
                         });
                         errdefer viewer.deinit();
 
@@ -698,7 +721,7 @@ pub const StreamHandler = struct {
                         // and is freed at the end of this block. The GUI
                         // is told the session has no windows any more,
                         // the same way a session change starts over.
-                        .exit => self.tmuxWindows("", &.{}),
+                        .exit => self.tmuxWindows("", &.{}, &.{}),
 
                         // The surface is on another thread, so the text
                         // is copied out of the viewer's buffers. Losing
@@ -739,7 +762,28 @@ pub const StreamHandler = struct {
                             // this action is emitted, so their replies
                             // arrive after we are attached.
                             self.tmuxAttachPanes(viewer);
-                            self.tmuxWindows(viewer.session_name, windows);
+                            self.tmuxWindows(
+                                viewer.session_name,
+                                windows,
+                                viewer.sessions.items,
+                            );
+                        },
+
+                        // Copied out for the surface, which owns the
+                        // clipboard. Lost to an allocation failure, the
+                        // clipboard keeps what it had.
+                        .paste_buffer => |data| {
+                            const req = apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                data,
+                            ) catch |err| {
+                                log.warn(
+                                    "failed to copy a tmux paste buffer err={}",
+                                    .{err},
+                                );
+                                continue;
+                            };
+                            self.surfaceMessageWriter(.{ .tmux_paste_buffer = req });
                         },
                     }
                 }

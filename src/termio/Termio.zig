@@ -225,6 +225,9 @@ pub const DerivedConfig = struct {
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
     tmux_pause_after: u32,
+    tmux_history_limit: ?u32,
+    tmux_paste_buffer_clipboard: bool,
+    tmux_client_flags: configpkg.Config.TmuxClientFlags,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -264,6 +267,9 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .tmux_pause_after = config.@"tmux-pause-after",
+            .tmux_history_limit = config.@"tmux-history-limit",
+            .tmux_paste_buffer_clipboard = config.@"tmux-paste-buffer-clipboard",
+            .tmux_client_flags = config.@"tmux-client-flags",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
@@ -361,6 +367,13 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .enquiry_response = opts.config.enquiry_response,
         .xt_checksum_report = opts.config.xt_checksum_report,
         .tmux_host = if (comptime StreamHandler.tmux_enabled) self else {},
+
+        // Read when a control mode session starts, which can be long
+        // before the config is next reloaded.
+        .tmux_pause_after = opts.config.tmux_pause_after,
+        .tmux_history_limit = opts.config.tmux_history_limit,
+        .tmux_paste_buffer_clipboard = opts.config.tmux_paste_buffer_clipboard,
+        .tmux_client_flags = opts.config.tmux_client_flags,
 
         // tmux answers the program in a pane itself, and decides how
         // wide its characters are. See the fields.
@@ -537,6 +550,17 @@ fn tmuxHostInput(self: *Termio, input: terminalpkg.tmux.Viewer.Input) void {
 
     self.renderer_state.mutex.unlock(global.io());
     self.mailbox.notify();
+}
+
+/// Feed the viewer of the session we host an input that is about the
+/// session rather than any one pane: hiding a window, switching session,
+/// listing sessions. A no-op when no session is attached.
+///
+/// For the surface that hosts the session, which owns this termio and so
+/// needs no router to reach it.
+pub fn tmuxSessionInput(self: *Termio, input: terminalpkg.tmux.Viewer.Input) void {
+    if (comptime !StreamHandler.tmux_enabled) return;
+    self.tmuxHostInput(input);
 }
 
 fn tmuxHostWrite(ctx: *anyopaque, pane_id: usize, data: []const u8) void {

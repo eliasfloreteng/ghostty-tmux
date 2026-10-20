@@ -89,6 +89,9 @@ pub fn sync(
     var live_panes: std.AutoHashMapUnmanaged(usize, void) = .empty;
 
     for (windows) |window| {
+        // Hidden by the user: no tab, so it is pruned with the rest.
+        if (window.hidden) continue;
+
         live_windows.put(arena.allocator(), window.id, {}) catch return;
         for (window.nodeSlice()) |node| {
             if (node.content() == .pane) {

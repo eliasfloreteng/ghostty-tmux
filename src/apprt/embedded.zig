@@ -1927,6 +1927,44 @@ pub const CAPI = struct {
         return surface.core_surface.tmuxClosePane();
     }
 
+    /// Hide a window of the tmux session this surface hosts from the GUI,
+    /// or show it again. The window stays in the session; the next window
+    /// list carries the change. Returns false if this surface hosts no
+    /// session.
+    export fn ghostty_surface_tmux_set_window_hidden(
+        surface: *Surface,
+        window_id: usize,
+        hidden: bool,
+    ) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxSessionInput(.{ .hide_window = .{
+            .window_id = window_id,
+            .hidden = hidden,
+        } });
+    }
+
+    /// Move the tmux client this surface hosts to another session on the
+    /// same server. The session's windows replace the current ones, as
+    /// for any session change. Returns false if this surface hosts no
+    /// session.
+    export fn ghostty_surface_tmux_switch_session(
+        surface: *Surface,
+        session_id: usize,
+    ) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxSessionInput(.{ .switch_session = .{
+            .session_id = session_id,
+        } });
+    }
+
+    /// Read the server's sessions into the window list action, and keep
+    /// them current from now on. Calling it again refreshes counts tmux
+    /// does not announce. Returns false if this surface hosts no session.
+    export fn ghostty_surface_tmux_list_sessions(surface: *Surface) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxSessionInput(.list_sessions);
+    }
+
     /// Release a reference from ghostty_surface_tmux_router that was not
     /// handed to a surface config.
     export fn ghostty_tmux_router_free(router_: ?*anyopaque) void {

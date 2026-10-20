@@ -176,6 +176,14 @@ pub const Message = union(enum) {
     else
         void,
 
+    /// One of tmux's paste buffers changed, for the system clipboard.
+    /// See `tmux-paste-buffer-clipboard`. The receiver owns this and must
+    /// `deinit` it.
+    tmux_paste_buffer: if (terminal.options.tmux_control_mode)
+        WriteReq
+    else
+        void,
+
     pub const TmuxNotice = struct {
         kind: terminal.tmux.Viewer.Notice.Kind,
 
