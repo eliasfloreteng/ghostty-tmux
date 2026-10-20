@@ -463,6 +463,73 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Leave the tmux session, leaving everything in it running."),
         }},
 
+        // These too are unbound by default, and only mean something on
+        // a tmux pane.
+        .tmux_swap_pane => comptime &.{
+            .{
+                .action = .{ .tmux_swap_pane = .previous },
+                .title = i18n.N_("Swap tmux Pane: Previous"),
+                .description = i18n.N_("Swap the tmux pane with the one before it."),
+            },
+            .{
+                .action = .{ .tmux_swap_pane = .next },
+                .title = i18n.N_("Swap tmux Pane: Next"),
+                .description = i18n.N_("Swap the tmux pane with the one after it."),
+            },
+            .{
+                .action = .{ .tmux_swap_pane = .left },
+                .title = i18n.N_("Swap tmux Pane: Left"),
+                .description = i18n.N_("Swap the tmux pane with the one to its left."),
+            },
+            .{
+                .action = .{ .tmux_swap_pane = .right },
+                .title = i18n.N_("Swap tmux Pane: Right"),
+                .description = i18n.N_("Swap the tmux pane with the one to its right."),
+            },
+            .{
+                .action = .{ .tmux_swap_pane = .up },
+                .title = i18n.N_("Swap tmux Pane: Up"),
+                .description = i18n.N_("Swap the tmux pane with the one above it."),
+            },
+            .{
+                .action = .{ .tmux_swap_pane = .down },
+                .title = i18n.N_("Swap tmux Pane: Down"),
+                .description = i18n.N_("Swap the tmux pane with the one below it."),
+            },
+        },
+
+        .tmux_rotate_window => comptime &.{
+            .{
+                .action = .{ .tmux_rotate_window = .next },
+                .title = i18n.N_("Rotate tmux Panes: Forward"),
+                .description = i18n.N_("Move each tmux pane of the window into the place of the next."),
+            },
+            .{
+                .action = .{ .tmux_rotate_window = .previous },
+                .title = i18n.N_("Rotate tmux Panes: Backward"),
+                .description = i18n.N_("Move each tmux pane of the window into the place of the previous."),
+            },
+        },
+
+        .tmux_break_pane => comptime &.{.{
+            .action = .tmux_break_pane,
+            .title = i18n.N_("Break tmux Pane into New Window"),
+            .description = i18n.N_("Move the tmux pane out into a tmux window of its own."),
+        }},
+
+        .tmux_join_pane => comptime &.{
+            .{
+                .action = .{ .tmux_join_pane = .previous },
+                .title = i18n.N_("Join tmux Pane to Previous Window"),
+                .description = i18n.N_("Move the tmux pane into the tmux window before its own."),
+            },
+            .{
+                .action = .{ .tmux_join_pane = .next },
+                .title = i18n.N_("Join tmux Pane to Next Window"),
+                .description = i18n.N_("Move the tmux pane into the tmux window after its own."),
+            },
+        },
+
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
             .title = i18n.N_("Change Terminal Title…"),

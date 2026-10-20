@@ -608,6 +608,53 @@ pub const Action = union(enum) {
     /// and there has to be a way to say the other thing.
     tmux_detach,
 
+    /// Swap the focused tmux pane with another pane of its tmux window,
+    /// as tmux's `swap-pane` does. Focus stays with the pane, in its new
+    /// place.
+    ///
+    /// Valid arguments:
+    ///
+    ///   - `previous`, `next`
+    ///
+    ///     The pane before or after it in tmux's pane order, wrapping
+    ///     around, as tmux's own `{` and `}` bindings do.
+    ///
+    ///   - `left`, `right`, `up`, `down`
+    ///
+    ///     The pane beside it on that side, if there is one.
+    ///
+    /// Does nothing on a surface that is not a tmux pane. Unbound by
+    /// default.
+    tmux_swap_pane: SplitFocusDirection,
+
+    /// Move every pane of the focused tmux pane's window one place
+    /// along, as tmux's `rotate-window` does: `next` moves each pane into
+    /// the place of the one after it (`rotate-window -D`), `previous`
+    /// the other way (`-U`).
+    ///
+    /// Does nothing on a surface that is not a tmux pane. Unbound by
+    /// default.
+    tmux_rotate_window: Adjacent,
+
+    /// Take the focused tmux pane out of its window into a new tmux
+    /// window, which opens as a new tab, as tmux's `break-pane` does.
+    /// Dragging a tmux pane's split out of its window does the same, and
+    /// opens the new tmux window as a window of its own.
+    ///
+    /// Does nothing on a surface that is not a tmux pane. Unbound by
+    /// default.
+    tmux_break_pane,
+
+    /// Move the focused tmux pane into the tmux window before (`previous`)
+    /// or after (`next`) its own, to the right of that window's active
+    /// pane, as tmux's `join-pane -h` does. If the pane was alone in its
+    /// window, that window closes. Dragging a tmux pane's split onto a
+    /// pane of another tab moves it there in the same way.
+    ///
+    /// Does nothing on a surface that is not a tmux pane. Unbound by
+    /// default.
+    tmux_join_pane: Adjacent,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1123,6 +1170,12 @@ pub const Action = union(enum) {
         next,
     };
 
+    /// One step either way along an order, such as tmux's windows.
+    pub const Adjacent = enum {
+        previous,
+        next,
+    };
+
     pub const SplitResizeParameter = struct {
         SplitResizeDirection,
         u16,
@@ -1409,6 +1462,10 @@ pub const Action = union(enum) {
             .reset_font_size,
             .set_font_size,
             .tmux_detach,
+            .tmux_swap_pane,
+            .tmux_rotate_window,
+            .tmux_break_pane,
+            .tmux_join_pane,
             .prompt_surface_title,
             .prompt_tab_title,
             .prompt_window_title,

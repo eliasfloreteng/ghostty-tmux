@@ -39,6 +39,8 @@ const Op = sinkpkg.Op;
 const Sink = sinkpkg.Sink;
 const KillScope = sinkpkg.KillScope;
 const SplitDirection = sinkpkg.SplitDirection;
+const SwapTarget = sinkpkg.SwapTarget;
+const Adjacent = sinkpkg.Adjacent;
 
 const log = std.log.scoped(.terminal_tmux_router);
 
@@ -142,6 +144,41 @@ pub const Router = struct {
                 ctx: *anyopaque,
                 pane_id: usize,
                 name: []const u8,
+            ) void,
+
+            /// The user asked to swap this pane with another of its
+            /// window.
+            swapPane: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                target: SwapTarget,
+            ) void,
+
+            /// The user asked to rotate the panes of this pane's window.
+            rotateWindow: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                direction: Adjacent,
+            ) void,
+
+            /// The user asked to take this pane out into a window of its
+            /// own.
+            breakPane: *const fn (ctx: *anyopaque, pane_id: usize) void,
+
+            /// The user asked to move this pane into the window before or
+            /// after its own.
+            joinPane: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                window: Adjacent,
+            ) void,
+
+            /// The user dragged this pane beside another one.
+            movePane: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                target_pane_id: usize,
+                direction: SplitDirection,
             ) void,
         };
     };
@@ -522,6 +559,57 @@ pub const Router = struct {
         self.host.vtable.moveWindow(self.host.ctx, pane_id, amount);
     }
 
+    /// Ask the session to swap this pane with another of its window.
+    pub fn swapPane(self: *Router, pane_id: usize, target: SwapTarget) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.swapPane(self.host.ctx, pane_id, target);
+    }
+
+    /// Ask the session to rotate the panes of this pane's window.
+    pub fn rotateWindow(self: *Router, pane_id: usize, direction: Adjacent) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.rotateWindow(self.host.ctx, pane_id, direction);
+    }
+
+    /// Ask the session to give this pane a window of its own.
+    pub fn breakPane(self: *Router, pane_id: usize) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.breakPane(self.host.ctx, pane_id);
+    }
+
+    /// Ask the session to move this pane into a neighbouring window.
+    pub fn joinPane(self: *Router, pane_id: usize, window: Adjacent) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.joinPane(self.host.ctx, pane_id, window);
+    }
+
+    /// Ask the session to move a pane beside another. Both have to be
+    /// this session's: a pane of another session is another router's.
+    pub fn movePane(
+        self: *Router,
+        pane_id: usize,
+        target_pane_id: usize,
+        direction: SplitDirection,
+    ) void {
+        if (!self.paneOpen(pane_id) or !self.paneOpen(target_pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.movePane(
+            self.host.ctx,
+            pane_id,
+            target_pane_id,
+            direction,
+        );
+    }
+
     /// Ask the session to toggle zoom on this pane.
     pub fn zoomPane(self: *Router, pane_id: usize) void {
         if (!self.paneOpen(pane_id)) return;
@@ -685,6 +773,19 @@ const TestHost = struct {
         pane_id: usize,
         scope: KillScope,
     }) = .empty,
+    pane_moves: std.ArrayList(PaneMove) = .empty,
+
+    const PaneMove = union(enum) {
+        swap: struct { pane_id: usize, target: SwapTarget },
+        rotate: struct { pane_id: usize, direction: Adjacent },
+        breakout: usize,
+        join: struct { pane_id: usize, window: Adjacent },
+        move: struct {
+            pane_id: usize,
+            target_pane_id: usize,
+            direction: SplitDirection,
+        },
+    };
 
     const vtable: Router.Host.VTable = .{
         .write = write,
@@ -699,7 +800,46 @@ const TestHost = struct {
         .zoomPane = zoomPane,
         .moveWindow = moveWindow,
         .renameWindow = renameWindow,
+        .swapPane = swapPane,
+        .rotateWindow = rotateWindow,
+        .breakPane = breakPane,
+        .joinPane = joinPane,
+        .movePane = movePane,
     };
+
+    fn paneMove(ctx: *anyopaque, move: PaneMove) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.pane_moves.append(self.alloc, move) catch @panic("oom");
+    }
+
+    fn swapPane(ctx: *anyopaque, pane_id: usize, target: SwapTarget) void {
+        paneMove(ctx, .{ .swap = .{ .pane_id = pane_id, .target = target } });
+    }
+
+    fn rotateWindow(ctx: *anyopaque, pane_id: usize, direction: Adjacent) void {
+        paneMove(ctx, .{ .rotate = .{ .pane_id = pane_id, .direction = direction } });
+    }
+
+    fn breakPane(ctx: *anyopaque, pane_id: usize) void {
+        paneMove(ctx, .{ .breakout = pane_id });
+    }
+
+    fn joinPane(ctx: *anyopaque, pane_id: usize, window: Adjacent) void {
+        paneMove(ctx, .{ .join = .{ .pane_id = pane_id, .window = window } });
+    }
+
+    fn movePane(
+        ctx: *anyopaque,
+        pane_id: usize,
+        target_pane_id: usize,
+        direction: SplitDirection,
+    ) void {
+        paneMove(ctx, .{ .move = .{
+            .pane_id = pane_id,
+            .target_pane_id = target_pane_id,
+            .direction = direction,
+        } });
+    }
 
     fn killWindows(
         ctx: *anyopaque,
@@ -772,6 +912,7 @@ const TestHost = struct {
         self.selected_panes.deinit(self.alloc);
         self.zoomed_panes.deinit(self.alloc);
         self.window_moves.deinit(self.alloc);
+        self.pane_moves.deinit(self.alloc);
         for (self.renames.items) |r| self.alloc.free(r);
         self.renames.deinit(self.alloc);
     }
@@ -1060,6 +1201,39 @@ test "input reaches the host and stops when the pane does" {
     tr.router.writePaste(5, "nope");
     try testing.expectEqual(1, tr.host.writes.items.len);
     try testing.expectEqual(1, tr.host.pastes.items.len);
+}
+
+test "rearranging panes reaches the host only for panes still open" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    const five = try tr.router.createChannel(5);
+    _ = try tr.router.createChannel(6);
+
+    tr.router.swapPane(5, .left);
+    tr.router.rotateWindow(5, .next);
+    tr.router.breakPane(5);
+    tr.router.joinPane(5, .previous);
+    tr.router.movePane(5, 6, .down);
+    try testing.expectEqual(5, tr.host.pane_moves.items.len);
+    try testing.expectEqual(
+        TestHost.PaneMove{ .move = .{
+            .pane_id = 5,
+            .target_pane_id = 6,
+            .direction = .down,
+        } },
+        tr.host.pane_moves.items[4],
+    );
+
+    // A pane of another session (or none) cannot be moved beside, and
+    // a closed pane cannot be moved at all.
+    tr.router.movePane(5, 1234, .down);
+    five.close();
+    tr.router.swapPane(5, .left);
+    tr.router.movePane(6, 5, .up);
+    try testing.expectEqual(5, tr.host.pane_moves.items.len);
 }
 
 test "detachHost closes every pane and blocks further host calls" {

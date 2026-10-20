@@ -2366,6 +2366,81 @@ fn tmuxZoom(self: *Surface) bool {
     return true;
 }
 
+/// Ask tmux to swap this pane with another of its window, if this
+/// surface is a pane.
+fn tmuxSwapPane(self: *Surface, target: terminal.tmux.sink.SwapTarget) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.swapPane(pane.id, target);
+    return true;
+}
+
+/// Ask tmux to rotate the panes of this pane's window, if this surface
+/// is a pane.
+fn tmuxRotateWindow(self: *Surface, direction: terminal.tmux.sink.Adjacent) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.rotateWindow(pane.id, direction);
+    return true;
+}
+
+/// Ask tmux to give this pane a window of its own, if this surface is a
+/// pane.
+///
+/// Public because the embedded apprt calls it when a split is dragged
+/// out of its window, which AppKit handles without a binding.
+pub fn tmuxBreakPane(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.breakPane(pane.id);
+    return true;
+}
+
+/// Ask tmux to move this pane into a neighbouring window, if this
+/// surface is a pane.
+fn tmuxJoinPane(self: *Surface, window: terminal.tmux.sink.Adjacent) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.joinPane(pane.id, window);
+    return true;
+}
+
+/// Ask tmux to move this surface's pane beside `target`'s, if both are
+/// panes of the same session.
+///
+/// Public because the embedded apprt calls it for a split dragged onto
+/// another one, which AppKit handles without a binding: rearranging the
+/// split tree locally tells tmux nothing, and tmux's next layout would
+/// put the panes back where they were.
+///
+/// Returns false when either is not a tmux pane, or they are panes of
+/// different sessions -- which a GUI can drag between, but tmux cannot
+/// move a pane between.
+pub fn tmuxMovePane(
+    self: *Surface,
+    target: *Surface,
+    direction: terminal.tmux.sink.SplitDirection,
+) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    const target_pane = target.tmuxPane() orelse return false;
+    defer target_pane.router.unref();
+    if (pane.router != target_pane.router) return false;
+
+    pane.router.movePane(pane.id, target_pane.id, direction);
+    return true;
+}
+
 /// Leave the tmux session this surface belongs to, if it belongs to one.
 ///
 /// The pane is only how we reach the session; detaching is not about it.
@@ -5707,6 +5782,29 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .tmux_detach => return self.tmuxDetach(),
+
+        .tmux_swap_pane => |v| return self.tmuxSwapPane(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.SwapTarget,
+                @tagName(tag),
+            ),
+        }),
+
+        .tmux_rotate_window => |v| return self.tmuxRotateWindow(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.Adjacent,
+                @tagName(tag),
+            ),
+        }),
+
+        .tmux_break_pane => return self.tmuxBreakPane(),
+
+        .tmux_join_pane => |v| return self.tmuxJoinPane(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.Adjacent,
+                @tagName(tag),
+            ),
+        }),
 
         .new_tab => {
             // On a tmux pane, a new tab is a new tmux window: the point

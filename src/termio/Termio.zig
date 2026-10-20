@@ -485,6 +485,11 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .zoomPane = tmuxHostZoomPane,
     .moveWindow = tmuxHostMoveWindow,
     .renameWindow = tmuxHostRenameWindow,
+    .swapPane = tmuxHostSwapPane,
+    .rotateWindow = tmuxHostRotateWindow,
+    .breakPane = tmuxHostBreakPane,
+    .joinPane = tmuxHostJoinPane,
+    .movePane = tmuxHostMovePane,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -592,6 +597,61 @@ fn tmuxHostMoveWindow(ctx: *anyopaque, pane_id: usize, amount: isize) void {
     self.tmuxHostInput(.{ .move_window = .{
         .pane_id = pane_id,
         .amount = amount,
+    } });
+}
+
+fn tmuxHostSwapPane(
+    ctx: *anyopaque,
+    pane_id: usize,
+    target: terminalpkg.tmux.sink.SwapTarget,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .swap_pane = .{
+        .pane_id = pane_id,
+        .target = target,
+    } });
+}
+
+fn tmuxHostRotateWindow(
+    ctx: *anyopaque,
+    pane_id: usize,
+    direction: terminalpkg.tmux.sink.Adjacent,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .rotate_window = .{
+        .pane_id = pane_id,
+        .direction = direction,
+    } });
+}
+
+fn tmuxHostBreakPane(ctx: *anyopaque, pane_id: usize) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .break_pane = .{ .pane_id = pane_id } });
+}
+
+fn tmuxHostJoinPane(
+    ctx: *anyopaque,
+    pane_id: usize,
+    window: terminalpkg.tmux.sink.Adjacent,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .join_pane = .{
+        .pane_id = pane_id,
+        .window = window,
+    } });
+}
+
+fn tmuxHostMovePane(
+    ctx: *anyopaque,
+    pane_id: usize,
+    target_pane_id: usize,
+    direction: terminalpkg.tmux.sink.SplitDirection,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .move_pane = .{
+        .pane_id = pane_id,
+        .target_pane_id = target_pane_id,
+        .direction = direction,
     } });
 }
 

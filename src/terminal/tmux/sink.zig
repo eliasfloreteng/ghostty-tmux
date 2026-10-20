@@ -68,6 +68,31 @@ pub const SplitDirection = enum {
     up,
 };
 
+/// Which pane a pane trades places with.
+///
+/// Lives here for the same reason as `KillScope`.
+pub const SwapTarget = enum {
+    /// The pane before it in tmux's own pane order, as `swap-pane -U`
+    /// (tmux's `{` binding) has it.
+    previous,
+    /// The pane after it, as `swap-pane -D` (`}`).
+    next,
+    /// The pane beside it on that side of the window's layout.
+    left,
+    right,
+    up,
+    down,
+};
+
+/// One step either way along an order tmux keeps: a window's panes for
+/// `rotate-window`, the session's windows for `join-pane`.
+///
+/// Lives here for the same reason as `KillScope`.
+pub const Adjacent = enum {
+    previous,
+    next,
+};
+
 pub const Op = union(enum) {
     /// Raw VT bytes: `%output` data, or capture-pane replay content.
     ///
