@@ -172,6 +172,11 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   client the pane's output as written, and the option is only about the
   terminals tmux draws on), and `clipboard-write = deny` refuses it. The
   app is relaunched for the latter, and your clipboard text is restored.
+- `pane_tui_redraws`: a full screen TUI drawn in box drawing characters
+  (a shell script, so nothing needs installing) shows exactly the text
+  tmux has on attach, after switching to another tab and back, and after
+  growing the window and shrinking it back. Resizing needs the
+  Accessibility permission; without it that part `SKIP`s.
 - `pane_grapheme_widths`: ZWJ sequences, flags, VS15/VS16 and combining
   marks take the columns tmux gives them, with
   `grapheme-width-method = legacy` and a program resetting mode 2027 (the

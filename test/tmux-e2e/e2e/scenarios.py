@@ -1294,3 +1294,94 @@ def switch_client_same_session(ctx: Context) -> None:
             f"the panes changed: {before} -> {ctx.describe()}",
         )
     ctx.wait_synced()
+
+
+# A full screen TUI drawn the way lazygit or Claude Code draws one: box
+# drawing borders (three UTF-8 bytes a cell, which tmux splits across
+# %output lines), a bar painted in reverse video to the last column, and a
+# repaint on every SIGWINCH. Plain sh and printf, so it needs nothing the
+# pane's empty environment may not have.
+_TUI_SCRIPT = r"""
+h='─' v='│'
+draw() {
+    set -- $(stty size)
+    rows=$1 cols=$2
+    printf '\033[H\033[2J'
+    i=1
+    while [ "$i" -lt "$rows" ]; do
+        printf '\033[%d;1H%s line-%04d ' "$i" "$v" "$i"
+        n=13
+        while [ "$n" -lt $((cols - 1)) ]; do printf '%s' "$h"; n=$((n + 1)); done
+        printf '%s' "$v"
+        i=$((i + 1))
+    done
+    printf '\033[%d;1H\033[7m tui %dx%d' "$rows" "$cols" "$rows"
+    printf '\033[K\033[27m'
+}
+trap draw WINCH
+printf '\033[?1049h'
+draw
+while :; do sleep 1; done
+"""
+
+
+def _screen_lines(text: str) -> list[str]:
+    lines = [line.rstrip() for line in text.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def expect_same_text(ctx: Context, term: str, pane: str, desc: str) -> None:
+    """The GUI terminal shows exactly the text tmux has on the pane's screen."""
+
+    def want() -> list[str]:
+        return _screen_lines(ctx.tmux.run("capture-pane", "-p", "-t", pane))
+
+    def gui() -> list[str]:
+        lines = _screen_lines(ctx.app.read_screen(term))
+        return lines[-len(want()) :] if want() else lines
+
+    wait_until(
+        lambda: gui() == want(),
+        timeout=ctx.timeout,
+        desc=desc,
+        describe_state=lambda: "\n".join(
+            f"{i:3} tmux |{w}|\n    gui  |{g}|" for i, (w, g) in enumerate(zip(want(), gui())) if w != g
+        )[:2000],
+    )
+
+
+@scenario
+def pane_tui_redraws(ctx: Context) -> None:
+    """A box-drawn full screen TUI looks as it does in tmux on attach, after switching tabs, and through resizes."""
+    ctx.open_gateway()
+    ctx.create_session({"main": 1, "other": 1})
+    script = ctx.tmux.conf.parent / "tui.sh"
+    script.write_text(_TUI_SCRIPT)
+    pane = f"{SESSION}:main"
+    ctx.tmux.run("send-keys", "-t", pane, f"sh {script}", "Enter")
+    wait_until(lambda: "line-0001" in ctx.tmux.capture(pane), timeout=ctx.timeout, desc="the TUI in tmux")
+
+    ctx.attach_session()
+    tab = ctx.tab_for_window("main")
+    term = tab.terminals[0].id
+    expect_same_text(ctx, term, pane, "the GUI to show the TUI as tmux does on attach")
+
+    # Away and back.
+    for _ in range(2):
+        ctx.app.select_tab(ctx.tab_for_window("other"))
+        time.sleep(0.5)
+        ctx.app.select_tab(tab)
+        expect_same_text(ctx, term, pane, "the TUI to look the same after switching tabs")
+
+    # Bigger, as fullscreen would make it, then back.
+    native = [w for w in native_windows(ctx.app.pid) if w.onscreen]
+    if not native:
+        raise Skip("no on-screen window to resize")
+    width, height = native[0].width, native[0].height
+    for w, h in ((width + 400, height + 250), (width, height)):
+        if not resize_front_window(ctx.app.pid, w, h):
+            raise Skip("resizing windows needs the Accessibility permission")
+        time.sleep(1)
+        expect_same_text(ctx, term, pane, f"the TUI to look the same after resizing the window to {w}x{h}")
