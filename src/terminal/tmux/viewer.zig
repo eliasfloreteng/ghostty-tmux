@@ -938,7 +938,27 @@ pub const Viewer = struct {
         // pane reports again. That loop has no fixed point -- it walks
         // the divider a cell per round trip for as long as it runs. So
         // nothing goes out until every pane in the window has spoken.
-        if (!layoutFullyRequested(&self.panes, window.layout)) return &.{};
+        //
+        // Except when the window as a whole is not changing size. A
+        // surface only reports when its own size changes, so dragging a
+        // divider inside one side of a split ({A | [B / C]}, moving the
+        // B/C divider) has B and C report and A say nothing, ever: A was
+        // not resized. Waiting for A would ignore the drag for good.
+        // There is nothing to mix up here, because no window size is
+        // being composed: if the panes that did report, with the rest at
+        // the sizes tmux has them, add up to the window tmux already
+        // has, the reports describe a rearrangement inside it, and the
+        // panes are resized on their own. A report that changes the
+        // window's size still waits for every pane, so a half-reported
+        // relayout (B in, C still in flight) does not add up and waits.
+        // And a report of the size a pane already has asks for nothing,
+        // so it waits for company rather than going out alone.
+        if (!layoutFullyRequested(&self.panes, window.layout)) {
+            const composed = composeLayoutSize(&self.panes, window.layout);
+            if (composed.cols != window.width or
+                composed.rows != window.height or
+                !layoutRequestsChange(&self.panes, window.layout)) return &.{};
+        }
 
         return self.queueResize(window) catch |err| {
             log.warn(
@@ -964,6 +984,23 @@ pub const Viewer = struct {
             .horizontal, .vertical => |children| for (children) |child| {
                 if (!layoutFullyRequested(panes, child)) break false;
             } else true,
+        };
+    }
+
+    /// Whether any pane in the layout is asking for a size other than
+    /// the one tmux has it at.
+    fn layoutRequestsChange(panes: *const PanesMap, node: Layout) bool {
+        return switch (node.content) {
+            .pane => |id| pane: {
+                const pane = panes.get(id) orelse break :pane false;
+                const want = pane.last_resize_request orelse break :pane false;
+                break :pane want.cols != pane.terminal.cols or
+                    want.rows != pane.terminal.rows;
+            },
+
+            .horizontal, .vertical => |children| for (children) |child| {
+                if (layoutRequestsChange(panes, child)) break true;
+            } else false,
         };
     }
 
@@ -7942,4 +7979,55 @@ test "a pane tmux resizes is read again, without breaking a sequence in flight" 
         const blue = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
         try testing.expect(blue.cell.style_id != 0);
     }
+}
+
+test "dragging a divider that leaves one side alone resizes the panes it moved" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    // Pane 0 on the left; panes 1 (20 rows) and 2 (23 rows) stacked on
+    // the right.
+    const layout = "5169,83x44,0,0{41x44,0,0,0,41x44,42,0[41x20,42,0,1,41x23,42,21,2]}";
+    try testViewer(&viewer, comptime &([_]TestStep{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end = "$0 @0 1 83 44 " ++ layout ++ " 0 " ++ layout ++ " %0",
+        } } },
+    } ++ testPrimaryCaptureSteps("", "") ++
+        testPrimaryCaptureSteps("", "") ++
+        testPrimaryCaptureSteps("", "") ++ [_]TestStep{
+        // pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    }));
+
+    try testViewer(&viewer, &.{
+        // The divider between 1 and 2 moves down five rows. Pane 1
+        // reports first: with 2 still at 23 rows that is a taller
+        // window than tmux has, so it waits for 2.
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 41, .rows = 25 } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |a| try testing.expect(a != .command);
+                }
+            }).check,
+        },
+
+        // Pane 2 reports. Pane 0 never will -- it did not change -- and
+        // the three add up to the window tmux already has, so the two
+        // that moved are resized.
+        .{
+            .input = .{ .resize = .{ .pane_id = 2, .cols = 41, .rows = 18 } },
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "resize-pane -t %1 -x 41 -y 25\n",
+                "resize-pane -t %2 -x 41 -y 18\n",
+            },
+        },
+    });
 }

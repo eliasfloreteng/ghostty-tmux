@@ -2757,3 +2757,112 @@ fn haveCommand(name: []const u8) bool {
     testing.allocator.free(out);
     return true;
 }
+
+test "live: split panes look the same here as in tmux when their window grows and shrinks" {
+    if (!enabled()) return error.SkipZigTest;
+    if (!haveCommand("nvim")) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24,
+        \\d=$(mktemp -d) && seq -f 'line %g of a file long enough to need wrapping when the window is narrow' 1 200 > "$d/f" && exec nvim --clean -c 'set number cursorline laststatus=2 wrap' "$d/f"
+    , .{ .ready = .{ .target = ":0", .format = "#{alternate_on}", .expect = "1" } });
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // A shell with wrapped lines beside it, the way a split is made from
+    // the GUI.
+    {
+        const out = try session.ask(&.{
+            "split-window",                                                                                        "-h", "-t", "%0",
+            "seq -f 'a long line number %g that goes on and on and wraps at narrower widths' 1 40; exec sleep 60",
+        });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try settle(&session, 400);
+
+    var ids: [2]usize = undefined;
+    for (session.viewer.panes.keys(), &ids) |k, *id| id.* = k;
+    for (ids) |id| try expectMatchesTmux(&session, id);
+
+    // Fullscreen, back, and a narrow window. Both surfaces report, as
+    // they do when their window resizes: the left one keeps half and
+    // the right one the rest, less the divider.
+    const sizes = [_][2]u16{ .{ 160, 48 }, .{ 80, 24 }, .{ 61, 30 } };
+    for (sizes) |s| {
+        const left: u16 = (s[0] - 1) / 2;
+        try session.input(.{ .resize = .{ .pane_id = ids[0], .cols = left, .rows = s[1] } });
+        try session.input(.{ .resize = .{ .pane_id = ids[1], .cols = s[0] - 1 - left, .rows = s[1] } });
+
+        var want_buf: [32]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, "{d}x{d}", .{ s[0], s[1] });
+        var rounds: usize = 0;
+        while (true) : (rounds += 1) {
+            if (rounds >= timeout_ms / poll_ms) return error.TimedOutWaitingForTmux;
+            _ = try session.pump();
+            if (std.mem.eql(u8, try session.windowSize(session.viewer.windows.items[0].id), want)) break;
+        }
+        try settle(&session, 400);
+
+        for (ids) |id| expectMatchesTmux(&session, id) catch |err| {
+            log.err("pane %{d} after resizing the window to {d}x{d}", .{ id, s[0], s[1] });
+            return err;
+        };
+    }
+    try testing.expect(!session.exited);
+}
+
+test "live: dragging a divider that leaves a pane alone still moves it" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 81, 24, "sleep 60");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // {A | [B / C]}: A on the left, B above C on the right.
+    for ([_][]const []const u8{
+        &.{ "split-window", "-h", "-t", "%0", "sleep 60" },
+        &.{ "split-window", "-v", "-t", "%1", "sleep 60" },
+    }) |argv| {
+        const out = try session.ask(argv);
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 3 and v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const height = struct {
+        fn of(s: *Session, comptime target: []const u8) !usize {
+            const out = try s.ask(&.{ "display-message", "-p", "-t", target, "#{pane_height}" });
+            defer s.alloc.free(out);
+            return std.fmt.parseInt(usize, std.mem.trim(u8, out, " \r\n"), 10);
+        }
+    }.of;
+    const b = try height(&session, "%1");
+    const c = try height(&session, "%2");
+    const width = blk: {
+        const out = try session.ask(&.{ "display-message", "-p", "-t", "%1", "#{pane_width}" });
+        defer alloc.free(out);
+        break :blk try std.fmt.parseInt(u16, std.mem.trim(u8, out, " \r\n"), 10);
+    };
+
+    // The B/C divider moves down three rows. A's surface did not change
+    // size, so it says nothing.
+    try session.input(.{ .resize = .{ .pane_id = 1, .cols = width, .rows = b + 3 } });
+    try session.input(.{ .resize = .{ .pane_id = 2, .cols = width, .rows = c - 3 } });
+
+    var rounds: usize = 0;
+    while (try height(&session, "%1") != b + 3) : (rounds += 1) {
+        if (rounds >= timeout_ms / poll_ms) return error.TimedOutWaitingForTmux;
+        _ = try session.pump();
+    }
+    try testing.expectEqual(c - 3, try height(&session, "%2"));
+    try testing.expect(!session.exited);
+}
