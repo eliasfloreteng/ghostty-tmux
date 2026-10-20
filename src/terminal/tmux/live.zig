@@ -42,6 +42,7 @@ const build_options = @import("terminal_options");
 const Parser = @import("../Parser.zig");
 const Screen = @import("../Screen.zig");
 const Terminal = @import("../Terminal.zig");
+const TerminalStream = @import("../stream_terminal.zig").Stream;
 const Style = @import("../style.zig").Style;
 const dcs = @import("../dcs.zig");
 const ptypkg = @import("../../pty.zig");
@@ -3803,4 +3804,297 @@ test "live: a synchronized, relatively positioned redraw looks the same here as 
     try expectFollowsTmuxThroughResizes(
         \\printf 'prompt$ claude\r\n'; i=0; while [ $i -lt 60 ]; do printf '\033[?2026h'; [ $i -gt 0 ] && printf '\033[6A\r'; printf '\033[2K\033[38;5;174m╭──────────────────────────────╮\033[0m\r\n'; printf '\033[2K\033[38;5;174m│\033[0m \033[1mframe %03d\033[0m                   \033[38;5;174m│\033[0m\r\n' $i; printf '\033[2K\033[38;5;174m│\033[0m \033[48;5;236m> type here               \033[0m   \033[38;5;174m│\033[0m\r\n'; printf '\033[2K\033[38;5;174m╰──────────────────────────────╯\033[0m\r\n'; printf '\033[2K  \033[2m? for shortcuts\033[0m\r\n\033[2K\r\n'; printf '\033[?2026l'; i=$((i+1)); sleep 0.05; done; exec sleep 60
     , "0");
+}
+
+/// A display for a pane, as a surface is one: a terminal of its own with
+/// unlimited scrollback, applying every op. Init in place: the stream's
+/// handler points at `terminal`.
+const DisplaySink = struct {
+    alloc: Allocator,
+    terminal: Terminal,
+    stream: TerminalStream,
+
+    /// How many times it was told all of the history is in.
+    completes: usize = 0,
+
+    /// The `read` of the last older history it refused as drifted, to
+    /// pass on as a surface does.
+    drifted: ?u32 = null,
+
+    fn init(self: *DisplaySink, alloc: Allocator, io: std.Io, cols: u16, rows: u16) !void {
+        self.* = .{
+            .alloc = alloc,
+            .terminal = try .init(io, alloc, .{
+                .cols = cols,
+                .rows = rows,
+                .max_scrollback_bytes = null,
+            }),
+            .stream = undefined,
+        };
+        self.stream = self.terminal.vtStream();
+    }
+
+    fn deinit(self: *DisplaySink) void {
+        self.stream.deinit();
+        self.terminal.deinit(self.alloc);
+    }
+
+    fn sink(self: *DisplaySink) Sink {
+        return .{ .ctx = self, .vtable = &.{
+            .ops = ops,
+            .close = close,
+        } };
+    }
+
+    fn ops(ctx: *anyopaque, list: []const sinkpkg.Op) void {
+        const self: *DisplaySink = @ptrCast(@alignCast(ctx));
+        for (list) |op| switch (op) {
+            .bytes => |b| self.stream.nextSlice(b),
+            .passthrough => {},
+            .history_complete => self.completes += 1,
+            else => sinkpkg.applyOp(self.alloc, &self.terminal, op) catch |err| switch (err) {
+                error.HistoryDrifted => self.drifted = op.older_history.read,
+                else => @panic("display failed to apply an op"),
+            },
+        };
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    /// Rows of scrollback above the primary screen.
+    fn held(self: *DisplaySink) usize {
+        const pages = &self.terminal.screens.get(.primary).?.pages;
+        return pages.total_rows - pages.rows;
+    }
+};
+
+/// Ask for older history the way a surface scrolled to the top does,
+/// until the display holds no more than it did before asking.
+fn readAllOlderHistory(session: *Session, display: *DisplaySink) !void {
+    var rounds: usize = 0;
+    while (rounds < timeout_ms / poll_ms) : (rounds += 1) {
+        const before = display.held();
+        try session.input(.{ .history_wanted = .{
+            .pane_id = 0,
+            .held = before,
+        } });
+        try session.waitFor(attached);
+        if (display.held() == before) return;
+    }
+    return error.TimedOutWaitingForTmux;
+}
+
+/// Whether the display's history is tmux's, row for row.
+fn expectHistoryIsTmuxs(session: *Session, display: *DisplaySink) !void {
+    const alloc = session.alloc;
+    const tmux = try session.ask(&.{ "capture-pane", "-p", "-S", "-", "-E", "-1", "-t", "%0" });
+    defer alloc.free(tmux);
+    const ours = try display.terminal.screens.get(.primary).?.dumpStringAlloc(
+        alloc,
+        .{ .history = .{} },
+    );
+    defer alloc.free(ours);
+
+    // Row for row, trailing blanks aside, which neither keeps the same.
+    var want = std.mem.splitScalar(u8, std.mem.trimEnd(u8, tmux, "\n"), '\n');
+    var got = std.mem.splitScalar(u8, ours, '\n');
+    var row: usize = 0;
+    while (want.next()) |w| : (row += 1) {
+        const g = got.next() orelse {
+            log.warn("display history ends at row {}", .{row});
+            return error.TestExpectedEqual;
+        };
+        testing.expectEqualStrings(
+            std.mem.trimEnd(u8, w, " "),
+            std.mem.trimEnd(u8, g, " "),
+        ) catch |err| {
+            log.warn("display history differs at row {}", .{row});
+            return err;
+        };
+    }
+    try testing.expect(got.next() == null);
+}
+
+test "live: older history is read as the display asks, after a resize too" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // Lines longer than the pane is wide, so every line is two rows, and
+    // how it reflows when the pane narrows is up to whoever reflows it.
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "awk 'BEGIN { for (i = 1; i <= 1500; i++) printf \"%05d %0100d\\n\", i, i }'; exec cat",
+        .{
+            .viewer = .{ .lazy_history = true, .history_chunk = 500 },
+            .history_limit = 20000,
+            .min_history = 2900,
+        },
+    );
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    var display: DisplaySink = undefined;
+    try display.init(alloc, testing.io, 80, 24);
+    defer display.deinit();
+    try session.viewer.attachPane(0, display.sink());
+
+    // Narrower: we reflow our history, tmux reflows its own, and the pane
+    // is read again with its newest chunk of history, which is all the
+    // display has to start from.
+    try session.input(.{ .resize = .{ .pane_id = 0, .cols = 60, .rows = 20 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(0) orelse return false;
+            return pane.terminal.cols == 60 and attached(v);
+        }
+    }.pred);
+    try testing.expectEqual(500, display.held());
+
+    // Then the rest, a chunk at a time, exactly as tmux has it.
+    try readAllOlderHistory(&session, &display);
+    try testing.expect(display.held() > 2900);
+    try expectHistoryIsTmuxs(&session, &display);
+
+    // Output scrolling more into both changes nothing about that, and
+    // asking again from the top finds nothing more.
+    try session.input(.{ .write = .{ .pane_id = 0, .data = "more\r" } });
+    try session.waitForPaneText(0, "more");
+    try session.waitFor(attached);
+    try readAllOlderHistory(&session, &display);
+    try expectHistoryIsTmuxs(&session, &display);
+    try testing.expect(!session.exited);
+}
+
+test "live: all of the older history is read at once for a search" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "seq 4000; exec cat",
+        .{
+            .viewer = .{ .lazy_history = true, .history_chunk = 100 },
+            .history_limit = 20000,
+            .min_history = 3900,
+        },
+    );
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    var display: DisplaySink = undefined;
+    try display.init(alloc, testing.io, 80, 24);
+    defer display.deinit();
+    try session.viewer.attachPane(0, display.sink());
+
+    // Something to start from: the newest chunk, as a resize reads it.
+    try session.input(.{ .resize = .{ .pane_id = 0, .cols = 70, .rows = 24 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(0) orelse return false;
+            return pane.terminal.cols == 70 and attached(v);
+        }
+    }.pred);
+    try testing.expectEqual(100, display.held());
+
+    try session.input(.{ .history_wanted = .{
+        .pane_id = 0,
+        .held = display.held(),
+        .all = true,
+    } });
+    try session.waitFor(attached);
+    try expectHistoryIsTmuxs(&session, &display);
+    try testing.expect(!session.exited);
+}
+
+/// A session with `seq 4000` in its one pane, history read 100 lines at
+/// a time, and `display` attached holding the newest 100 of it, as a
+/// resize leaves it.
+fn startChunkedDisplay(alloc: Allocator, display: *DisplaySink) !Session {
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "seq 4000; exec cat",
+        .{
+            .viewer = .{ .lazy_history = true, .history_chunk = 100 },
+            .history_limit = 20000,
+            .min_history = 3900,
+        },
+    );
+    errdefer session.deinit();
+    try session.waitFor(attached);
+
+    try display.init(alloc, testing.io, 80, 24);
+    errdefer display.deinit();
+    try session.viewer.attachPane(0, display.sink());
+    try session.input(.{ .resize = .{ .pane_id = 0, .cols = 70, .rows = 24 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(0) orelse return false;
+            return pane.terminal.cols == 70 and attached(v);
+        }
+    }.pred);
+    try testing.expectEqual(100, display.held());
+    return session;
+}
+
+test "live: a display needing all of its history is told once it has it" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var display: DisplaySink = undefined;
+    var session = try startChunkedDisplay(alloc, &display);
+    defer session.deinit();
+    defer display.deinit();
+
+    // As a select all does, held until it is told.
+    try session.input(.{ .read_history = .{ .pane_id = 0 } });
+    try session.waitFor(attached);
+    try testing.expectEqual(1, display.completes);
+    try expectHistoryIsTmuxs(&session, &display);
+    try testing.expect(!session.exited);
+}
+
+test "live: history that drifted from tmux's is read again and then reads on" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var display: DisplaySink = undefined;
+    var session = try startChunkedDisplay(alloc, &display);
+    defer session.deinit();
+    defer display.deinit();
+
+    // Make the display's oldest line one tmux does not have, as the two
+    // clearing the screen into history by different rules would.
+    {
+        const pages = &display.terminal.screens.get(.primary).?.pages;
+        const pin = pages.pin(.{ .history = .{} }).?;
+        pin.cells(.all)[0] = .init('Z');
+    }
+
+    // Its older history is refused, and passed on as a surface does.
+    try session.input(.{ .history_wanted = .{ .pane_id = 0, .held = display.held() } });
+    try session.waitFor(attached);
+    try testing.expectEqual(100, display.held());
+    const read = display.drifted orelse return error.TestUnexpectedResult;
+    try session.input(.{ .history_drifted = .{ .pane_id = 0, .read = read } });
+    try session.waitFor(attached);
+
+    // Read again from scratch, the display agrees with tmux, and older
+    // history goes in above it from there.
+    try testing.expectEqual(100, display.held());
+    display.drifted = null;
+    try readAllOlderHistory(&session, &display);
+    try testing.expect(display.drifted == null);
+    try testing.expect(display.held() > 3900);
+    try expectHistoryIsTmuxs(&session, &display);
+    try testing.expect(!session.exited);
 }

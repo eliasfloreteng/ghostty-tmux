@@ -452,6 +452,14 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
     // released: the mailbox can block, and only ever frees up our lock.
     var status: ?terminalpkg.tmux.sink.PaneStatus = null;
 
+    // The same for what the surface passes on to the viewer: older
+    // history that drifted from tmux's, and all of it being in. Through
+    // the surface rather than the router from here, because this runs
+    // inside the router's delivery, on whatever thread flushed it, and
+    // that can be the host's own.
+    var drifted: ?u32 = null;
+    var complete = false;
+
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
@@ -505,6 +513,17 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
 
             .pane_status => |v| status = v,
 
+            .history_complete => complete = true,
+
+            .older_history => |v| terminalpkg.tmux.sink.applyOp(
+                self.alloc,
+                &self.terminal,
+                op,
+            ) catch |err| switch (err) {
+                error.HistoryDrifted => drifted = v.read,
+                else => log.warn("tmux older history failed err={}", .{err}),
+            },
+
             else => terminalpkg.tmux.sink.applyOp(
                 self.alloc,
                 &self.terminal,
@@ -522,6 +541,14 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
 
     if (status) |v| _ = self.surface_mailbox.push(
         .{ .tmux_pane_status = v },
+        .{ .forever = {} },
+    );
+    if (drifted) |v| _ = self.surface_mailbox.push(
+        .{ .tmux_history_drifted = v },
+        .{ .forever = {} },
+    );
+    if (complete) _ = self.surface_mailbox.push(
+        .tmux_history_complete,
         .{ .forever = {} },
     );
 }
@@ -568,6 +595,9 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .moveWindow = tmuxHostMoveWindow,
     .renameWindow = tmuxHostRenameWindow,
     .paneShown = tmuxHostPaneShown,
+    .historyWanted = tmuxHostHistoryWanted,
+    .readHistory = tmuxHostReadHistory,
+    .historyDrifted = tmuxHostHistoryDrifted,
     .swapPane = tmuxHostSwapPane,
     .rotateWindow = tmuxHostRotateWindow,
     .breakPane = tmuxHostBreakPane,
@@ -700,6 +730,33 @@ fn tmuxHostPaneShown(ctx: *anyopaque, pane_id: usize, shown: bool) void {
     self.tmuxHostInput(.{ .pane_shown = .{
         .pane_id = pane_id,
         .shown = shown,
+    } });
+}
+
+fn tmuxHostHistoryWanted(
+    ctx: *anyopaque,
+    pane_id: usize,
+    held: usize,
+    all: bool,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .history_wanted = .{
+        .pane_id = pane_id,
+        .held = held,
+        .all = all,
+    } });
+}
+
+fn tmuxHostReadHistory(ctx: *anyopaque, pane_id: usize) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .read_history = .{ .pane_id = pane_id } });
+}
+
+fn tmuxHostHistoryDrifted(ctx: *anyopaque, pane_id: usize, read: u32) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .history_drifted = .{
+        .pane_id = pane_id,
+        .read = read,
     } });
 }
 

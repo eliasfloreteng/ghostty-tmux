@@ -28,6 +28,8 @@ const testing = std.testing;
 const assert = @import("../../quirks.zig").inlineAssert;
 
 const Terminal = @import("../Terminal.zig");
+const PageList = @import("../PageList.zig");
+const Cell = @import("../page.zig").Cell;
 const ScreenSet = @import("../ScreenSet.zig");
 const size = @import("../size.zig");
 const viewer = @import("viewer.zig");
@@ -157,6 +159,10 @@ pub const Op = union(enum) {
     /// row count.
     scroll_into_history,
 
+    /// History older than any the terminal holds, to go above it. See
+    /// `OlderHistory`.
+    older_history: OlderHistory,
+
     /// Clear the display and home the cursor, ahead of a visible replay.
     erase_and_home,
 
@@ -227,9 +233,52 @@ pub const Op = union(enum) {
     /// state: `applyOp` ignores it, and a consumer with a GUI shows it.
     pane_status: PaneStatus,
 
+    /// The pane's whole history, as far as `tmux-history-limit` goes, is
+    /// in: the read a display asked for with `Viewer.Input.read_history`
+    /// has been applied. Not terminal state; `applyOp` ignores it. A
+    /// display holding back something that needs all of the scrollback
+    /// (select all, writing it to a file) does it now.
+    history_complete,
+
     pub const Pwd = struct {
         host: []const u8,
         path: []const u8,
+    };
+
+    /// A capture of a run of tmux's history, read because the display
+    /// was scrolled to the top of what it holds. See `prependHistory`.
+    ///
+    /// tmux numbers history lines back from the screen: 1 is the line
+    /// just above it. A terminal mirroring a pane holds the newest lines
+    /// of that history, one row each (a capture of tmux's grid at the
+    /// pane's own width, without `-J`, is a row per line), so with `n`
+    /// rows of scrollback it holds lines 1 through `n`. That stays true
+    /// as output scrolls more lines into both, which is what lets the
+    /// capture be placed: applied in order with the pane's output, it is
+    /// a snapshot of tmux's history at the same point in the stream.
+    ///
+    /// Only the lines older than any the terminal has are added, above
+    /// its scrollback, without touching what is there: the viewport,
+    /// a selection and search results all stay on the content they were
+    /// on. A capture that does not reach down to the terminal's oldest
+    /// line adds nothing: it was asked for before the terminal's history
+    /// was replaced, and the display asks again. One whose line there is
+    /// not the terminal's adds nothing either, and fails with
+    /// `error.HistoryDrifted`: the two histories no longer agree line for
+    /// line, and only reading the pane again from scratch fixes that.
+    pub const OlderHistory = struct {
+        /// The capture, decoded: one line of tmux's history per row,
+        /// oldest first.
+        bytes: []const u8,
+
+        /// How far back from the screen the capture's last line is.
+        /// Always at least 1.
+        newest: usize,
+
+        /// Which read from scratch the read was measured against, for
+        /// telling the viewer about it if it does not line up. See
+        /// `Viewer.Input.history_drifted`.
+        read: u32 = 0,
     };
 
     /// Copy an op so it can outlive the sink call that delivered it.
@@ -250,6 +299,10 @@ pub const Op = union(enum) {
                 } };
             },
             .passthrough => |b| .{ .passthrough = try alloc.dupe(u8, b) },
+            .older_history => |v| .{ .older_history = .{
+                .bytes = try alloc.dupe(u8, v.bytes),
+                .newest = v.newest,
+            } },
 
             // The parsed pane state is a flat struct of scalars and
             // slices, so walk it rather than naming the string fields:
@@ -276,6 +329,7 @@ pub const Op = union(enum) {
             .trim_trailing_blanks,
             .resize,
             .pane_status,
+            .history_complete,
             => self,
         };
     }
@@ -285,6 +339,7 @@ pub const Op = union(enum) {
     pub fn deinit(self: Op, alloc: Allocator) void {
         switch (self) {
             .bytes, .replay, .passthrough => |b| alloc.free(b),
+            .older_history => |v| alloc.free(v.bytes),
             .title => |t| alloc.free(t),
             .pwd => |p| {
                 alloc.free(p.host);
@@ -378,6 +433,8 @@ pub fn applyOp(
             t.setCursorPos(1, 1);
         },
 
+        .older_history => |v| try prependHistory(alloc, t, v),
+
         .erase_and_home => {
             t.eraseDisplay(.complete, false);
             t.setCursorPos(1, 1);
@@ -405,8 +462,127 @@ pub fn applyOp(
         }),
 
         // For whoever displays the terminal, not for the terminal.
-        .pane_status => {},
+        .pane_status, .history_complete => {},
     }
+}
+
+/// See `Op.OlderHistory`. Always the primary screen, whichever is
+/// active: history is only ever the primary's.
+fn prependHistory(
+    alloc: Allocator,
+    t: *Terminal,
+    v: Op.OlderHistory,
+) !void {
+    const screen = t.screens.get(.primary) orelse return;
+    const pages = &screen.pages;
+    const held = pages.total_rows - pages.rows;
+
+    // The capture has to reach at least the line just above our oldest,
+    // or there would be lines missing between the two.
+    if (v.newest == 0 or v.newest > held + 1) {
+        log.info(
+            "older history stops short of ours newest={} held={}",
+            .{ v.newest, held },
+        );
+        return;
+    }
+
+    // Laid out as a history replay always is, at our width, but on a
+    // terminal of its own to copy rows from.
+    var scratch: Terminal = try .init(t.io(), alloc, .{
+        .cols = t.cols,
+        .rows = t.rows,
+        .max_scrollback_bytes = null,
+    });
+    defer scratch.deinit(alloc);
+    scratch.modes.set(.grapheme_cluster, t.modes.get(.grapheme_cluster));
+    {
+        var stream = scratch.vtStream();
+        defer stream.deinit();
+        stream.nextSlice(v.bytes);
+    }
+    scratch.carriageReturn();
+    for (0..scratch.rows) |_| try scratch.index();
+
+    // The capture's rows, oldest first, and how far back the oldest is.
+    const source = &scratch.screens.active.pages;
+    const lines = source.total_rows - source.rows;
+    if (lines == 0) return;
+    const oldest = v.newest + lines - 1;
+    if (oldest <= held) return;
+    const keep = oldest - held;
+
+    // Where the capture overlaps what we have, its line there has to be
+    // ours. One that is not means our scrollback and tmux's history have
+    // drifted apart (each clears and reflows by its own rules), and the
+    // capture would go in at the wrong place: better none than that.
+    if (keep < lines) {
+        const theirs = source.pin(.{ .screen = .{ .y = @intCast(keep) } }).?;
+        const ours = pages.pin(.{ .screen = .{} }).?;
+        if (!sameText(theirs.cells(.all), ours.cells(.all))) {
+            log.warn("older history does not line up with ours, dropping it", .{});
+            return error.HistoryDrifted;
+        }
+    }
+
+    // A viewport at the top stays on what it shows rather than jumping
+    // to the new top. Any other viewport is a pin, or the active area,
+    // neither of which a prepend moves.
+    const top: ?PageList.Pin = if (pages.viewport == .top)
+        pages.getTopLeft(.screen)
+    else
+        null;
+    defer if (top) |p| pages.scroll(.{ .pin = p });
+
+    // The rows go on top a page at a time, so the newest of them first.
+    // History is the start of the screen, so rows `0..keep` are the
+    // start of the capture's pages.
+    var node = source.pages.first.?;
+    var start: usize = 0;
+    while (start + node.rows() < keep) {
+        start += node.rows();
+        node = node.next.?;
+    }
+    var len = keep - start;
+    while (true) {
+        const page = node.page();
+        var allocation = try pages.allocatePage(page.exactRowCapacity(0, len));
+        defer allocation.deinit();
+        const dst = allocation.page();
+        dst.size.rows = @intCast(len);
+        try dst.cloneFrom(page, 0, len);
+
+        // Past our scrollback limit: we have as much as we may keep.
+        allocation.finalize(.prepend, .{}) catch |err| {
+            log.info("scrollback full, older history dropped err={}", .{err});
+            return;
+        };
+
+        node = node.prev orelse return;
+        len = node.rows();
+    }
+}
+
+/// Whether two rows hold the same text, which is all a capture and live
+/// output can be relied on to agree about: blanks, unwritten cells and
+/// cells with only a background are all a space to a capture.
+fn sameText(a: []const Cell, b: []const Cell) bool {
+    for (0..@max(a.len, b.len)) |x| {
+        if (cellText(a, x) != cellText(b, x)) return false;
+    }
+    return true;
+}
+
+fn cellText(cells: []const Cell, x: usize) u21 {
+    if (x >= cells.len) return ' ';
+    const cell = cells[x];
+    return switch (cell.content_tag) {
+        .codepoint, .codepoint_grapheme => switch (cell.codepoint()) {
+            0 => ' ',
+            else => |cp| cp,
+        },
+        else => ' ',
+    };
 }
 
 /// See `Op.trim_trailing_blanks`. Only the active area of the active
@@ -782,4 +958,200 @@ test "pane state puts the cursor where tmux has it, not waiting to wrap" {
     const text = try t.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
     defer alloc.free(text);
     try testing.expectEqualStrings("aXcd\nefgh", text);
+}
+
+/// A terminal whose scrollback holds `history` lines, one per row, with
+/// `screen` on display. Lines are separated by "\r\n", as a capture's are.
+fn testHistoryTerminal(
+    alloc: Allocator,
+    history: []const u8,
+    screen: []const u8,
+) !Terminal {
+    var t: Terminal = try .init(testing.io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+    });
+    errdefer t.deinit(alloc);
+    try applyOp(alloc, &t, .{ .replay = history });
+    try applyOp(alloc, &t, .scroll_into_history);
+    try applyOp(alloc, &t, .{ .replay = screen });
+    return t;
+}
+
+fn expectHistory(alloc: Allocator, t: *Terminal, expected: []const u8) !void {
+    const text = try t.screens.get(.primary).?.dumpStringAlloc(
+        alloc,
+        .{ .history = .{} },
+    );
+    defer alloc.free(text);
+    try testing.expectEqualStrings(expected, text);
+}
+
+test "older history goes in above what is held, past the line they share" {
+    const alloc = testing.allocator;
+    var t = try testHistoryTerminal(alloc, "c\r\nd\r\ne", "x\r\ny\r\nz");
+    defer t.deinit(alloc);
+
+    // Three lines held, so tmux's lines 3 back to 5 are "c", "b" and
+    // "a". The capture ends on the oldest one we hold.
+    try applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = "a\r\nb\r\nc",
+        .newest = 3,
+    } });
+    try expectHistory(alloc, &t, "a\nb\nc\nd\ne");
+
+    // The screen is untouched.
+    const screen = try t.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+    defer alloc.free(screen);
+    try testing.expectEqualStrings("x\ny\nz", screen);
+}
+
+test "older history whose overlap is not ours adds nothing, and says so" {
+    const alloc = testing.allocator;
+    var t = try testHistoryTerminal(alloc, "c\r\nd\r\ne", "x");
+    defer t.deinit(alloc);
+
+    // Line 3 back is "c" here, and tmux says it is "q": the two have
+    // drifted apart, and "a" and "b" would go in at the wrong place.
+    try testing.expectError(error.HistoryDrifted, applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = "a\r\nb\r\nq",
+        .newest = 3,
+    } }));
+    try expectHistory(alloc, &t, "c\nd\ne");
+}
+
+test "older history that stops short of ours adds nothing" {
+    const alloc = testing.allocator;
+    var t = try testHistoryTerminal(alloc, "c\r\nd\r\ne", "x");
+    defer t.deinit(alloc);
+
+    // Lines 5 back to 7: line 4 would be missing between the two.
+    try applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = "a\r\nb\r\nc",
+        .newest = 5,
+    } });
+    try expectHistory(alloc, &t, "c\nd\ne");
+}
+
+test "older history that is all held already adds nothing" {
+    const alloc = testing.allocator;
+    var t = try testHistoryTerminal(alloc, "c\r\nd\r\ne", "x");
+    defer t.deinit(alloc);
+
+    // Output scrolled more lines into both before tmux ran the capture,
+    // so all of it is ours by the time it lands.
+    try applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = "c\r\nd",
+        .newest = 2,
+    } });
+    try expectHistory(alloc, &t, "c\nd\ne");
+}
+
+test "older history right above ours needs no overlap, and keeps blank lines" {
+    const alloc = testing.allocator;
+    var t = try testHistoryTerminal(alloc, "c\r\nd\r\ne", "x");
+    defer t.deinit(alloc);
+
+    try applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = "a\r\n\r\nb",
+        .newest = 4,
+    } });
+    try expectHistory(alloc, &t, "a\n\nb\nc\nd\ne");
+}
+
+test "older history leaves the viewport and pins on their content" {
+    const alloc = testing.allocator;
+    var t = try testHistoryTerminal(alloc, "c\r\nd\r\ne", "x");
+    defer t.deinit(alloc);
+    const pages = &t.screens.active.pages;
+
+    // Scrolled all the way up, and something (a selection, a search
+    // result) pinned to "d".
+    pages.scroll(.top);
+    const d = try pages.trackPin(pages.pin(.{ .history = .{ .y = 1 } }).?);
+    defer pages.untrackPin(d);
+
+    try applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = "a\r\nb\r\nc",
+        .newest = 3,
+    } });
+
+    // Still showing "c" at the top, with the new lines above it to
+    // scroll up to.
+    const top = pages.getTopLeft(.viewport);
+    try testing.expectEqual(@as(u21, 'c'), top.rowAndCell().cell.codepoint());
+    try testing.expect(pages.viewport != .top);
+    try testing.expectEqual(@as(u21, 'd'), d.rowAndCell().cell.codepoint());
+    try testing.expectEqual(
+        @as(u32, 3),
+        pages.pointFromPin(.history, d.*).?.history.y,
+    );
+}
+
+test "older history spanning several pages goes in whole and in order" {
+    const alloc = testing.allocator;
+    var t = try testHistoryTerminal(alloc, "held", "x");
+    defer t.deinit(alloc);
+
+    // Far more lines than a page holds, ending on the one we hold.
+    var capture: std.Io.Writer.Allocating = .init(alloc);
+    defer capture.deinit();
+    const count = 5000;
+    for (0..count) |i| try capture.writer.print("{d}\r\n", .{i});
+    try capture.writer.writeAll("held");
+
+    try applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = capture.written(),
+        .newest = 1,
+    } });
+
+    const pages = &t.screens.active.pages;
+    try testing.expect(pages.totalPages() > 2);
+    try testing.expectEqual(count + 1, pages.total_rows - pages.rows);
+    var buf: [16]u8 = undefined;
+    for ([_]usize{ 0, 1, 1234, count - 1 }) |i| {
+        const pin = pages.pin(.{ .history = .{ .y = @intCast(i) } }).?;
+        const text = try std.fmt.bufPrint(&buf, "{d}", .{i});
+        const cells = pin.cells(.all);
+        for (text, 0..) |c, x| try testing.expectEqual(@as(u21, c), cells[x].codepoint());
+    }
+    const last = pages.pin(.{ .history = .{ .y = count } }).?;
+    try testing.expectEqual(@as(u21, 'h'), last.rowAndCell().cell.codepoint());
+}
+
+test "older history stops at the scrollback limit" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = 10_000,
+    });
+    defer t.deinit(alloc);
+    try applyOp(alloc, &t, .{ .replay = "held" });
+    try applyOp(alloc, &t, .scroll_into_history);
+
+    var capture: std.Io.Writer.Allocating = .init(alloc);
+    defer capture.deinit();
+    const count = 5000;
+    for (0..count) |i| try capture.writer.print("{d}\r\n", .{i});
+    try capture.writer.writeAll("held");
+    try applyOp(alloc, &t, .{ .older_history = .{
+        .bytes = capture.written(),
+        .newest = 1,
+    } });
+
+    // As much as fits goes in, newest first, and nothing is pushed out
+    // to make room: what was held is still the newest history, and
+    // right above it is the newest of what was read.
+    const pages = &t.screens.active.pages;
+    const held = pages.total_rows - pages.rows;
+    try testing.expect(held < count + 1);
+    const last = pages.pin(.{ .history = .{ .y = @intCast(held - 1) } }).?;
+    try testing.expectEqual(@as(u21, 'h'), last.rowAndCell().cell.codepoint());
+    if (held > 1) {
+        const above = pages.pin(.{ .history = .{ .y = @intCast(held - 2) } }).?;
+        const cells = above.cells(.all);
+        for ("4999", 0..) |c, x| try testing.expectEqual(@as(u21, c), cells[x].codepoint());
+    }
 }

@@ -155,6 +155,28 @@ pub const Router = struct {
                 pane_id: usize,
                 shown: bool,
             ) void,
+
+            /// The pane's display wants history older than it holds.
+            /// See `Viewer.Input.HistoryWanted`.
+            historyWanted: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                held: usize,
+                all: bool,
+            ) void,
+
+            /// The pane's display needs all of its history. See
+            /// `Viewer.Input.read_history`.
+            readHistory: *const fn (ctx: *anyopaque, pane_id: usize) void,
+
+            /// The pane's display refused older history that did not
+            /// line up with its own. See `Viewer.Input.history_drifted`.
+            historyDrifted: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                read: u32,
+            ) void,
+
             /// The user asked to swap this pane with another of its
             /// window.
             swapPane: *const fn (
@@ -266,6 +288,7 @@ pub const Router = struct {
                 };
                 self.buffer_bytes += switch (copy) {
                     .bytes, .replay, .passthrough => |b| b.len,
+                    .older_history => |v| v.bytes.len,
                     else => 0,
                 };
                 self.buffer.appendAssumeCapacity(copy);
@@ -644,6 +667,38 @@ pub const Router = struct {
         self.host.vtable.paneShown(self.host.ctx, pane_id, shown);
     }
 
+    /// Ask the session for history older than the pane's display holds:
+    /// `held` rows of scrollback, as the display has it now.
+    pub fn historyWanted(
+        self: *Router,
+        pane_id: usize,
+        held: usize,
+        all: bool,
+    ) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.historyWanted(self.host.ctx, pane_id, held, all);
+    }
+
+    /// Ask the session for all of the pane's history, to be told by a
+    /// `.history_complete` op once it is in.
+    pub fn readHistory(self: *Router, pane_id: usize) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.readHistory(self.host.ctx, pane_id);
+    }
+
+    /// Tell the session the pane's display refused older history read
+    /// against its `read`th read from scratch, because it did not line up.
+    pub fn historyDrifted(self: *Router, pane_id: usize, read: u32) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.historyDrifted(self.host.ctx, pane_id, read);
+    }
+
     /// Tell the session the user has moved into this pane.
     pub fn selectPane(self: *Router, pane_id: usize) void {
         if (!self.paneOpen(pane_id)) return;
@@ -820,6 +875,16 @@ const TestHost = struct {
         pane_id: usize,
         shown: bool,
     }) = .empty,
+    history_wanted: std.ArrayList(struct {
+        pane_id: usize,
+        held: usize,
+        all: bool,
+    }) = .empty,
+    history_reads: std.ArrayList(usize) = .empty,
+    history_drifts: std.ArrayList(struct {
+        pane_id: usize,
+        read: u32,
+    }) = .empty,
     pane_moves: std.ArrayList(PaneMove) = .empty,
     command_lines: std.ArrayList([]u8) = .empty,
 
@@ -849,6 +914,9 @@ const TestHost = struct {
         .moveWindow = moveWindow,
         .renameWindow = renameWindow,
         .paneShown = paneShown,
+        .historyWanted = historyWanted,
+        .readHistory = readHistory,
+        .historyDrifted = historyDrifted,
         .swapPane = swapPane,
         .rotateWindow = rotateWindow,
         .breakPane = breakPane,
@@ -862,6 +930,28 @@ const TestHost = struct {
         self.shown.append(self.alloc, .{
             .pane_id = pane_id,
             .shown = shown,
+        }) catch @panic("oom");
+    }
+
+    fn historyWanted(ctx: *anyopaque, pane_id: usize, held: usize, all: bool) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.history_wanted.append(self.alloc, .{
+            .pane_id = pane_id,
+            .held = held,
+            .all = all,
+        }) catch @panic("oom");
+    }
+
+    fn readHistory(ctx: *anyopaque, pane_id: usize) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.history_reads.append(self.alloc, pane_id) catch @panic("oom");
+    }
+
+    fn historyDrifted(ctx: *anyopaque, pane_id: usize, read: u32) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.history_drifts.append(self.alloc, .{
+            .pane_id = pane_id,
+            .read = read,
         }) catch @panic("oom");
     }
 
@@ -981,6 +1071,9 @@ const TestHost = struct {
         self.splits.deinit(self.alloc);
         self.window_kills.deinit(self.alloc);
         self.shown.deinit(self.alloc);
+        self.history_wanted.deinit(self.alloc);
+        self.history_reads.deinit(self.alloc);
+        self.history_drifts.deinit(self.alloc);
         self.selected_panes.deinit(self.alloc);
         self.zoomed_panes.deinit(self.alloc);
         self.window_moves.deinit(self.alloc);
@@ -1296,6 +1389,50 @@ test "whether a pane can be seen reaches the host while it is open" {
     sink.close();
     tr.router.paneShown(5, false);
     try testing.expectEqual(2, tr.host.shown.items.len);
+}
+
+test "a display wanting older history reaches the host while it is open" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    const sink = try tr.router.createChannel(5);
+
+    tr.router.historyWanted(5, 120, false);
+    tr.router.historyWanted(1234, 7, true);
+    try testing.expectEqual(1, tr.host.history_wanted.items.len);
+    try testing.expectEqual(5, tr.host.history_wanted.items[0].pane_id);
+    try testing.expectEqual(120, tr.host.history_wanted.items[0].held);
+    try testing.expect(!tr.host.history_wanted.items[0].all);
+
+    sink.close();
+    tr.router.historyWanted(5, 130, false);
+    try testing.expectEqual(1, tr.host.history_wanted.items.len);
+}
+
+test "a display needing all its history, or refusing some, reaches the host while it is open" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    const sink = try tr.router.createChannel(5);
+
+    tr.router.readHistory(5);
+    tr.router.historyDrifted(5, 3);
+    tr.router.readHistory(1234);
+    tr.router.historyDrifted(1234, 3);
+    try testing.expectEqualSlices(usize, &.{5}, tr.host.history_reads.items);
+    try testing.expectEqual(1, tr.host.history_drifts.items.len);
+    try testing.expectEqual(5, tr.host.history_drifts.items[0].pane_id);
+    try testing.expectEqual(3, tr.host.history_drifts.items[0].read);
+
+    sink.close();
+    tr.router.readHistory(5);
+    tr.router.historyDrifted(5, 4);
+    try testing.expectEqual(1, tr.host.history_reads.items.len);
+    try testing.expectEqual(1, tr.host.history_drifts.items.len);
 }
 
 test "rearranging panes reaches the host only for panes still open" {

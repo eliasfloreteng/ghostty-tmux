@@ -49,6 +49,11 @@ terminal and the session opens as native Ghostty windows:
   its own Ghostty window (tmux 3.4+, with a fallback for older servers),
   and fullscreening or resizing re-reads what tmux has on screen, so
   full-screen programs (lazygit, Neovim, Claude Code) stay intact.
+- **New splits and tabs start where you are.** A new split or tab made
+  from a tmux pane starts in that pane's working directory
+  (`split-window -c` / `new-window -c` with the directory tmux reports
+  for the pane), as in plain Ghostty. `split-inherit-working-directory`
+  and `tab-inherit-working-directory` turn this off.
 - **Swap, rotate, break and join panes** (`tmux_swap_pane`,
   `tmux_rotate_window`, `tmux_break_pane`, `tmux_join_pane`), and **run
   any tmux command** from a prompt (`prompt_tmux_command`) or a keybind
@@ -62,8 +67,13 @@ terminal and the session opens as native Ghostty windows:
   `select-pane`/`select-window` from tmux or another client moves Ghostty.
 - **Full history on attach**, both screens, cursor and terminal modes
   (modifyOtherKeys too, from tmux 3.5), so scrollback, search and
-  selection are Ghostty's own. Each pane's screen is shown first and its
-  history fills in behind it, so big sessions appear at once. Typing, IME and pastes (bracketed exactly
+  selection are Ghostty's own. Each pane's screen is shown first with its
+  newest history behind it, and older history is read from tmux as you
+  scroll up to it (or all at once when you search, select all or write
+  the scrollback to a file), up to `tmux-history-limit`, so big sessions
+  appear at once. Resizing a pane re-reads its history as tmux reflowed
+  it, so scrollback stays line for line what tmux has. Typing, IME and
+  pastes (bracketed exactly
   when the pane's program asked for it) are sent through tmux; queries are
   answered by tmux only.
 - **The terminal that ran `tmux -CC`** shows which session it hosts and
@@ -124,8 +134,14 @@ macOS builds (Apple silicon) are on the
 **Ghostty tmux.app**. It has its own name and bundle identifier
 (`com.eliasfloreteng.ghostty-tmux`), so it installs and runs alongside the
 official Ghostty with its own preferences and permissions, while reading
-the same Ghostty config. Its updater is disabled, so it never "updates"
-itself into the official release. Unless the build workflow has signing
+the same Ghostty config. It updates itself from this fork's releases,
+never from the official ones: each build of `main` carries a signed
+appcast, and the app checks the latest release's (Check for Updates…,
+or the `auto-update` option). Updates work for ad-hoc signed builds too,
+since Sparkle trusts the EdDSA signature, though macOS asks for
+permissions again after each one. Builds from before auto-update, and
+local builds from `install-fork.sh` (unless given
+`FORK_SPARKLE_PUBLIC_KEY`), don't update themselves. Unless the build workflow has signing
 secrets (see [`fork-build.yml`](.github/workflows/fork-build.yml)), a
 release is ad-hoc signed and not notarized: after unzipping, run
 `xattr -dr com.apple.quarantine "Ghostty tmux.app"` (or right-click ›
@@ -155,15 +171,6 @@ tagged `build-<commit>` (once per commit).
 
 Not done yet, roughly in order of usefulness:
 
-- New splits and tabs start in the working directory of the pane they
-  were made from, as they do in plain Ghostty (`split-window -c`,
-  `new-window -c` with `#{pane_current_path}`).
-- Auto-update: the app's updater is disabled so it never updates itself
-  into the official release; it should update from this fork's releases
-  instead.
-- Reading history on demand as it is scrolled into, rather than all of it
-  after the screen, and re-reading history (not just the screen) after a
-  resize.
 - Moving a tab into a window of another session, or between sessions.
 - Restoring kitty keyboard flags, which tmux neither implements nor keeps.
 - Reconnecting without shell integration, or after `ssh host` followed by

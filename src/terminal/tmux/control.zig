@@ -148,11 +148,11 @@ pub const Parser = struct {
                 const line = written[idx..];
 
                 if (parseBlockTerminator(line)) |terminator| {
-                    const output = std.mem.trimEnd(
-                        u8,
-                        written[0..idx],
-                        "\r\n",
-                    );
+                    // Only the last line's own ending goes. A blank line
+                    // before it is part of the reply: a capture's newest
+                    // lines can be empty, and a capture whose lines are
+                    // counted has to keep all of them.
+                    const output = trimLineEnding(written[0..idx]);
 
                     if (self.block_trimmed) log.warn(
                         "tmux control mode block exceeded {} bytes, kept the newest {} bytes",
@@ -234,6 +234,15 @@ pub const Parser = struct {
     }
 
     const ParseError = error{RegexError};
+
+    /// A block's payload without the ending of its last line: the
+    /// newline, and the carriage return a pty puts before it.
+    fn trimLineEnding(payload: []const u8) []const u8 {
+        var end = payload.len;
+        if (end > 0 and payload[end - 1] == '\n') end -= 1;
+        if (end > 0 and payload[end - 1] == '\r') end -= 1;
+        return payload[0..end];
+    }
 
     const BlockTerminator = enum { end, err };
 
@@ -1292,6 +1301,22 @@ test "tmux begin/end data" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
     try testing.expectEqualStrings("hello\nworld", n.block_end);
+}
+
+test "tmux block keeps the blank lines at its end" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A capture whose newest lines are empty, through a pty: only the
+    // last line's own ending goes.
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 1 1 1\r\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("a\r\n\r\n\r\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1 1 1\r") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings("a\r\n\r\n", n.block_end);
 }
 
 test "tmux block payload may start with %end" {

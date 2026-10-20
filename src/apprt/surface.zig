@@ -177,6 +177,18 @@ pub const Message = union(enum) {
     else
         void,
 
+    /// All of this tmux pane's history is in, as asked for by
+    /// `Surface.tmuxDeferForHistory`: do what was waiting for it.
+    tmux_history_complete: void,
+
+    /// This tmux pane refused older history that did not line up with
+    /// its own, read against the given read from scratch. For the viewer:
+    /// see `terminal.tmux.Viewer.Input.history_drifted`.
+    tmux_history_drifted: if (terminal.options.tmux_control_mode)
+        u32
+    else
+        void,
+
     /// tmux has something to tell the user. See `apprt.action.TmuxNotice`.
     tmux_notice: if (terminal.options.tmux_control_mode)
         TmuxNotice
