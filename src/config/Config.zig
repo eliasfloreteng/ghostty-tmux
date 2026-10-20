@@ -2533,6 +2533,17 @@ keybind: Keybinds = .{},
 /// older servers do not have the flag and are not sent it.
 @"tmux-pause-after": u32 = 0,
 
+/// Show tmux's status line in the windows of a tmux control mode session
+/// (`tmux -CC`): a bar along the bottom of each window with `status-left`,
+/// the window list and `status-right`, formatted by tmux as its own
+/// status line would be, and kept up to date as they change (tmux checks
+/// about once a second). tmux's colors and styles are not reproduced.
+///
+/// Off by default, since the windows and the session are already shown
+/// as native tabs and titles. Takes effect from the next attach. Requires
+/// tmux 3.2 or newer; with an older server the bar never appears.
+@"tmux-status-bar": bool = false,
+
 /// The total amount of bytes that can be used for image data (e.g. the Kitty
 /// image protocol) per terminal screen. The maximum value is 4,294,967,295
 /// (4GiB). The default is 320MB. If this is set to zero, then all image

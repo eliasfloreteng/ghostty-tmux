@@ -180,6 +180,10 @@ pub const Router = struct {
                 target_pane_id: usize,
                 direction: SplitDirection,
             ) void,
+
+            /// The user typed a command line for tmux. Borrowed for the
+            /// duration of the call.
+            commandLine: *const fn (ctx: *anyopaque, text: []const u8) void,
         };
     };
 
@@ -626,6 +630,14 @@ pub const Router = struct {
         self.host.vtable.selectPane(self.host.ctx, pane_id);
     }
 
+    /// Run a command line the user typed. Not tied to a pane: it is a
+    /// command for the session, from wherever the user typed it.
+    pub fn commandLine(self: *Router, text: []const u8) void {
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.commandLine(self.host.ctx, text);
+    }
+
     /// Leave the session, leaving everything in it running.
     ///
     /// Not tied to a pane, and deliberately the whole session: detaching
@@ -774,6 +786,7 @@ const TestHost = struct {
         scope: KillScope,
     }) = .empty,
     pane_moves: std.ArrayList(PaneMove) = .empty,
+    command_lines: std.ArrayList([]u8) = .empty,
 
     const PaneMove = union(enum) {
         swap: struct { pane_id: usize, target: SwapTarget },
@@ -805,7 +818,14 @@ const TestHost = struct {
         .breakPane = breakPane,
         .joinPane = joinPane,
         .movePane = movePane,
+        .commandLine = commandLine,
     };
+
+    fn commandLine(ctx: *anyopaque, text: []const u8) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        const copy = self.alloc.dupe(u8, text) catch @panic("oom");
+        self.command_lines.append(self.alloc, copy) catch @panic("oom");
+    }
 
     fn paneMove(ctx: *anyopaque, move: PaneMove) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
@@ -913,6 +933,8 @@ const TestHost = struct {
         self.zoomed_panes.deinit(self.alloc);
         self.window_moves.deinit(self.alloc);
         self.pane_moves.deinit(self.alloc);
+        for (self.command_lines.items) |c| self.alloc.free(c);
+        self.command_lines.deinit(self.alloc);
         for (self.renames.items) |r| self.alloc.free(r);
         self.renames.deinit(self.alloc);
     }
@@ -1234,6 +1256,22 @@ test "rearranging panes reaches the host only for panes still open" {
     tr.router.swapPane(5, .left);
     tr.router.movePane(6, 5, .up);
     try testing.expectEqual(5, tr.host.pane_moves.items.len);
+}
+
+test "a command line reaches the host until it goes away" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    // No pane needed: it is the session's.
+    tr.router.commandLine("list-sessions");
+    try testing.expectEqual(1, tr.host.command_lines.items.len);
+    try testing.expectEqualStrings("list-sessions", tr.host.command_lines.items[0]);
+
+    tr.router.detachHost();
+    tr.router.commandLine("list-sessions");
+    try testing.expectEqual(1, tr.host.command_lines.items.len);
 }
 
 test "detachHost closes every pane and blocks further host calls" {

@@ -374,6 +374,16 @@ pub const Action = union(Key) {
     /// tmux has something to tell the user. See `TmuxNotice`.
     tmux_notice: TmuxNotice,
 
+    /// tmux's status line changed. See `TmuxStatus`.
+    tmux_status: TmuxStatus,
+
+    /// Ask the user for a command line to run in the tmux session the
+    /// target surface belongs to (as a pane, or as the surface hosting
+    /// it), and run it with `Surface.tmuxCommandLine`. What it prints
+    /// comes back as a `tmux_notice`. Only sent for a surface that does
+    /// belong to a session.
+    prompt_tmux_command,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -448,6 +458,8 @@ pub const Action = union(Key) {
         resize_window,
         tmux_windows,
         tmux_notice,
+        tmux_status,
+        prompt_tmux_command,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1156,6 +1168,35 @@ pub const TmuxNotice = struct {
 
     test "ghostty.h TmuxNotice.Kind" {
         try lib.checkGhosttyHEnum(Kind, "GHOSTTY_TMUX_NOTICE_");
+    }
+};
+
+/// tmux's status line, for a session whose `tmux-status-bar` is on.
+///
+/// The target is the surface hosting the session, as for `TmuxNotice`;
+/// the line belongs to every window of it. Sent whenever any part
+/// changes, with all three: `status-left`, the window list as tmux would
+/// list it, and `status-right`, each formatted by tmux and with tmux's
+/// styles taken out. Any of them may be empty. Only valid for the
+/// duration of the action call.
+pub const TmuxStatus = struct {
+    left: [:0]const u8,
+    windows: [:0]const u8,
+    right: [:0]const u8,
+
+    // Sync with: ghostty_action_tmux_status_s
+    pub const C = extern struct {
+        left: [*:0]const u8,
+        windows: [*:0]const u8,
+        right: [*:0]const u8,
+    };
+
+    pub fn cval(self: TmuxStatus) C {
+        return .{
+            .left = self.left.ptr,
+            .windows = self.windows.ptr,
+            .right = self.right.ptr,
+        };
     }
 };
 

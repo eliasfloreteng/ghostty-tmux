@@ -517,6 +517,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Move the tmux pane out into a tmux window of its own."),
         }},
 
+        .prompt_tmux_command => comptime &.{.{
+            .action = .prompt_tmux_command,
+            .title = i18n.N_("Run tmux Command…"),
+            .description = i18n.N_("Prompt for a command to run in the tmux session."),
+        }},
+
         .tmux_join_pane => comptime &.{
             .{
                 .action = .{ .tmux_join_pane = .previous },
@@ -797,6 +803,7 @@ fn actionCommands(action: Action.Key) []const Command {
         .set_surface_title,
         .set_tab_title,
         .set_window_title,
+        .tmux_command,
         .search,
         .scroll_to_row,
         .scroll_page_fractional,

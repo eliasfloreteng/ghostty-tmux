@@ -1227,6 +1227,28 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .tmux_status => |status| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            defer status.deinit();
+
+            var it = std.mem.splitScalar(u8, status.slice(), 0);
+            var parts: [3][:0]const u8 = undefined;
+            var stack = std.heap.stackFallback(512, self.alloc);
+            const alloc = stack.get();
+            var made: usize = 0;
+            defer for (parts[0..made]) |p| alloc.free(p);
+            for (&parts) |*part| {
+                part.* = try alloc.dupeZ(u8, it.next() orelse "");
+                made += 1;
+            }
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_status,
+                .{ .left = parts[0], .windows = parts[1], .right = parts[2] },
+            );
+        },
+
         .child_exited => |v| self.childExited(v),
 
         .desktop_notification => |notification| {
@@ -2438,6 +2460,40 @@ pub fn tmuxMovePane(
     if (pane.router != target_pane.router) return false;
 
     pane.router.movePane(pane.id, target_pane.id, direction);
+    return true;
+}
+
+/// Whether this surface belongs to a tmux session: is one of its panes,
+/// or hosts it.
+fn tmuxSession(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    if (self.tmuxPane()) |pane| {
+        pane.router.unref();
+        return true;
+    }
+    return self.tmuxHosting();
+}
+
+/// Run a command line in the tmux session this surface belongs to, if
+/// it belongs to one. Like detaching, this is about the session rather
+/// than the pane, so the surface hosting it can do it too.
+///
+/// Public because the embedded apprt calls it with what its prompt for
+/// `prompt_tmux_command` was given.
+pub fn tmuxCommandLine(self: *Surface, text: []const u8) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    if (self.tmuxPane()) |pane| {
+        defer pane.router.unref();
+        pane.router.commandLine(text);
+        return true;
+    }
+
+    if (!self.tmuxHosting()) return false;
+    const router = self.tmuxRouter() orelse return false;
+    defer router.unref();
+    router.commandLine(text);
     return true;
 }
 
@@ -5798,6 +5854,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         }),
 
         .tmux_break_pane => return self.tmuxBreakPane(),
+
+        .tmux_command => |v| return self.tmuxCommandLine(v),
+
+        .prompt_tmux_command => {
+            if (!self.tmuxSession()) return false;
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .prompt_tmux_command,
+                {},
+            );
+        },
 
         .tmux_join_pane => |v| return self.tmuxJoinPane(switch (v) {
             inline else => |tag| @field(

@@ -1531,6 +1531,56 @@ test "live: moving a tab reorders tmux's windows" {
     try testing.expect(!session.exited);
 }
 
+test "live: moving a tab two along shifts the one between, and we learn the order" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    for (0..2) |_| {
+        const out = try session.ask(&.{ "new-window", "-d", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 3 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    var ids: [3]usize = undefined;
+    for (session.viewer.windows.items, 0..) |w, i| ids[i] = w.id;
+
+    const pane = session.viewer.windows.items[0].layout.content.pane;
+    try session.input(.{ .move_window = .{ .pane_id = pane, .amount = 2 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // tmux says nothing when windows move, so this is the list we asked
+    // for again: the first window last, the others each one back.
+    const want = [_]usize{ ids[1], ids[2], ids[0] };
+    for (session.viewer.windows.items, want) |w, id| {
+        try testing.expectEqual(id, w.id);
+    }
+
+    // And it is tmux's order too.
+    const order = try session.ask(&.{ "list-windows", "-F", "#{window_id}" });
+    defer alloc.free(order);
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    for (want) |id| try expected.writer.print("@{d}\n", .{id});
+    try testing.expectEqualStrings(
+        std.mem.trim(u8, expected.written(), "\n"),
+        std.mem.trim(u8, order, " \r\n"),
+    );
+    try testing.expect(!session.exited);
+}
+
 test "live: zooming a pane round-trips through tmux" {
     if (!enabled()) return error.SkipZigTest;
 
@@ -1935,6 +1985,80 @@ test "live: a split to the left or up puts the new pane first" {
     try testing.expect(!session.exited);
 }
 
+test "live: panes are swapped, moved, broken out and joined by tmux" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .right } });
+    const settled = struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred;
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // Pane 0 trades places with the pane on its right, and stays the
+    // active one, in its new place.
+    try session.input(.{ .swap_pane = .{ .pane_id = 0, .target = .right } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const layout = v.viewer.windows.items[0].layout;
+            return layout.content == .horizontal and
+                layout.content.horizontal[1].content.pane == 0;
+        }
+    }.pred);
+    try session.waitFor(settled);
+    {
+        const active = try session.ask(&.{ "display-message", "-p", "#{pane_id}" });
+        defer alloc.free(active);
+        try testing.expectEqualStrings("%0", std.mem.trim(u8, active, " \r\n"));
+    }
+
+    // Dropped below pane 0, pane 1 stacks under it.
+    try session.input(.{ .move_pane = .{
+        .pane_id = 1,
+        .target_pane_id = 0,
+        .direction = .down,
+    } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const layout = v.viewer.windows.items[0].layout;
+            return layout.content == .vertical and
+                layout.content.vertical[1].content.pane == 1;
+        }
+    }.pred);
+
+    // Broken out, pane 1 gets a window of its own.
+    try session.input(.{ .break_pane = .{ .pane_id = 1 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try testing.expectEqual(1, session.viewer.windows.items[1].layout.content.pane);
+
+    // And joined back into the window before it, beside pane 0.
+    try session.input(.{ .join_pane = .{ .pane_id = 1, .window = .previous } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 1 and
+                v.viewer.panes.count() == 2 and
+                v.viewer.windows.items[0].layout.content == .horizontal;
+        }
+    }.pred);
+    try testing.expect(!session.exited);
+}
+
 test "live: a large styled history does not break the attach" {
     if (!enabled()) return error.SkipZigTest;
 
@@ -2209,8 +2333,7 @@ test "live: switching session mid-attach pairs every reply correctly" {
     try session.waitFor(struct {
         fn pred(v: *Session) bool {
             return v.viewer.panes.count() == 2 and
-                v.viewer.command_queue.empty() and
-                v.viewer.orphan_replies == 0;
+                v.viewer.command_queue.empty();
         }
     }.pred);
     try testing.expectEqual(1, session.viewer.windows.items.len);
@@ -2439,5 +2562,141 @@ test "live: characters are as wide here as tmux makes them" {
 
         try session.input(.{ .write = .{ .pane_id = pane_id, .data = "\r" } });
     }
+    try testing.expect(!session.exited);
+}
+
+test "live: a typed command line's output and errors come back" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // Two commands on one line, so two replies before the marker's.
+    try session.input(.{ .command_line = .{
+        .text = "display-message -p hello ; display-message -p world",
+    } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.lastNotice(.command_output) != null and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try testing.expectEqualStrings("hello\nworld", session.lastNotice(.command_output).?);
+
+    try session.input(.{ .command_line = .{ .text = "switch-client -t no-such-session" } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.lastNotice(.command_error) != null and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        session.lastNotice(.command_error).?,
+        "no-such-session",
+    ) != null);
+
+    // Switching session from the prompt changes the session under the
+    // line's own replies, and every reply still pairs up.
+    {
+        const out = try session.ask(&.{ "new-session", "-d", "-s", "typed", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.input(.{ .command_line = .{ .text = "switch-client -t typed" } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return std.mem.eql(u8, v.viewer.session_name, "typed") and
+                v.viewer.panes.count() == 1 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try session.input(.{ .command_line = .{ .text = "display-message -p after" } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const last = v.lastNotice(.command_output) orelse return false;
+            return std.mem.eql(u8, last, "after");
+        }
+    }.pred);
+    try testing.expect(!session.exited);
+}
+
+test "live: windows moved by someone else are listed again in their new order" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "sleep 60", .{
+        .viewer = .{ .follow_window_order = true },
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    {
+        const out = try session.ask(&.{ "new-window", "-d", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    const first = session.viewer.windows.items[0].id;
+
+    // Another client swapping them, which tmux tells us nothing about.
+    {
+        var a: [16]u8 = undefined;
+        var b: [16]u8 = undefined;
+        const out = try session.ask(&.{
+            "swap-window", "-d",
+            "-s",          try std.fmt.bufPrint(&a, "@{d}", .{first}),
+            "-t",          try std.fmt.bufPrint(&b, "@{d}", .{session.viewer.windows.items[1].id}),
+        });
+        alloc.free(out);
+    }
+
+    // tmux checks subscriptions about once a second.
+    const Pred = struct {
+        var id: usize = 0;
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.windows.items[1].id == id;
+        }
+    };
+    Pred.id = first;
+    try session.waitFor(Pred.pred);
+    try testing.expect(!session.exited);
+}
+
+test "live: tmux's status line is mirrored when asked for" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, "sleep 60", .{
+        .viewer = .{ .status_line = true },
+        .config = "set -g status-left '#[fg=red][left]#[default] '\nset -g status-right 'right #{session_windows}'",
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return std.mem.eql(u8, v.viewer.status.left, "[left] ") and
+                std.mem.eql(u8, v.viewer.status.right, "right 1") and
+                v.viewer.status.windows.len > 0;
+        }
+    }.pred);
+
+    // And followed when it changes.
+    {
+        const out = try session.ask(&.{ "new-window", "-d", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return std.mem.eql(u8, v.viewer.status.right, "right 2");
+        }
+    }.pred);
     try testing.expect(!session.exited);
 }

@@ -225,6 +225,7 @@ pub const DerivedConfig = struct {
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
     tmux_pause_after: u32,
+    tmux_status_bar: bool,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -264,6 +265,7 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .tmux_pause_after = config.@"tmux-pause-after",
+            .tmux_status_bar = config.@"tmux-status-bar",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
@@ -360,6 +362,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write_limit = opts.config.clipboard_write_limit,
         .enquiry_response = opts.config.enquiry_response,
         .xt_checksum_report = opts.config.xt_checksum_report,
+        .tmux_status_bar = opts.config.tmux_status_bar,
         .tmux_host = if (comptime StreamHandler.tmux_enabled) self else {},
 
         // tmux answers the program in a pane itself, and decides how
@@ -490,6 +493,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .breakPane = tmuxHostBreakPane,
     .joinPane = tmuxHostJoinPane,
     .movePane = tmuxHostMovePane,
+    .commandLine = tmuxHostCommandLine,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -653,6 +657,11 @@ fn tmuxHostMovePane(
         .target_pane_id = target_pane_id,
         .direction = direction,
     } });
+}
+
+fn tmuxHostCommandLine(ctx: *anyopaque, text: []const u8) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .command_line = .{ .text = text } });
 }
 
 fn tmuxHostZoomPane(ctx: *anyopaque, pane_id: usize) void {

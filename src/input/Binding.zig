@@ -655,6 +655,22 @@ pub const Action = union(enum) {
     /// default.
     tmux_join_pane: Adjacent,
 
+    /// Run a command line in the tmux session this surface belongs to,
+    /// as tmux's own command prompt (`prefix :`) would, for example
+    /// `tmux_command:select-layout tiled`. Several commands can be joined
+    /// with ` ; `. What it prints, and any error, is shown as a notice.
+    ///
+    /// Works on a tmux pane and on the surface hosting the session.
+    /// Does nothing anywhere else.
+    tmux_command: []const u8,
+
+    /// Prompt for a command line to run in the tmux session this surface
+    /// belongs to, and show what it prints. See `tmux_command`.
+    ///
+    /// Works on a tmux pane and on the surface hosting the session.
+    /// Does nothing anywhere else. Unbound by default.
+    prompt_tmux_command,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1466,6 +1482,8 @@ pub const Action = union(enum) {
             .tmux_rotate_window,
             .tmux_break_pane,
             .tmux_join_pane,
+            .tmux_command,
+            .prompt_tmux_command,
             .prompt_surface_title,
             .prompt_tab_title,
             .prompt_window_title,

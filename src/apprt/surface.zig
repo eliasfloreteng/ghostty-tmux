@@ -176,6 +176,14 @@ pub const Message = union(enum) {
     else
         void,
 
+    /// tmux's status line changed: `status-left`, the window list and
+    /// `status-right`, in that order, separated by NUL. The receiver owns
+    /// it and must `deinit` it.
+    tmux_status: if (terminal.options.tmux_control_mode)
+        WriteReq
+    else
+        void,
+
     pub const TmuxNotice = struct {
         kind: terminal.tmux.Viewer.Notice.Kind,
 
