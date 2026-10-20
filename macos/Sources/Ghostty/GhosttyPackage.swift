@@ -342,6 +342,16 @@ extension Notification.Name {
     static let ghosttyTmuxNotice = Notification.Name("com.mitchellh.ghostty.tmuxNotice")
     static let TmuxNoticeKey = ghosttyTmuxNotice.rawValue + ".notice"
 
+    /// tmux's status line changed, for a session with `tmux-status-bar`
+    /// on. The object is the surface hosting the session.
+    static let ghosttyTmuxStatus = Notification.Name("com.mitchellh.ghostty.tmuxStatus")
+    static let TmuxStatusKey = ghosttyTmuxStatus.rawValue + ".status"
+
+    /// The tabs of a tab group changed order, which AppKit has no event
+    /// for: see `TerminalController.onFrameDidChange`. The object is a
+    /// window of the group.
+    static let ghosttyTabsDidReorder = Notification.Name("com.mitchellh.ghostty.tabsDidReorder")
+
     /// Focus the search field
     static let ghosttySearchFocus = Notification.Name("com.mitchellh.ghostty.searchFocus")
 }

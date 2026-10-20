@@ -83,6 +83,12 @@ extension Ghostty {
                     .transition(.opacity)
                 }
 
+                // A tmux pane that is behind tmux says so: it can look
+                // complete and not be.
+                if surfaceView.tmuxPaneStatus != .live {
+                    TmuxPaneStatusBadge(status: surfaceView.tmuxPaneStatus)
+                }
+
                 // Readonly indicator badge
                 if surfaceView.readonly {
                     ReadonlyBadge {
@@ -1051,6 +1057,75 @@ extension Ghostty {
                     RoundedRectangle(cornerRadius: 6)
                         .strokeBorder(Color.orange.opacity(0.6), lineWidth: 1.5)
                 )
+        }
+    }
+
+    /// Says that a tmux pane is not up to date with tmux, over its top left
+    /// corner (the read-only badge has the right).
+    ///
+    /// History loading after an attach is usually over in a moment, so
+    /// that is only shown if it is still going a little later: a badge
+    /// flashing on every pane of every attach would be noise. A pane tmux
+    /// paused is shown at once, since what it shows may be stale.
+    struct TmuxPaneStatusBadge: View {
+        let status: Action.TmuxPaneStatus
+
+        @State private var shown = false
+
+        var body: some View {
+            VStack {
+                HStack {
+                    if shown {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(label)
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(.regularMaterial))
+                        .foregroundStyle(.secondary)
+                        .help(help)
+                        .transition(.opacity)
+                    }
+
+                    Spacer()
+                }
+                .padding(8)
+
+                Spacer()
+            }
+            .allowsHitTesting(shown)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(shown ? label : "")
+            .task(id: status) {
+                if status == .loadingHistory {
+                    try? await Task.sleep(nanoseconds: 750_000_000)
+                    guard !Task.isCancelled else { return }
+                }
+                withAnimation { shown = true }
+            }
+        }
+
+        private var label: String {
+            switch status {
+            case .catchingUp: "Paused, catching up…"
+            case .loadingHistory: "Loading history…"
+            case .live: ""
+            }
+        }
+
+        private var help: String {
+            switch status {
+            case .catchingUp:
+                "tmux paused this pane because Ghostty fell behind its output " +
+                    "(tmux-pause-after), and it is being read again. Output from " +
+                    "while it was paused is lost."
+            case .loadingHistory:
+                "The pane's scrollback is still being read from tmux."
+            case .live: ""
+            }
         }
     }
 

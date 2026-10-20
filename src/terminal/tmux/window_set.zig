@@ -94,6 +94,18 @@ pub const WindowSet = struct {
         has_active_pane: bool,
         active_pane_id: usize,
 
+        /// What tmux would mark this window with in its status line: it
+        /// rang a bell, had activity, or fell silent, since the session
+        /// was last on it. See `Viewer.Alerts`.
+        ///
+        /// tmux only sets these on a window the session is not on, and
+        /// clears them when the session moves to it, so a GUI showing
+        /// them on a tab need not clear them itself: selecting the tab
+        /// moves tmux, and the next snapshot has them cleared.
+        bell: bool,
+        activity: bool,
+        silence: bool,
+
         /// The layout tree, flattened. Index 0 is the root. This is never
         /// empty: a window always has at least one pane.
         nodes: [*]const Node,
@@ -212,6 +224,9 @@ pub const WindowSet = struct {
                 .zoomed_pane_id = src.zoomed_pane_id orelse 0,
                 .has_active_pane = src.active_pane_id != null,
                 .active_pane_id = src.active_pane_id orelse 0,
+                .bell = src.alerts.bell,
+                .activity = src.alerts.activity,
+                .silence = src.alerts.silence,
                 .nodes = owned.ptr,
                 .nodes_len = owned.len,
                 .hidden = src.hidden,
@@ -446,6 +461,21 @@ test "session name is copied and NUL terminated" {
 
     try testing.expectEqualStrings("work", set.session_name);
     try testing.expectEqual(0, set.session_name.ptr[set.session_name.len]);
+}
+
+test "alerts cross as flags" {
+    const alloc = testing.allocator;
+
+    var window = try testWindow(alloc, 0, 83, 44, "83x44,0,0,0");
+    defer window.deinit(alloc);
+    window.alerts = .{ .bell = true, .silence = true };
+
+    const set = try WindowSet.create(alloc, "", &.{window}, &.{});
+    defer set.destroy();
+
+    try testing.expect(set.windows[0].bell);
+    try testing.expect(!set.windows[0].activity);
+    try testing.expect(set.windows[0].silence);
 }
 
 test "active pane crosses as a flag and an id" {

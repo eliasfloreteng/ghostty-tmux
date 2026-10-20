@@ -228,6 +228,8 @@ pub const DerivedConfig = struct {
     tmux_history_limit: ?u32,
     tmux_paste_buffer_clipboard: bool,
     tmux_client_flags: configpkg.Config.TmuxClientFlags,
+    tmux_hidden_output_off_after: u32,
+    tmux_status_bar: bool,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -270,6 +272,8 @@ pub const DerivedConfig = struct {
             .tmux_history_limit = config.@"tmux-history-limit",
             .tmux_paste_buffer_clipboard = config.@"tmux-paste-buffer-clipboard",
             .tmux_client_flags = config.@"tmux-client-flags",
+            .tmux_hidden_output_off_after = config.@"tmux-hidden-output-off-after",
+            .tmux_status_bar = config.@"tmux-status-bar",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
@@ -371,6 +375,8 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         // Read when a control mode session starts, which can be long
         // before the config is next reloaded.
         .tmux_pause_after = opts.config.tmux_pause_after,
+        .tmux_hidden_output_off_after = opts.config.tmux_hidden_output_off_after,
+        .tmux_status_bar = opts.config.tmux_status_bar,
         .tmux_history_limit = opts.config.tmux_history_limit,
         .tmux_paste_buffer_clipboard = opts.config.tmux_paste_buffer_clipboard,
         .tmux_client_flags = opts.config.tmux_client_flags,
@@ -442,6 +448,10 @@ fn tmuxEndpointClose(ctx: *anyopaque) void {
 ///
 /// tmux owns this grid: a `.resize` op is the only thing that resizes it.
 pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
+    // The last status in the batch, told to the surface once our lock is
+    // released: the mailbox can block, and only ever frees up our lock.
+    var status: ?terminalpkg.tmux.sink.PaneStatus = null;
+
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
@@ -451,6 +461,27 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
             // ops. Replies the stream would send are dropped: tmux has
             // already answered the pane. See `answer_queries`.
             .bytes => |b| self.processOutputLocked(b),
+
+            // What the program wrapped for the terminal outside tmux:
+            // notifications, clipboard writes, kitty graphics. Through
+            // the same stream, but tmux's cursor does not move for it,
+            // so ours is put back where tmux has it. Only a kitty
+            // graphics placement could have moved it.
+            .passthrough => |b| {
+                const screen = self.terminal.screens.active;
+                const x = screen.cursor.x;
+                const y = screen.cursor.y;
+                const pending_wrap = screen.cursor.pending_wrap;
+                self.processOutputLocked(b);
+
+                const after = self.terminal.screens.active;
+                if (after == screen and
+                    (after.cursor.x != x or after.cursor.y != y))
+                {
+                    after.cursorAbsolute(x, y);
+                    after.cursor.pending_wrap = pending_wrap;
+                }
+            },
 
             .resize => |v| self.terminal.resize(self.alloc, .{
                 .cols = v.cols,
@@ -463,6 +494,16 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
                 "tmux pane resize failed err={}",
                 .{err},
             ),
+
+            // As the program would have said it, so the surface hears of
+            // it the same way: OSC 2 and OSC 7.
+            .title => |title| self.terminal_stream.handler.windowTitle(
+                title,
+            ) catch |err| log.warn("tmux pane title failed err={}", .{err}),
+
+            .pwd => |pwd| self.tmuxPanePwd(pwd),
+
+            .pane_status => |v| status = v,
 
             else => terminalpkg.tmux.sink.applyOp(
                 self.alloc,
@@ -478,6 +519,34 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
     // Ops other than bytes schedule no render of their own, so one
     // wakeup covers the batch.
     self.terminal_stream.handler.queueRender() catch unreachable;
+
+    if (status) |v| _ = self.surface_mailbox.push(
+        .{ .tmux_pane_status = v },
+        .{ .forever = {} },
+    );
+}
+
+/// Report a tmux pane's working directory as an OSC 7 from the tmux
+/// server's host would, so the same rule applies to it: a path on another
+/// machine is ignored. The `kitty-shell-cwd` scheme takes the path as it
+/// is, so it needs no escaping. Caller holds the renderer mutex.
+fn tmuxPanePwd(self: *Termio, pwd: terminalpkg.tmux.Op.Pwd) void {
+    if (pwd.host.len == 0 or pwd.path.len == 0) return;
+
+    var buf: [4096]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        &buf,
+        "kitty-shell-cwd://{s}{s}",
+        .{ pwd.host, pwd.path },
+    ) catch {
+        log.warn("tmux pane path too long, ignoring", .{});
+        return;
+    };
+
+    self.terminal_stream.handler.reportPwd(url) catch |err| log.warn(
+        "tmux pane path failed err={}",
+        .{err},
+    );
 }
 
 /// How the tmux router asks us to talk to the tmux server.
@@ -498,6 +567,13 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .zoomPane = tmuxHostZoomPane,
     .moveWindow = tmuxHostMoveWindow,
     .renameWindow = tmuxHostRenameWindow,
+    .paneShown = tmuxHostPaneShown,
+    .swapPane = tmuxHostSwapPane,
+    .rotateWindow = tmuxHostRotateWindow,
+    .breakPane = tmuxHostBreakPane,
+    .joinPane = tmuxHostJoinPane,
+    .movePane = tmuxHostMovePane,
+    .commandLine = tmuxHostCommandLine,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -617,6 +693,74 @@ fn tmuxHostMoveWindow(ctx: *anyopaque, pane_id: usize, amount: isize) void {
         .pane_id = pane_id,
         .amount = amount,
     } });
+}
+
+fn tmuxHostPaneShown(ctx: *anyopaque, pane_id: usize, shown: bool) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .pane_shown = .{
+        .pane_id = pane_id,
+        .shown = shown,
+    } });
+}
+
+fn tmuxHostSwapPane(
+    ctx: *anyopaque,
+    pane_id: usize,
+    target: terminalpkg.tmux.sink.SwapTarget,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .swap_pane = .{
+        .pane_id = pane_id,
+        .target = target,
+    } });
+}
+
+fn tmuxHostRotateWindow(
+    ctx: *anyopaque,
+    pane_id: usize,
+    direction: terminalpkg.tmux.sink.Adjacent,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .rotate_window = .{
+        .pane_id = pane_id,
+        .direction = direction,
+    } });
+}
+
+fn tmuxHostBreakPane(ctx: *anyopaque, pane_id: usize) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .break_pane = .{ .pane_id = pane_id } });
+}
+
+fn tmuxHostJoinPane(
+    ctx: *anyopaque,
+    pane_id: usize,
+    window: terminalpkg.tmux.sink.Adjacent,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .join_pane = .{
+        .pane_id = pane_id,
+        .window = window,
+    } });
+}
+
+fn tmuxHostMovePane(
+    ctx: *anyopaque,
+    pane_id: usize,
+    target_pane_id: usize,
+    direction: terminalpkg.tmux.sink.SplitDirection,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .move_pane = .{
+        .pane_id = pane_id,
+        .target_pane_id = target_pane_id,
+        .direction = direction,
+    } });
+}
+
+fn tmuxHostCommandLine(ctx: *anyopaque, text: []const u8) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .command_line = .{ .text = text } });
 }
 
 fn tmuxHostZoomPane(ctx: *anyopaque, pane_id: usize) void {
@@ -1058,6 +1202,13 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 
     // We always notify our backend of focus changes.
     try self.backend.focusGained(td, focused);
+}
+
+/// Whether the surface can be seen: it is in a selected tab of a window
+/// that is neither minimized nor covered. Only a tmux pane cares, to let
+/// tmux stop sending output nobody can see.
+pub fn visibilityChanged(self: *Termio, td: *ThreadData, visible: bool) void {
+    self.backend.visibilityChanged(td, visible);
 }
 
 /// Process output from the pty. This is the manual API that users can

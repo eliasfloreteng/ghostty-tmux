@@ -55,6 +55,13 @@ pub const StreamHandler = struct {
     tmux_history_limit: ?u32 = null,
     tmux_paste_buffer_clipboard: bool = false,
     tmux_client_flags: configpkg.Config.TmuxClientFlags = .{},
+    /// Seconds a tmux pane may be out of sight, and still producing
+    /// output, before its output is turned off, or 0 never to. Read when
+    /// a control mode session starts.
+    tmux_hidden_output_off_after: u32 = 0,
+    /// Whether to mirror tmux's status line. Read when a control mode
+    /// session starts.
+    tmux_status_bar: bool = false,
 
     /// The color reporting format for OSC requests.
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
@@ -131,6 +138,10 @@ pub const StreamHandler = struct {
     /// Requests carrying a granted password skip the permission prompt.
     kitty_clipboard_grants: terminal.kitty.clipboard.Grants = .{},
 
+    /// The kitty desktop notification (OSC 99) being put together, which
+    /// a program may send in pieces.
+    kitty_notification: terminal.kitty.notification.Notification = .{},
+
     /// The in-flight Kitty clipboard protocol (OSC 5522) write
     /// transaction, if any.
     kitty_clipboard_write: ?*terminal.kitty.clipboard.WriteState = null,
@@ -148,6 +159,11 @@ pub const StreamHandler = struct {
     /// notification; the sequence completes at latest with the pane's next
     /// `%output`, and something mid-sequence is by definition mid-stream.
     tmux_attach_retry: if (tmux_enabled) bool else void = if (tmux_enabled) false else {},
+
+    /// Set while the DCS carrying control mode is ending with the viewer
+    /// still alive, i.e. without tmux having said `%exit`. See
+    /// `dcsUnhook`.
+    tmux_lost: if (tmux_enabled) bool else void = if (tmux_enabled) false else {},
 
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
@@ -308,6 +324,8 @@ pub const StreamHandler = struct {
         self.tmux_history_limit = config.tmux_history_limit;
         self.tmux_paste_buffer_clipboard = config.tmux_paste_buffer_clipboard;
         self.tmux_client_flags = config.tmux_client_flags;
+        self.tmux_hidden_output_off_after = config.tmux_hidden_output_off_after;
+        self.tmux_status_bar = config.tmux_status_bar;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
@@ -371,6 +389,7 @@ pub const StreamHandler = struct {
             .linefeed_mode,
             .kitty_clipboard_grant_read,
             .kitty_clipboard_grant_write,
+            .visible,
             => false,
         };
     }
@@ -572,6 +591,9 @@ pub const StreamHandler = struct {
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
+            .kitty_desktop_notification => if (self.kitty_notification.next(value)) |n| {
+                try self.showDesktopNotification(n.title, n.body);
+            },
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
@@ -633,6 +655,19 @@ pub const StreamHandler = struct {
     pub inline fn dcsUnhook(self: *StreamHandler) !void {
         var cmd = self.dcs.unhook() orelse return;
         defer cmd.deinit();
+
+        // tmux says `%exit` before it ends the DCS, however its client
+        // leaves, and the viewer is gone by the time the DCS ends. One
+        // ending with the viewer still here never heard from tmux: what
+        // ended it is whatever the host printed once the connection to
+        // tmux broke, typically a shell's prompt after ssh died.
+        if (comptime tmux_enabled) {
+            self.tmux_lost = cmd == .tmux and self.tmux_viewer != null;
+        }
+        defer if (comptime tmux_enabled) {
+            self.tmux_lost = false;
+        };
+
         try self.dcsCommand(&cmd);
     }
 
@@ -649,6 +684,15 @@ pub const StreamHandler = struct {
                     .enter => {
                         // Setup our viewer state
                         assert(self.tmux_viewer == null);
+                        // What was typed to start this, for the user to
+                        // run again if the connection drops. Read now,
+                        // while it is still the last thing on screen.
+                        const reattach = terminal.tmux.host_command.read(
+                            self.alloc,
+                            self.terminal.screens.active,
+                        ) catch null;
+                        defer if (reattach) |command| self.alloc.free(command);
+
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(global.io(), self.alloc, .{
@@ -659,6 +703,11 @@ pub const StreamHandler = struct {
                                 .active_pane = self.tmux_client_flags.@"active-pane",
                                 .no_detach_on_destroy = self.tmux_client_flags.@"no-detach-on-destroy",
                             },
+                            .hidden_output_off_after = self.tmux_hidden_output_off_after,
+                            .follow_window_order = true,
+                            .status_line = self.tmux_status_bar,
+                            .lazy_history = true,
+                            .reattach_command = reattach orelse "",
                         });
                         errdefer viewer.deinit();
 
@@ -714,7 +763,12 @@ pub const StreamHandler = struct {
                     break :tmux;
                 };
 
-                for (viewer.next(.{ .tmux = tmux })) |action| {
+                const input: terminal.tmux.Viewer.Input = if (tmux == .exit and
+                    self.tmux_lost)
+                    .connection_lost
+                else
+                    .{ .tmux = tmux };
+                for (viewer.next(input)) |action| {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
                         // The viewer has already closed every pane's sink
@@ -742,6 +796,30 @@ pub const StreamHandler = struct {
                                 .kind = notice.kind,
                                 .text = text,
                             } });
+                        },
+
+                        // Copied out of the viewer's buffers, as for a
+                        // notice: one string, the parts separated by NUL,
+                        // which tmux's status text cannot contain.
+                        .status => |status| {
+                            var buf: std.ArrayList(u8) = .empty;
+                            defer buf.deinit(self.alloc);
+                            buf.print(self.alloc, "{s}\x00{s}\x00{s}", .{
+                                status.left,
+                                status.windows,
+                                status.right,
+                            }) catch |err| {
+                                log.warn("failed to report tmux status err={}", .{err});
+                                continue;
+                            };
+                            const joined = apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                buf.items,
+                            ) catch |err| {
+                                log.warn("failed to report tmux status err={}", .{err});
+                                continue;
+                            };
+                            self.surfaceMessageWriter(.{ .tmux_status = joined });
                         },
 
                         .command => |command| {
@@ -1306,7 +1384,7 @@ pub const StreamHandler = struct {
     //-------------------------------------------------------------------------
     // OSC
 
-    fn windowTitle(self: *StreamHandler, title: []const u8) !void {
+    pub fn windowTitle(self: *StreamHandler, title: []const u8) !void {
         var buf: [256]u8 = undefined;
         if (title.len >= buf.len) {
             log.warn("change title requested larger than our buffer size, ignoring", .{});
@@ -1832,7 +1910,7 @@ pub const StreamHandler = struct {
         try self.terminal.semanticPrompt(cmd);
     }
 
-    fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+    pub fn reportPwd(self: *StreamHandler, url: []const u8) !void {
         // Special handling for the empty URL. We treat the empty URL
         // as resetting the pwd as if we never saw a pwd. I can't find any
         // other terminal that does this but it seems like a reasonable

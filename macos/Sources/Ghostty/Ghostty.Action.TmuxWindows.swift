@@ -59,6 +59,12 @@ extension Ghostty.Action {
             /// shown again.
             let hidden: Bool
 
+            /// What tmux would mark the window with in its status line:
+            /// it rang a bell, had activity, or fell silent since the
+            /// session was last on it. tmux clears them when it moves to
+            /// the window, which selecting its tab does.
+            let alerts: Alerts
+
             let nodes: [Node]
 
             /// The first pane in tree order. Children of a split are
@@ -67,6 +73,12 @@ extension Ghostty.Action {
             var firstPaneId: Int? {
                 nodes.first(where: { $0.kind == .pane })?.paneId
             }
+        }
+
+        struct Alerts: Equatable {
+            var bell = false
+            var activity = false
+            var silence = false
         }
 
         /// A node in a window's flattened layout tree. `paneId` is
@@ -159,6 +171,10 @@ extension Ghostty.Action {
                     zoomedPaneId: cWindow.zoomed ? cWindow.zoomed_pane_id : nil,
                     activePaneId: cWindow.has_active_pane ? cWindow.active_pane_id : nil,
                     hidden: cWindow.hidden,
+                    alerts: Alerts(
+                        bell: cWindow.bell,
+                        activity: cWindow.activity,
+                        silence: cWindow.silence),
                     nodes: nodes)
             }
         }

@@ -145,6 +145,18 @@ pub fn focusGained(
     self.router.selectPane(self.pane_id);
 }
 
+/// Tell tmux whether anyone can see this pane, so that it can stop
+/// sending output nobody is looking at. See
+/// `Viewer.Options.hidden_output_off_after`.
+pub fn visibilityChanged(
+    self: *Tmux,
+    td: *termio.Termio.ThreadData,
+    visible: bool,
+) void {
+    _ = td;
+    self.router.paneShown(self.pane_id, visible);
+}
+
 pub fn resize(
     self: *Tmux,
     grid_size: renderer.GridSize,

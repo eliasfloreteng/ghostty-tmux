@@ -129,6 +129,10 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   without a prompt, Ghostty keeps running, the gateway comes to the front
   with its title back, and its shell still answers. (No reason bar is
   expected: tmux 3.6 ends these with a bare `%exit`.)
+- `connection_lost_reattach`: a control client killed with SIGKILL (no
+  `%exit`, as when ssh dies) closes the tabs and offers to reattach;
+  accepting runs the attach command again in the gateway and the session
+  comes back. Needs the gateway shell's Ghostty shell integration.
 - `switch_client`: the tabs become the other session's, the gateway is
   retitled and stays behind.
 - `resize_window`: resizing the GUI changes the tmux window size.
@@ -144,9 +148,9 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
 - `tmux_config_errors`, `tmux_display_message`, `gui_failed_split_notice`:
   one alert lists every tmux.conf error; `display-message -c` and a split
   tmux refuses (read-only client) show a notice bar.
-- `tmux_menu_enabled`: File › tmux is enabled on a pane, only Dashboard
-  and Detach on the gateway, nothing elsewhere. The menu is opened to read it, since
-  AppKit validates items only then.
+- `tmux_menu_enabled`: File › tmux is enabled on a pane, only Run
+  Command, Dashboard and Detach on the gateway, nothing elsewhere. The
+  menu is opened to read it, since AppKit validates items only then.
 - `no_restore_after_relaunch`: with `window-save-state = always`, quitting
   and relaunching brings no tmux tabs back and the gateway's window back
   as a plain shell. The app is relaunched twice for this.

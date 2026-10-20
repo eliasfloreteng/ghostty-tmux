@@ -2608,6 +2608,37 @@ keybind: Keybinds = .{},
 /// flag added in a later tmux than the server's is ignored by it.
 @"tmux-client-flags": TmuxClientFlags = .{},
 
+/// How many seconds a pane of a tmux control mode session (`tmux -CC`)
+/// may be out of sight while it keeps producing output, before tmux is
+/// asked to stop sending that output (`refresh-client -A '%pane:off'`).
+/// A pane is out of sight when its tab is not the selected one, or its
+/// window is minimized or fully covered.
+///
+/// This saves sending, and drawing, output nobody can see, which matters
+/// most over a slow connection. A pane that is quiet while hidden costs
+/// nothing either way, and is left alone.
+///
+/// The catch is tmux's: a pane that every attached client has turned off
+/// is not read from at all. So when Ghostty is the only client, a program
+/// in a hidden pane that writes a lot waits, rather than running on in
+/// the background, until the pane is shown again. When it is shown again
+/// its output is turned back on and it is read in full again, so nothing
+/// it showed is missing; anything that scrolled past while another
+/// client kept the pane running is in its scrollback.
+///
+/// Set to 0 to disable, which is the default. Requires tmux 3.2 or newer.
+@"tmux-hidden-output-off-after": u32 = 0,
+/// Show tmux's status line in the windows of a tmux control mode session
+/// (`tmux -CC`): a bar along the bottom of each window with `status-left`,
+/// the window list and `status-right`, formatted by tmux as its own
+/// status line would be, and kept up to date as they change (tmux checks
+/// about once a second). tmux's colors and styles are not reproduced.
+///
+/// Off by default, since the windows and the session are already shown
+/// as native tabs and titles. Takes effect from the next attach. Requires
+/// tmux 3.2 or newer; with an older server the bar never appears.
+@"tmux-status-bar": bool = false,
+
 /// The total amount of bytes that can be used for image data (e.g. the Kitty
 /// image protocol) per terminal screen. The maximum value is 4,294,967,295
 /// (4GiB). The default is 320MB. If this is set to zero, then all image

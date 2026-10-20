@@ -73,6 +73,13 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuChangeTabTitle: NSMenuItem?
     @IBOutlet private var menuReadonly: NSMenuItem?
     @IBOutlet private var menuTmuxDetach: NSMenuItem?
+    @IBOutlet private var menuTmuxSwapPanePrevious: NSMenuItem?
+    @IBOutlet private var menuTmuxSwapPaneNext: NSMenuItem?
+    @IBOutlet private var menuTmuxRotatePanes: NSMenuItem?
+    @IBOutlet private var menuTmuxBreakPane: NSMenuItem?
+    @IBOutlet private var menuTmuxJoinPanePrevious: NSMenuItem?
+    @IBOutlet private var menuTmuxJoinPaneNext: NSMenuItem?
+    @IBOutlet private var menuTmuxRunCommand: NSMenuItem?
     @IBOutlet private var menuQuickTerminal: NSMenuItem?
     @IBOutlet private var menuTerminalInspector: NSMenuItem?
     @IBOutlet private var menuCommandPalette: NSMenuItem?
@@ -1266,9 +1273,17 @@ extension AppDelegate {
 
         syncMenuShortcut(config, action: "toggle_secure_input", menuItem: self.menuSecureInput)
 
-        // Only detach: the rest of the tmux menu are bindings that already
-        // have a menu item of their own, which shows their shortcut.
+        // Only the tmux actions: the rest of the tmux menu are bindings
+        // that already have a menu item of their own, which shows their
+        // shortcut.
         syncMenuShortcut(config, action: "tmux_detach", menuItem: self.menuTmuxDetach)
+        syncMenuShortcut(config, action: "tmux_swap_pane:previous", menuItem: self.menuTmuxSwapPanePrevious)
+        syncMenuShortcut(config, action: "tmux_swap_pane:next", menuItem: self.menuTmuxSwapPaneNext)
+        syncMenuShortcut(config, action: "tmux_rotate_window:next", menuItem: self.menuTmuxRotatePanes)
+        syncMenuShortcut(config, action: "tmux_break_pane", menuItem: self.menuTmuxBreakPane)
+        syncMenuShortcut(config, action: "tmux_join_pane:previous", menuItem: self.menuTmuxJoinPanePrevious)
+        syncMenuShortcut(config, action: "tmux_join_pane:next", menuItem: self.menuTmuxJoinPaneNext)
+        syncMenuShortcut(config, action: "prompt_tmux_command", menuItem: self.menuTmuxRunCommand)
 
         // This menu item is NOT synced with the configuration because it disables macOS
         // global fullscreen keyboard shortcut. The shortcut in the Ghostty config will continue

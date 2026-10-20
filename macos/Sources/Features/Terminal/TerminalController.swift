@@ -732,6 +732,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard tabWindowsHash != v else { return }
         tabWindowsHash = v
         self.relabelTabs()
+
+        // The same hack is the only way to hear that a tmux window's tab
+        // was dragged somewhere else, which tmux has to be told.
+        NotificationCenter.default.post(name: .ghosttyTabsDidReorder, object: window)
     }
 
     override func syncAppearance() {

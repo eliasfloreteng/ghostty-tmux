@@ -82,6 +82,9 @@ pub const Message = union(enum) {
     /// The surface gained or lost focus.
     focused: bool,
 
+    /// The surface came into sight or went out of it (occlusion).
+    visible: bool,
+
     /// Record a Kitty clipboard protocol session grant for a password
     /// so future requests carrying it skip the permission prompt, for
     /// reads and writes respectively.
