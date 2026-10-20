@@ -25,7 +25,9 @@ class UpdateController {
     /// `GhosttyUpdaterDisabled` Info.plist key. A build that is not an
     /// official release (a fork, a local build under another bundle ID)
     /// would otherwise "update" into the official release, which the
-    /// official feed and signing key both accept.
+    /// official feed and signing key both accept. A build that updates
+    /// from somewhere else instead sets its own `SUFeedURL` and
+    /// `SUPublicEDKey`.
     static var isDisabled: Bool {
         Bundle.main.infoDictionary?["GhosttyUpdaterDisabled"] as? Bool == true
     }

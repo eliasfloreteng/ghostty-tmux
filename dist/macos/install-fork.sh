@@ -12,6 +12,13 @@
 #
 # To keep macOS permissions across updates, sign with a certificate, e.g.:
 #   SIGN_IDENTITY="Apple Development" dist/macos/install-fork.sh
+#
+# A local build does not update itself: it would replace what you built
+# with the next release of the fork's main. To have it do that anyway,
+# give it the fork's public update key (`generate_keys -p`):
+#   FORK_SPARKLE_PUBLIC_KEY=<key> dist/macos/install-fork.sh
+# It then updates to the first release built from a later commit of main
+# than the checkout's.
 
 set -eu
 
