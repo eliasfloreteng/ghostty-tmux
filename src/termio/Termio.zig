@@ -568,6 +568,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .moveWindow = tmuxHostMoveWindow,
     .renameWindow = tmuxHostRenameWindow,
     .paneShown = tmuxHostPaneShown,
+    .historyWanted = tmuxHostHistoryWanted,
     .swapPane = tmuxHostSwapPane,
     .rotateWindow = tmuxHostRotateWindow,
     .breakPane = tmuxHostBreakPane,
@@ -700,6 +701,20 @@ fn tmuxHostPaneShown(ctx: *anyopaque, pane_id: usize, shown: bool) void {
     self.tmuxHostInput(.{ .pane_shown = .{
         .pane_id = pane_id,
         .shown = shown,
+    } });
+}
+
+fn tmuxHostHistoryWanted(
+    ctx: *anyopaque,
+    pane_id: usize,
+    held: usize,
+    all: bool,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .history_wanted = .{
+        .pane_id = pane_id,
+        .held = held,
+        .all = all,
     } });
 }
 

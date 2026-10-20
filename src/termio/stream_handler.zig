@@ -714,6 +714,12 @@ pub const StreamHandler = struct {
                             .follow_window_order = true,
                             .status_line = self.tmux_status_bar,
                             .lazy_history = true,
+                            // A few dozen screens: enough to scroll back
+                            // through without waiting, and little enough
+                            // to read again whenever a pane is resized.
+                            // The surface asks for the rest as it is
+                            // scrolled up to (see `Surface.tmuxHistory`).
+                            .history_chunk = 1000,
                             .reattach_command = reattach orelse "",
                         });
                         errdefer viewer.deinit();

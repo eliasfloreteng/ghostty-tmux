@@ -161,6 +161,13 @@ child_exited: bool = false,
 tmux_reattach_command: if (terminal.options.tmux_control_mode) ?[]const u8 else void =
     if (terminal.options.tmux_control_mode) null else {},
 
+/// The size of the scrollback, as the scrollbar has it, when we last
+/// asked tmux for older history, so that a display sitting at the top
+/// asks once per change of what it holds rather than once per frame.
+/// See `tmuxHistory`.
+tmux_history_asked: if (terminal.options.tmux_control_mode) ?usize else void =
+    if (terminal.options.tmux_control_mode) null else {},
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -1934,6 +1941,7 @@ fn updateRendererHealth(self: *Surface, health: rendererpkg.Health) void {
 
 /// Called when the scrollbar state changes.
 fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
+    self.tmuxHistory(scrollbar);
     _ = self.rt_app.performAction(
         .{ .surface = self },
         .scrollbar,
@@ -2639,6 +2647,50 @@ fn tmuxPane(self: *Surface) ?struct {
         else => return null,
     };
     return .{ .router = tmux.router.ref(), .id = tmux.pane_id };
+}
+
+/// If this is a tmux pane, ask tmux for the history above what we hold
+/// once the viewport is within a couple of screens of the top of it, so
+/// that scrolling up reads it in as it is reached. See
+/// `terminal.tmux.Viewer.Options.history_chunk`.
+///
+/// Asked again whenever the scrollback changes size while we are up
+/// there, which is what a chunk arriving does, until tmux has no more:
+/// then nothing arrives, nothing changes, and nothing more is asked.
+fn tmuxHistory(self: *Surface, scrollbar: terminal.Scrollbar) void {
+    if (comptime !terminal.options.tmux_control_mode) return;
+    if (scrollbar.offset > scrollbar.len * 2) return;
+    if (self.tmux_history_asked == scrollbar.total) return;
+    if (self.tmuxHistoryWanted(false)) self.tmux_history_asked = scrollbar.total;
+}
+
+/// Ask tmux for older history than we hold, if this is a tmux pane on
+/// its primary screen (the only one with history), the next chunk of it
+/// or with `all` all of it. Returns whether it asked.
+fn tmuxHistoryWanted(self: *Surface, all: bool) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const router, const pane_id, const held = pane: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        const tmux = switch (self.io.backend) {
+            .tmux => |*v| v,
+            else => return false,
+        };
+        if (self.io.terminal.screens.active_key != .primary) return false;
+        const pages = &self.io.terminal.screens.active.pages;
+        break :pane .{
+            tmux.router.ref(),
+            tmux.pane_id,
+            pages.total_rows - pages.rows,
+        };
+    };
+    defer router.unref();
+
+    // Called without our lock: the router takes the host's.
+    router.historyWanted(pane_id, held, all);
+    return true;
 }
 
 pub fn tmuxRouter(self: *Surface) ?*terminal.tmux.Router {
@@ -5598,6 +5650,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     .{&s.state},
                 );
                 s.thread.setName(global.io(), "search") catch {};
+
+                // A tmux pane may not have read all of its history yet.
+                // It goes in above what is searched already, and the
+                // search picks it up as it arrives.
+                _ = self.tmuxHistoryWanted(true);
 
                 break :init s;
             };

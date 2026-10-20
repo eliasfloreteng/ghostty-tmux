@@ -2560,18 +2560,17 @@ keybind: Keybinds = .{},
 /// Only supported on macOS.
 @"tmux-hide-host": bool = false,
 
-/// How many lines of each pane's scrollback to read when attaching to a
-/// tmux control mode session (`tmux -CC`).
+/// How many lines of each pane's scrollback to read from a tmux control
+/// mode session (`tmux -CC`).
 ///
-/// Attaching reads every pane's history so that scrollback, search and
-/// selection work as they would in Ghostty, and for a session with large
-/// histories over a slow connection that read is most of the time an
-/// attach takes. This caps it to the newest lines of each pane. Older
-/// lines stay in tmux; they are just not in Ghostty's scrollback.
+/// A pane's history is read so that scrollback, search and selection work
+/// as they would in Ghostty. Attaching reads only its newest lines, and
+/// older ones are read as the pane is scrolled up to them, or all at once
+/// when it is searched. This caps how far back that goes, counted from
+/// the screen. Older lines stay in tmux; they are just not in Ghostty's
+/// scrollback.
 ///
-/// Unset (the default) reads all of it. `0` reads none. The cap also
-/// applies to a pane created later and to one re-read after
-/// `tmux-pause-after` paused it.
+/// Unset (the default) reads as far back as tmux has. `0` reads none.
 @"tmux-history-limit": ?u32 = null,
 
 /// Copy tmux's paste buffers to the system clipboard as they change, when
