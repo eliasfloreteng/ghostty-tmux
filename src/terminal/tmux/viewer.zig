@@ -14,6 +14,7 @@ const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
 const sinkpkg = @import("sink.zig");
+const passthrough = @import("passthrough.zig");
 const Sink = sinkpkg.Sink;
 
 const log = std.log.scoped(.terminal_tmux_viewer);
@@ -742,6 +743,10 @@ pub const Viewer = struct {
         /// notification loses the prefix and prints the tail as text.
         stream: TerminalStream,
 
+        /// Takes tmux's passthrough escape back out of the pane's
+        /// output, ahead of `stream`. Persistent for the same reason.
+        passthrough: passthrough.Unwrapper,
+
         /// Where this pane's operations are mirrored, if anything has
         /// attached. See `attachPane`.
         sink: ?Sink = null,
@@ -837,6 +842,7 @@ pub const Viewer = struct {
 
             // Only valid because `self` never moves again.
             self.stream = self.terminal.vtStream();
+            self.passthrough = .{};
             self.sink = null;
 
             // Field defaults do not apply here: `self` is uninitialized
@@ -4173,7 +4179,7 @@ pub const Viewer = struct {
             return error.UnknownPane;
         const pane: *Pane = entry.value_ptr.*;
 
-        if (!pane.stream.ground()) {
+        if (!pane.stream.ground() or pane.passthrough.midSequence()) {
             log.info(
                 "attach to pane id={} while mid-sequence, refusing",
                 .{pane_id},
@@ -4223,6 +4229,11 @@ pub const Viewer = struct {
             // The stream is per-pane and persistent, so it can't go
             // through applyOp.
             .bytes => |b| pane.stream.nextSlice(b),
+
+            // Nothing in it is for us: it never touches the grid, and a
+            // notification or an image is the display's business.
+            .passthrough => {},
+
             else => try sinkpkg.applyOp(self.alloc, &pane.terminal, op),
         };
 
@@ -4348,7 +4359,21 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
-        try self.paneOps(pane, &.{.{ .bytes = data }});
+
+        // Almost all output is the pane's own, and goes as it came.
+        // Otherwise it is split into the pane's output and what was
+        // wrapped for the terminal outside tmux, in order. The runs point
+        // into `data` and constants, which outlive the call.
+        if (pane.passthrough.idle() and
+            std.mem.indexOfScalar(u8, data, 0x1B) == null)
+        {
+            try self.paneOps(pane, &.{.{ .bytes = data }});
+        } else {
+            var ops: OpCollector = .{ .alloc = self.alloc };
+            defer ops.list.deinit(self.alloc);
+            try pane.passthrough.feed(data, &ops);
+            try self.paneOps(pane, ops.list.items);
+        }
         try self.hideOutput(id, pane);
 
         // A server that cannot tell us about alerts by subscription is
@@ -4359,6 +4384,23 @@ pub const Viewer = struct {
             if (self.current_window_id != window.id) try self.requestAlerts();
         }
     }
+
+    /// Turns the runs `passthrough.Unwrapper` hands out into ops.
+    const OpCollector = struct {
+        alloc: Allocator,
+        list: std.ArrayList(sinkpkg.Op) = .empty,
+
+        pub fn emit(
+            self: *OpCollector,
+            kind: passthrough.Kind,
+            bytes: []const u8,
+        ) Allocator.Error!void {
+            try self.list.append(self.alloc, switch (kind) {
+                .pane => .{ .bytes = bytes },
+                .passthrough => .{ .passthrough = bytes },
+            });
+        }
+    };
 
     /// Convert a tmux layout dimension into a terminal cell count. tmux
     /// gives us a usize but our terminals are limited to CellCountInt, so
@@ -5037,6 +5079,9 @@ const Format = struct {
             .scroll_region_lower,
             // Tab stops
             .pane_tabs,
+            // Keyboard: modifyOtherKeys. Last because it is the newest
+            // (tmux 3.5); older servers print nothing for it.
+            .pane_key_mode,
         },
     };
 
@@ -5968,8 +6013,8 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;0;1;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
-                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
+                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;0;1;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160;VT10x
+                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160;VT10x
                 ,
             } },
             .check = (struct {
@@ -6085,7 +6130,7 @@ test "pane state ignores out of bounds scroll region" {
         // list-panes with a scroll region bottom far past the screen
         .{
             .input = .{ .tmux = .{
-                .block_end = "%0;0;5;1;;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;60000;",
+                .block_end = "%0;0;5;1;;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;60000;;",
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
@@ -6178,7 +6223,7 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
         (if (alternate_on) "1;0;0;" else "0;0;0;") ++
         "0;1;0;0;0;" ++
         "0;0;0;0;0;" ++
-        "0;0;0;23;8,16,24,32,40,48,56,64,72\n" ++
+        "0;0;0;23;8,16,24,32,40,48,56,64,72;Ext 2\n" ++
         "%end 8 8 0\n" ++
 
         // Live output after initialization.
@@ -6484,8 +6529,13 @@ const MirrorSink = struct {
     stream: TerminalStream,
     closed: bool = false,
 
-    /// How many ops it has been sent, for tests about what is not sent.
+    /// How many ops other than the pane's own output it has been sent,
+    /// for tests about what is not sent. Output is left out because how
+    /// it is cut up is the passthrough unwrapper's business.
     ops: usize = 0,
+
+    /// Everything that arrived as `.passthrough`, in order.
+    passthrough: std.ArrayList(u8) = .empty,
 
     fn init(
         self: *MirrorSink,
@@ -6503,6 +6553,7 @@ const MirrorSink = struct {
     }
 
     fn deinit(self: *MirrorSink) void {
+        self.passthrough.deinit(self.alloc);
         self.stream.deinit();
         self.terminal.deinit(self.alloc);
     }
@@ -6516,9 +6567,17 @@ const MirrorSink = struct {
 
     fn applyOps(ctx: *anyopaque, ops: []const sinkpkg.Op) void {
         const self: *MirrorSink = @ptrCast(@alignCast(ctx));
-        self.ops += ops.len;
+        for (ops) |op| if (op != .bytes) {
+            self.ops += 1;
+        };
         for (ops) |op| switch (op) {
             .bytes => |b| self.stream.nextSlice(b),
+            .passthrough => |b| self.passthrough.appendSlice(
+                self.alloc,
+                b,
+            ) catch |err| {
+                log.warn("mirror sink failed to keep passthrough: {}", .{err});
+            },
             else => sinkpkg.applyOp(
                 self.alloc,
                 &self.terminal,
@@ -6720,7 +6779,7 @@ test "pane state maps tmux mouse flags to the right modes" {
         //  ...;mouse_all;mouse_button;mouse_standard;utf8;sgr;...
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;1;0;0;0;0;0;39;8,16
+            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;1;0;0;0;0;0;39;8,16;VT10x
             ,
         } } },
     });
@@ -6767,7 +6826,7 @@ test "attached sink mirrors the pane terminal" {
         // reach the active screen.
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;7;2;1;bar;;;1;5;3;1;1;0;0;1;0;0;0;0;0;;;1;40;8,16,24
+            \\%0;7;2;1;bar;;;1;5;3;1;1;0;0;1;0;0;0;0;0;;;1;40;8,16,24;VT10x
             ,
         } } },
         // Then live output, including a sequence split across two
@@ -6813,6 +6872,87 @@ test "attached sink mirrors the pane terminal" {
     );
     defer testing.allocator.free(str);
     try testing.expect(std.mem.indexOf(u8, str, "hello red") != null);
+}
+
+test "a pane's passthrough reaches its sink unwrapped and leaves the grid alone" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps()[0..4]);
+    try viewer.attachPane(0, mirror.sink());
+
+    // A notification wrapped the way Claude Code wraps it, split mid
+    // prefix and mid sequence, with text and a cursor move in the
+    // wrapper that tmux would never have drawn.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "before\x1bPtm",
+        } } } },
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "ux;junk\x1b\x1b[H\x1b\x1b]777;notify;Ti",
+        } } } },
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "tle;Body\x1b\x1b\\\x1b\\after",
+        } } } },
+    });
+
+    try testing.expectEqualStrings(
+        "\x1b]777;notify;Title;Body\x1b\\",
+        mirror.passthrough.items,
+    );
+
+    // Both sides drew the pane's own output and nothing else, and the
+    // cursor is where that output left it.
+    const pane: *Viewer.Pane = viewer.panes.getEntry(0).?.value_ptr.*;
+    for ([_]*Terminal{ &pane.terminal, &mirror.terminal }) |t| {
+        const str = try t.screens.active.dumpStringAlloc(
+            testing.allocator,
+            .{ .active = .{} },
+        );
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("beforeafter", str);
+        try testing.expectEqual(11, t.screens.active.cursor.x);
+        try testing.expectEqual(0, t.screens.active.cursor.y);
+    }
+}
+
+test "attaching mid passthrough string waits for it to end" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps()[0..4]);
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "\x1bPtmux;\x1b\x1b]9;half",
+        } } } },
+    });
+
+    // Our own parser is at ground, but the sink would get the rest of
+    // the OSC without its start.
+    try testing.expectError(
+        error.PaneMidSequence,
+        viewer.attachPane(0, mirror.sink()),
+    );
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "\x07\x1b\\",
+        } } } },
+    });
+    try viewer.attachPane(0, mirror.sink());
 }
 
 test "sink is closed when its pane goes away" {
@@ -8630,7 +8770,7 @@ test "output escape sequence split across notifications" {
         // pane_state, alternate_on = 0.
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16
+            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16;VT10x
             ,
         } } },
 
@@ -8684,7 +8824,7 @@ test "pane state restores the active screen" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16
+                \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;;;0;39;8,16;VT10x
                 ,
             } },
             .check = (struct {
@@ -9616,7 +9756,7 @@ test "pane titles and working directories reach the pane's display" {
         // tmux could not tell where the pane is.
         .{ .input = testSubscription("ghostty-path", 0, 0, "") },
     });
-    try testing.expectEqual(ops + 1, mirror.ops);
+    try testing.expectEqual(ops, mirror.ops);
     try testing.expectEqualStrings("make", mirror.terminal.getTitle().?);
     try testing.expectEqualStrings("/home/me/src", mirror.terminal.getPwd().?);
 

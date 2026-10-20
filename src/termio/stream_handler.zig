@@ -132,6 +132,10 @@ pub const StreamHandler = struct {
     /// Requests carrying a granted password skip the permission prompt.
     kitty_clipboard_grants: terminal.kitty.clipboard.Grants = .{},
 
+    /// The kitty desktop notification (OSC 99) being put together, which
+    /// a program may send in pieces.
+    kitty_notification: terminal.kitty.notification.Notification = .{},
+
     /// The in-flight Kitty clipboard protocol (OSC 5522) write
     /// transaction, if any.
     kitty_clipboard_write: ?*terminal.kitty.clipboard.WriteState = null,
@@ -566,6 +570,9 @@ pub const StreamHandler = struct {
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
+            .kitty_desktop_notification => if (self.kitty_notification.next(value)) |n| {
+                try self.showDesktopNotification(n.title, n.body);
+            },
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),

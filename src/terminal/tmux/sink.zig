@@ -100,6 +100,17 @@ pub const Op = union(enum) {
     /// ops, because a sequence can be split across notifications.
     bytes: []const u8,
 
+    /// A string sequence (OSC, DCS or APC) that the pane's program
+    /// wrapped in tmux's passthrough escape, unwrapped. See
+    /// `passthrough.zig`.
+    ///
+    /// For the same stream as `.bytes`, which it may be split across
+    /// like any other sequence. tmux never sees it take effect, so it
+    /// must not move the cursor of a terminal that mirrors tmux's grid:
+    /// a kitty graphics placement would. The viewer's own terminal skips
+    /// it, having no use for notifications or images.
+    passthrough: []const u8,
+
     /// Make the given screen active, without any of the side effects that
     /// the DECSET alternate-screen modes carry.
     switch_screen: ScreenSet.Key,
@@ -179,6 +190,7 @@ pub const Op = union(enum) {
                     .path = try alloc.dupe(u8, p.path),
                 } };
             },
+            .passthrough => |b| .{ .passthrough = try alloc.dupe(u8, b) },
 
             // The parsed pane state is a flat struct of scalars and
             // slices, so walk it rather than naming the string fields:
@@ -211,7 +223,7 @@ pub const Op = union(enum) {
     /// straight from the viewer; those payloads are not ours.
     pub fn deinit(self: Op, alloc: Allocator) void {
         switch (self) {
-            .bytes => |b| alloc.free(b),
+            .bytes, .passthrough => |b| alloc.free(b),
             .title => |t| alloc.free(t),
             .pwd => |p| {
                 alloc.free(p.host);
@@ -270,15 +282,15 @@ pub const Sink = struct {
 
 /// Apply an op to a terminal.
 ///
-/// `.bytes` is not handled here: the caller owns the stream, because parser
-/// state has to persist across calls.
+/// `.bytes` and `.passthrough` are not handled here: the caller owns the
+/// stream, because parser state has to persist across calls.
 pub fn applyOp(
     alloc: Allocator,
     t: *Terminal,
     op: Op,
 ) !void {
     switch (op) {
-        .bytes => unreachable,
+        .bytes, .passthrough => unreachable,
 
         .switch_screen => |key| _ = try t.switchScreen(key),
 
@@ -421,6 +433,23 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) !void {
     t.modes.set(.focus_event, data.focus_flag);
     t.modes.set(.bracketed_paste, data.bracketed_paste);
 
+    // modifyOtherKeys. Our keys reach the program as the bytes we encode
+    // them to (`send-keys -H`), so the encoding has to be the one it
+    // asked for. tmux's level 1 is ours off: we only implement 2. An
+    // empty value is a tmux before 3.5, which cannot tell us, and the
+    // flag is left as live output set it.
+    //
+    // The kitty keyboard flags have no equivalent: tmux 3.6 neither
+    // implements the protocol nor keeps the flags a program pushed, so
+    // a program that set them before we attached keeps getting legacy
+    // keys from us. Programs that ask first (`CSI ? u`) never set them
+    // under tmux, since tmux leaves that query unanswered.
+    if (std.mem.eql(u8, data.pane_key_mode, "Ext 2")) {
+        t.flags.modify_other_keys_2 = true;
+    } else if (data.pane_key_mode.len > 0) {
+        t.flags.modify_other_keys_2 = false;
+    }
+
     // Scroll region (tmux uses 0-based values)
     scroll: {
         const scroll_top = std.math.cast(
@@ -510,6 +539,36 @@ test "cloning a payload-free op copies it as-is" {
             std.meta.activeTag(copy),
         );
     }
+}
+
+test "pane state restores modifyOtherKeys as tmux reports it" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var data: PaneStateData = std.mem.zeroes(PaneStateData);
+    data.cursor_shape = "";
+    data.cursor_colour = "";
+    data.pane_tabs = "";
+
+    data.pane_key_mode = "Ext 2";
+    try applyPaneState(&t, data);
+    try testing.expect(t.flags.modify_other_keys_2);
+
+    // A tmux too old to say leaves what we have alone.
+    data.pane_key_mode = "";
+    try applyPaneState(&t, data);
+    try testing.expect(t.flags.modify_other_keys_2);
+
+    // Level 1 is not one we implement.
+    data.pane_key_mode = "Ext 1";
+    try applyPaneState(&t, data);
+    try testing.expect(!t.flags.modify_other_keys_2);
+
+    t.flags.modify_other_keys_2 = true;
+    data.pane_key_mode = "VT10x";
+    try applyPaneState(&t, data);
+    try testing.expect(!t.flags.modify_other_keys_2);
 }
 
 test "erase_all clears the scrollback as well as the display" {

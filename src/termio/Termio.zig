@@ -444,6 +444,27 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
             // already answered the pane. See `answer_queries`.
             .bytes => |b| self.processOutputLocked(b),
 
+            // What the program wrapped for the terminal outside tmux:
+            // notifications, clipboard writes, kitty graphics. Through
+            // the same stream, but tmux's cursor does not move for it,
+            // so ours is put back where tmux has it. Only a kitty
+            // graphics placement could have moved it.
+            .passthrough => |b| {
+                const screen = self.terminal.screens.active;
+                const x = screen.cursor.x;
+                const y = screen.cursor.y;
+                const pending_wrap = screen.cursor.pending_wrap;
+                self.processOutputLocked(b);
+
+                const after = self.terminal.screens.active;
+                if (after == screen and
+                    (after.cursor.x != x or after.cursor.y != y))
+                {
+                    after.cursorAbsolute(x, y);
+                    after.cursor.pending_wrap = pending_wrap;
+                }
+            },
+
             .resize => |v| self.terminal.resize(self.alloc, .{
                 .cols = v.cols,
                 .rows = v.rows,

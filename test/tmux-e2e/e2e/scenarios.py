@@ -1069,6 +1069,46 @@ def pane_osc52_clipboard(ctx: Context) -> None:
             ctx.app.relaunch()
 
 
+@scenario
+def pane_passthrough_unwrapped(ctx: Context) -> None:
+    """A sequence wrapped in tmux's passthrough escape takes effect, and nothing else in the wrapper does."""
+    # Claude Code wraps its notifications like this whenever $TMUX is set.
+    # A notification cannot be seen from here, but a clipboard write goes
+    # through the same unwrapping. `allow-passthrough` stays at its
+    # default, off: a control client gets the pane's raw output anyway.
+    saved = pbpaste()
+    try:
+        ctx.attach()
+        text = f"wrapped-{secrets.token_hex(4)}"
+        encoded = base64.b64encode(text.encode()).decode()
+        # The wrapper also holds text, which tmux never draws. Spelled
+        # through a variable so the command line itself does not show it.
+        rest = f"-in-wrapper\\033\\033]52;c;{encoded}\\a\\033\\\\"
+        ctx.tmux.run(
+            "send-keys",
+            "-t",
+            f"{SESSION}:main",
+            f"j=junk; printf '\\033Ptmux;'\"$j\"'{rest}'; echo pt-$((6*7))",
+            "Enter",
+        )
+        wait_until(
+            lambda: pbpaste() == text,
+            timeout=ctx.timeout,
+            desc=f"{text!r} on the clipboard from inside the wrapper",
+            describe_state=lambda: f"clipboard: {pbpaste()!r}",
+        )
+        term = ctx.tab_for_window("main").terminals[0].id
+        wait_until(
+            lambda: "pt-42" in ctx.app.read_screen(term),
+            timeout=ctx.timeout,
+            desc="the pane's output after the wrapper in the GUI",
+        )
+        screen = ctx.app.read_screen(term)
+        check("junk-in-wrapper" not in screen, "text inside the wrapper was drawn")
+    finally:
+        pbcopy(saved)
+
+
 def _numbered_file(ctx: Context, lines: int) -> str:
     path = ctx.tmux.conf.parent / "numbered.txt"
     path.write_text("".join(f"line-{i:04d}\n" for i in range(1, lines + 1)))
