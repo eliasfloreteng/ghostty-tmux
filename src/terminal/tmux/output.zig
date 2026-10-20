@@ -131,6 +131,8 @@ pub const Variable = enum {
     cursor_y,
     /// 1 if focus reporting is enabled.
     focus_flag,
+    /// The tmux server's host name, as `gethostname` has it there.
+    host,
     /// Pane insert flag.
     insert_flag,
     /// Pane keypad cursor flag.
@@ -175,6 +177,14 @@ pub const Variable = enum {
     window_height,
     /// Whether a pane in this window is zoomed.
     window_zoomed_flag,
+    /// 1 if the window has rung a bell since the session was last on it.
+    window_bell_flag,
+    /// 1 if the window has had activity (`monitor-activity`) since the
+    /// session was last on it.
+    window_activity_flag,
+    /// 1 if the window has been silent for `monitor-silence` seconds
+    /// since the session was last on it.
+    window_silence_flag,
     /// Window layout description as it is actually displayed. Identical to
     /// `window_layout` unless a pane is zoomed, in which case it is a
     /// single leaf holding only the zoomed pane. Parse it for that pane
@@ -210,6 +220,9 @@ pub const Variable = enum {
             .origin_flag,
             .window_active,
             .window_zoomed_flag,
+            .window_bell_flag,
+            .window_activity_flag,
+            .window_silence_flag,
             .wrap_flag,
             => std.mem.eql(u8, value, "1"),
             .alternate_saved_x,
@@ -235,6 +248,7 @@ pub const Variable = enum {
             .window_height => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
             .cursor_shape,
+            .host,
             .pane_tabs,
             .version,
             .window_layout,
@@ -249,6 +263,9 @@ pub const Variable = enum {
         return switch (self) {
             .window_active,
             .window_zoomed_flag,
+            .window_bell_flag,
+            .window_activity_flag,
+            .window_silence_flag,
             .alternate_on,
             .bracketed_paste,
             .client_readonly,
@@ -280,6 +297,7 @@ pub const Variable = enum {
             => usize,
             .cursor_colour,
             .cursor_shape,
+            .host,
             .pane_tabs,
             .version,
             .window_layout,

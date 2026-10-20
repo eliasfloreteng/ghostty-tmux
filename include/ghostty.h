@@ -1002,6 +1002,14 @@ typedef struct {
   // client). Focusing it again is harmless: the core does not echo it back.
   bool has_active_pane;
   size_t active_pane_id;
+  // What tmux would mark the window with in its status line: it rang a
+  // bell, had activity (monitor-activity) or fell silent
+  // (monitor-silence) since the session was last on it. tmux sets these
+  // only on a window it is not on and clears them when it moves there,
+  // so selecting the tab is what clears them; the next snapshot says so.
+  bool bell;
+  bool activity;
+  bool silence;
   const ghostty_tmux_node_s* nodes;
   size_t nodes_len;
 } ghostty_tmux_window_s;
