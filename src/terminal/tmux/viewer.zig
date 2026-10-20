@@ -5226,20 +5226,18 @@ pub const Viewer = struct {
         };
         const pane: *Pane = entry.value_ptr.*;
 
-        // Almost all output is the pane's own, and goes as it came.
-        // Otherwise it is split into the pane's output and what was
-        // wrapped for the terminal outside tmux, in order. The runs point
-        // into `data` and constants, which outlive the call.
-        if (pane.passthrough.idle() and
-            std.mem.indexOfScalar(u8, data, 0x1B) == null)
-        {
-            try self.paneOps(pane, &.{.{ .bytes = data }});
-        } else {
-            var ops: OpCollector = .{ .alloc = self.alloc };
-            defer ops.list.deinit(self.alloc);
-            try pane.passthrough.feed(data, &ops);
-            try self.paneOps(pane, ops.list.items);
-        }
+        // Split into the pane's output and what was wrapped for the
+        // terminal outside tmux, in order. The runs point into `data` and
+        // constants, which outlive the call. Almost all output is the
+        // pane's own, which comes back as one run of `data` whatever
+        // escape sequences are in it, so the list nearly always holds a
+        // single op and is kept off the heap.
+        var stack = std.heap.stackFallback(8 * @sizeOf(sinkpkg.Op), self.alloc);
+        const alloc = stack.get();
+        var ops: OpCollector = .{ .alloc = alloc };
+        defer ops.list.deinit(alloc);
+        try pane.passthrough.feed(data, &ops);
+        if (ops.list.items.len > 0) try self.paneOps(pane, ops.list.items);
         try self.hideOutput(id, pane);
 
         // A server that cannot tell us about alerts by subscription is
