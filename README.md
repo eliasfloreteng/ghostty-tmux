@@ -47,10 +47,11 @@ terminal and the session opens as native Ghostty windows:
   Ghostty window (tmux 3.4+, with a fallback for older servers).
 - **Focus follows both ways.** Focusing a split selects the tmux pane, and
   `select-pane`/`select-window` from tmux or another client moves Ghostty.
-- **Full history on attach**, both screens, cursor and terminal modes, so
-  scrollback, search and selection are Ghostty's own. Typing, IME and
-  pastes (bracketed exactly when the pane's program asked for it) are sent
-  through tmux; queries are answered by tmux only.
+- **Full history on attach**, both screens, cursor and terminal modes
+  (modifyOtherKeys too, from tmux 3.5), so scrollback, search and
+  selection are Ghostty's own. Typing, IME and pastes (bracketed exactly
+  when the pane's program asked for it) are sent through tmux; queries are
+  answered by tmux only.
 - **The terminal that ran `tmux -CC`** shows which session it hosts and
   offers _Show Windows_ and _Detach_; it no longer swallows keys as tmux
   commands. Closing it says it detaches, and the session keeps running.
@@ -58,6 +59,17 @@ terminal and the session opens as native Ghostty windows:
   Detach) and a `tmux_detach` keybind action (unbound by default).
 - **tmux talks back**: `display-message`, tmux.conf errors, refused
   commands and the reason a session ended are shown as notices or alerts.
+- **Notifications, links and passthrough from panes**: OSC 9, OSC 777 and
+  OSC 99 notifications become native notifications of the pane they came
+  from (clicking one brings its tab and split forward), whether sent as is
+  or wrapped in tmux's `DCS tmux;` passthrough, which is unwrapped
+  whatever `allow-passthrough` says. Of what is wrapped only OSC, DCS and
+  APC sequences (clipboard, kitty graphics) take effect, since tmux never
+  sees them. OSC 8 hyperlinks are clickable, including ones in history
+  read on attach. Inside tmux, `TERM_PROGRAM` is `tmux`, so tools cannot
+  tell they are in Ghostty: Claude Code, for one, sends no notification
+  on its `auto` channel there; set it to `ghostty` (OSC 777) with
+  `claude config set --global preferredNotifChannel ghostty`.
 - **Robust sessions**: detach, `kill-session`, `kill-server`, `switch-client`
   (including to the same session), dropped ssh connections, large histories,
   floods (optional `tmux-pause-after = <seconds>`) and read-only clients
