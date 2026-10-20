@@ -75,6 +75,17 @@ pub const Op = union(enum) {
     /// ops, because a sequence can be split across notifications.
     bytes: []const u8,
 
+    /// A string sequence (OSC, DCS or APC) that the pane's program
+    /// wrapped in tmux's passthrough escape, unwrapped. See
+    /// `passthrough.zig`.
+    ///
+    /// For the same stream as `.bytes`, which it may be split across
+    /// like any other sequence. tmux never sees it take effect, so it
+    /// must not move the cursor of a terminal that mirrors tmux's grid:
+    /// a kitty graphics placement would. The viewer's own terminal skips
+    /// it, having no use for notifications or images.
+    passthrough: []const u8,
+
     /// Make the given screen active, without any of the side effects that
     /// the DECSET alternate-screen modes carry.
     switch_screen: ScreenSet.Key,
@@ -122,6 +133,7 @@ pub const Op = union(enum) {
     pub fn clone(self: Op, alloc: Allocator) Allocator.Error!Op {
         return switch (self) {
             .bytes => |b| .{ .bytes = try alloc.dupe(u8, b) },
+            .passthrough => |b| .{ .passthrough = try alloc.dupe(u8, b) },
 
             // The parsed pane state is a flat struct of scalars and
             // slices, so walk it rather than naming the string fields:
@@ -154,7 +166,7 @@ pub const Op = union(enum) {
     /// straight from the viewer; those payloads are not ours.
     pub fn deinit(self: Op, alloc: Allocator) void {
         switch (self) {
-            .bytes => |b| alloc.free(b),
+            .bytes, .passthrough => |b| alloc.free(b),
             .pane_state => |data| freePaneState(alloc, data, null),
             else => {},
         }
@@ -208,15 +220,15 @@ pub const Sink = struct {
 
 /// Apply an op to a terminal.
 ///
-/// `.bytes` is not handled here: the caller owns the stream, because parser
-/// state has to persist across calls.
+/// `.bytes` and `.passthrough` are not handled here: the caller owns the
+/// stream, because parser state has to persist across calls.
 pub fn applyOp(
     alloc: Allocator,
     t: *Terminal,
     op: Op,
 ) !void {
     switch (op) {
-        .bytes => unreachable,
+        .bytes, .passthrough => unreachable,
 
         .switch_screen => |key| _ = try t.switchScreen(key),
 
