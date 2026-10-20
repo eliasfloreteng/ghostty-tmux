@@ -353,6 +353,16 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) !void {
             if (cursor_x >= screen.pages.cols or
                 cursor_y >= screen.pages.rows) break :cursor;
             screen.cursorAbsolute(cursor_x, cursor_y);
+
+            // A capture replay fills every row to the last column (it
+            // is taken with -N), so it leaves the cursor in the bottom
+            // right corner waiting to wrap. Moving the cursor does not
+            // clear that by itself, and left set, the program's next
+            // character would wrap onto the line below the one tmux has
+            // the cursor on: everything it then draws relative to the
+            // cursor lands a line low, and at the bottom of the screen
+            // it scrolls. tmux reports a position, never a pending wrap.
+            screen.cursor.pending_wrap = false;
         }
 
         // Set cursor shape on this screen
@@ -576,4 +586,33 @@ test "trim_trailing_blanks empties plain padding and keeps painted cells" {
     try testing.expect(cell(screen, 2, 2).style_id != 0);
     try testing.expect(cell(screen, 3, 2).style_id != 0);
     for (4..8) |x| try testing.expectEqual(@as(u21, 0), cell(screen, @intCast(x), 2).codepoint());
+}
+
+test "pane state puts the cursor where tmux has it, not waiting to wrap" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+
+    // A replay that fills the screen leaves the cursor at the end of
+    // the last row with a wrap pending.
+    try applyOp(alloc, &t, .{ .replay = "abcd\r\nefgh" });
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+
+    var data: PaneStateData = std.mem.zeroes(PaneStateData);
+    data.cursor_x = 1;
+    data.cursor_y = 0;
+    data.cursor_shape = "";
+    data.cursor_colour = "";
+    data.pane_tabs = "";
+    data.scroll_region_upper = 0;
+    data.scroll_region_lower = 1;
+    try applyOp(alloc, &t, .{ .pane_state = data });
+
+    // The next character goes where tmux would put it.
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("X");
+    const text = try t.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+    defer alloc.free(text);
+    try testing.expectEqualStrings("aXcd\nefgh", text);
 }
