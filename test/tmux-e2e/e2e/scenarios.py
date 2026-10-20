@@ -772,12 +772,16 @@ def gui_failed_split_notice(ctx: Context) -> None:
 
 # -- menu ------------------------------------------------------------------------
 
-TMUX_ITEMS = ["New Window", "Split Right", "Split Down", "Zoom Pane", "Kill Pane…", "Detach"]
+TMUX_ITEMS = ["New Window", "Split Right", "Split Down", "Zoom Pane", "Kill Pane…", "Dashboard…", "Detach"]
+
+# The items that are about the session as a whole, and so also work from
+# the gateway.
+SESSION_ITEMS = ["Dashboard…", "Detach"]
 
 
 @scenario
 def tmux_menu_enabled(ctx: Context) -> None:
-    """File > tmux items are enabled on a tmux pane, only Detach on the gateway, none elsewhere."""
+    """File > tmux items are enabled on a tmux pane, only Dashboard and Detach on the gateway, none elsewhere."""
     ctx.attach()
     plain = ctx.app.new_window()
     plain_term = wait_until(
@@ -797,8 +801,11 @@ def tmux_menu_enabled(ctx: Context) -> None:
     check(all(pane[i] for i in TMUX_ITEMS), f"on a tmux pane every item should be enabled: {pane}")
 
     gateway = items_with_focus(ctx.gateway)
-    check(gateway["Detach"], f"Detach should be enabled on the gateway: {gateway}")
-    check(not any(gateway[i] for i in TMUX_ITEMS if i != "Detach"), f"only Detach belongs to the gateway: {gateway}")
+    check(all(gateway[i] for i in SESSION_ITEMS), f"Dashboard and Detach should be enabled on the gateway: {gateway}")
+    check(
+        not any(gateway[i] for i in TMUX_ITEMS if i not in SESSION_ITEMS),
+        f"only Dashboard and Detach belong to the gateway: {gateway}",
+    )
 
     other = items_with_focus(plain_term)
     check(not any(other[i] for i in TMUX_ITEMS), f"nothing should be enabled outside tmux: {other}")
@@ -1294,3 +1301,163 @@ def switch_client_same_session(ctx: Context) -> None:
             f"the panes changed: {before} -> {ctx.describe()}",
         )
     ctx.wait_synced()
+
+
+# -- dashboard ---------------------------------------------------------------------
+
+DASHBOARD = "tmux Dashboard"
+
+
+def open_dashboard(ctx: Context) -> str:
+    """Open the dashboard from the gateway's overlay and wait for it."""
+    name = ctx.ax_window(f"tmux: {SESSION}")
+    ax.press_button(ctx.app.pid, name, "Dashboard…")
+    return ctx.ax_window(DASHBOARD)
+
+
+@scenario
+def dashboard_hide_window(ctx: Context) -> None:
+    """Hiding a window in the dashboard closes its tab, keeps it in tmux, and showing it brings it back."""
+    two_window_layout(ctx)
+    dash = open_dashboard(ctx)
+    ax.press_checkbox(ctx.app.pid, dash, "beta")
+
+    wait_until(
+        lambda: sorted(t.name for t in ctx.tmux_tabs()) == ["alpha"],
+        timeout=ctx.timeout,
+        desc="the hidden window's tab to close",
+        describe_state=ctx.describe,
+    )
+    check(
+        sorted(w.name for w in ctx.windows()) == ["alpha", "beta"],
+        f"hiding a window must not close it in tmux{ctx.describe()}",
+    )
+    hidden = ctx.tmux.run("show-options", "-w", "-v", "-t", f"{SESSION}:beta", "@ghostty-hidden").strip()
+    check(hidden == "1", f"the window is not marked hidden in tmux: {hidden!r}")
+
+    # Output while hidden is there once it is shown again.
+    pane = ctx.tmux.window(SESSION, "beta").panes[0].id
+    token = secrets.token_hex(3)
+    ctx.tmux.run("send-keys", "-t", pane, f"echo hidden-{token}", "Enter")
+
+    ax.press_checkbox(ctx.app.pid, ctx.ax_window(DASHBOARD), "beta")
+    ctx.wait_synced("the shown window's tab to come back")
+    beta = ctx.tab_for_window("beta")
+    term = ctx.pane_map(beta)
+    shown = next(t for t, p in term.items() if p == pane)
+    wait_until(
+        lambda: f"hidden-{token}" in ctx.app.read_screen(shown),
+        timeout=ctx.timeout,
+        desc="what the pane printed while hidden to be on screen",
+    )
+
+
+@scenario
+def dashboard_hidden_window_survives_reattach(ctx: Context) -> None:
+    """A window hidden in tmux has no tab on the next attach."""
+    ctx.open_gateway()
+    ctx.create_session({"alpha": 1, "beta": 1})
+    ctx.tmux.run("set-option", "-w", "-t", f"{SESSION}:beta", "@ghostty-hidden", "1")
+    ctx.attach_session()
+    wait_until(
+        lambda: sorted(t.name for t in ctx.tmux_tabs()) == ["alpha"],
+        timeout=ctx.timeout,
+        desc="only the shown window to have a tab",
+        describe_state=ctx.describe,
+    )
+    time.sleep(1)
+    check(
+        sorted(t.name for t in ctx.tmux_tabs()) == ["alpha"],
+        f"the hidden window got a tab after all{ctx.describe()}",
+    )
+
+
+@scenario
+def dashboard_switch_session(ctx: Context) -> None:
+    """The dashboard lists the server's sessions and attaches to another one."""
+    two_window_layout(ctx)
+    ctx.tmux.run("new-session", "-d", "-s", "other", "-n", "gamma")
+    dash = open_dashboard(ctx)
+    wait_until(
+        lambda: "other" in ax.window_texts(ctx.app.pid, dash),
+        timeout=ctx.timeout,
+        desc="the dashboard to list session 'other'",
+        describe_state=lambda: repr(ax.window_texts(ctx.app.pid, dash)),
+    )
+    ax.press_button(ctx.app.pid, dash, "Attach")
+    wait_until(
+        lambda: sorted(t.name for t in ctx.tmux_tabs()) == ["gamma"],
+        timeout=ctx.timeout,
+        desc="the tabs to be session 'other''s windows",
+        describe_state=ctx.describe,
+    )
+    client = ctx.tmux.control_clients()[0]
+    check(ctx.tmux.client_session(client) == "other", "the control client is not on 'other'")
+
+
+@scenario
+def option_windows_placement(ctx: Context) -> None:
+    """With tmux-window-placement = windows, each tmux window is a native window of its own."""
+    ctx.app.relaunch("tmux-window-placement = windows\n")
+    try:
+        two_window_layout(ctx)
+        snap = ctx.app.snapshot()
+        owners = {}
+        for w in snap.windows:
+            for t in w.tabs:
+                if t.name in ("alpha", "beta"):
+                    owners[t.name] = w.id
+        check(len(owners) == 2, f"both tmux windows should be on screen: {snap.describe()}")
+        check(owners["alpha"] != owners["beta"], f"the tmux windows share a native window: {snap.describe()}")
+
+        # The one tmux is not on was opened behind, without taking focus
+        # and so without moving tmux.
+        time.sleep(1)
+        check(ctx.tmux.window(SESSION, "alpha").active, f"opening the windows moved tmux off 'alpha'{ctx.describe()}")
+    finally:
+        ctx.gateway = ""
+        ctx.app.relaunch()
+
+
+@scenario
+def option_hide_host(ctx: Context) -> None:
+    """With tmux-hide-host, the gateway's window goes while attached and comes back on detach."""
+    ctx.app.relaunch("tmux-hide-host = true\n")
+    try:
+        two_window_layout(ctx)
+        ctx.ax_window("alpha")
+        wait_until(
+            lambda: f"tmux: {SESSION}" not in ax.window_names(ctx.app.pid),
+            timeout=ctx.timeout,
+            desc="the gateway's window to be ordered out",
+            describe_state=lambda: f"on screen: {ax.window_names(ctx.app.pid)}",
+        )
+        for client in ctx.tmux.control_clients():
+            ctx.tmux.run("detach-client", "-t", client)
+        expect_gateway_back(ctx, "detach-client with the gateway hidden")
+    finally:
+        ctx.gateway = ""
+        ctx.app.relaunch()
+
+
+@scenario
+def option_paste_buffer_clipboard(ctx: Context) -> None:
+    """With tmux-paste-buffer-clipboard, setting a tmux buffer puts it on the clipboard."""
+    saved = pbpaste()
+    ctx.app.relaunch("tmux-paste-buffer-clipboard = true\n")
+    try:
+        ctx.attach()
+        token = secrets.token_hex(4)
+        text = f"copied in tmux {token}\n\x1b[31mwith colour\x1b[m\n"
+        ctx.tmux.run("set-buffer", "-b", "e2e", text)
+        wait_until(
+            lambda: pbpaste() == text,
+            timeout=ctx.timeout,
+            desc="the tmux buffer to reach the clipboard",
+            describe_state=lambda: f"clipboard {pbpaste()!r}",
+        )
+        ctx.wait_synced("the session to survive reading the buffer")
+    finally:
+        pbcopy(saved)
+        ctx.gateway = ""
+        ctx.app.relaunch()

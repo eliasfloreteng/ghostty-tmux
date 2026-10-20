@@ -154,6 +154,18 @@ def press_button(pid: int, window_name: str, title: str) -> None:
     log(f"pressed {title!r} in {window_name!r}")
 
 
+def press_checkbox(pid: int, window_name: str, title: str) -> None:
+    """Toggle the first checkbox (a SwiftUI `Toggle`) titled `title`."""
+    wins = windows(pid)
+    if window_name in wins:
+        for e in _walk(wins[window_name]):
+            if _attr(e, "AXRole") == "AXCheckBox" and title in (_attr(e, "AXTitle"), _attr(e, "AXDescription")):
+                if AS.AXUIElementPerformAction(e, "AXPress") == 0:
+                    log(f"toggled {title!r} in {window_name!r}")
+                    return
+    raise RuntimeError(f"no checkbox {title!r} in window {window_name!r} (windows: {list(wins)})")
+
+
 def dismiss_sheets(pid: int, button: str = "OK") -> None:
     for w in windows(pid).values():
         for child in _children(w):

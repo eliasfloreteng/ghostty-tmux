@@ -144,8 +144,8 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
 - `tmux_config_errors`, `tmux_display_message`, `gui_failed_split_notice`:
   one alert lists every tmux.conf error; `display-message -c` and a split
   tmux refuses (read-only client) show a notice bar.
-- `tmux_menu_enabled`: File › tmux is enabled on a pane, only Detach on
-  the gateway, nothing elsewhere. The menu is opened to read it, since
+- `tmux_menu_enabled`: File › tmux is enabled on a pane, only Dashboard
+  and Detach on the gateway, nothing elsewhere. The menu is opened to read it, since
   AppKit validates items only then.
 - `no_restore_after_relaunch`: with `window-save-state = always`, quitting
   and relaunching brings no tmux tabs back and the gateway's window back
@@ -178,6 +178,19 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
   app is relaunched for this). An emoji with a skin tone modifier is left
   out: tmux 3.6 does not join the two and makes it four columns wide,
   where Ghostty makes it two.
+
+- `dashboard_*`: the dashboard (opened from the gateway's overlay) hides
+  a window, which loses its tab but stays in tmux, and shows it again with
+  what it printed meanwhile; a window hidden in tmux has no tab on
+  attach; Attach on another session switches to it. Needs the
+  Accessibility permission, as it presses the dashboard's controls.
+- `option_windows_placement`, `option_hide_host`,
+  `option_paste_buffer_clipboard`: `tmux-window-placement = windows`
+  gives each tmux window a native window without moving tmux,
+  `tmux-hide-host` orders the gateway out while attached and brings it
+  back on detach, and `tmux-paste-buffer-clipboard` puts a tmux buffer
+  (escape sequences and all) on the clipboard. The app is relaunched for
+  each, and your clipboard text is restored.
 
 Some things can't be checked automatically. These scenarios report `SKIP`
 with a reason:
