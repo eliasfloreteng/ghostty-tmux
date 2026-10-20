@@ -21,12 +21,19 @@ extension Ghostty.Action {
             /// session's windows go.
             case exit
 
+            /// The tmux server is too old to be shown, so the client
+            /// detached before opening anything. The text names the
+            /// version found and the one needed. Sent just before the
+            /// session ends; the session keeps running in tmux.
+            case unsupported
+
             init?(_ c: ghostty_tmux_notice_kind_e) {
                 switch c {
                 case GHOSTTY_TMUX_NOTICE_MESSAGE: self = .message
                 case GHOSTTY_TMUX_NOTICE_CONFIG_ERROR: self = .configError
                 case GHOSTTY_TMUX_NOTICE_COMMAND_ERROR: self = .commandError
                 case GHOSTTY_TMUX_NOTICE_EXIT: self = .exit
+                case GHOSTTY_TMUX_NOTICE_UNSUPPORTED: self = .unsupported
                 default: return nil
                 }
             }

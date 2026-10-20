@@ -373,6 +373,13 @@ pub const Viewer = struct {
             /// "detached", "server exited" or "too far behind"). Always
             /// immediately followed by the `exit` action.
             exit,
+
+            /// The tmux server is older than the oldest we support, so
+            /// we have left the session rather than half show it. The
+            /// text names the version found and the one needed. Always
+            /// immediately followed by a `detach-client` command and the
+            /// `exit` action; the session keeps running in tmux.
+            unsupported,
         };
     };
 
@@ -1213,25 +1220,45 @@ pub const Viewer = struct {
         }
     }
 
-    /// Whether the tmux we are talking to is at least the given version.
+    /// The oldest tmux we support. Control mode itself is far older, but
+    /// we rely on what 3.2 added to it: `%pause` and `%continue`,
+    /// `refresh-client -f` and `-A`, and the `list-panes` formats the
+    /// attach reads every pane's state with. An older server attaches
+    /// happily and then fails piecemeal, so it is turned away up front
+    /// instead. See `refuseOldTmux`.
+    const min_tmux_release: Release = .{ .major = 3, .minor = 2 };
+
+    /// A tmux release, `major.minor`, as compared by `tmuxRelease`.
+    const Release = struct {
+        major: usize,
+        minor: usize,
+
+        fn atLeast(self: Release, other: Release) bool {
+            if (self.major != other.major) return self.major > other.major;
+            return self.minor >= other.minor;
+        }
+    };
+
+    /// The release of the tmux we are talking to, or null if its version
+    /// cannot be read.
     ///
     /// tmux reports versions like `3.5a`, where the letter is a bug-fix
-    /// release, so only the leading `major.minor` is compared. A build
-    /// from tmux's git tree calls itself `next-3.7`: the release it is
-    /// on its way to, and newer than every release before it, so it
-    /// counts as that one. An unparseable version answers false: a
-    /// feature we cannot confirm is a feature we do not use.
-    fn tmuxVersionAtLeast(self: *const Viewer, major: usize, minor: usize) bool {
+    /// release, so only the leading `major.minor` counts. A build from
+    /// tmux's git tree calls itself `next-3.7`: the release it is on its
+    /// way to, and newer than every release before it, so it counts as
+    /// that one. Anything else (`master`, a distribution's own scheme
+    /// such as OpenBSD's `openbsd-7.6`) is unreadable.
+    fn tmuxRelease(self: *const Viewer) ?Release {
         const version = if (std.mem.startsWith(u8, self.tmux_version, "next-"))
             self.tmux_version["next-".len..]
         else
             self.tmux_version;
         var it = std.mem.splitScalar(u8, version, '.');
-        const major_str = it.next() orelse return false;
-        const minor_str = it.next() orelse return false;
+        const major_str = it.next() orelse return null;
+        const minor_str = it.next() orelse return null;
 
-        const got_major = std.fmt.parseInt(usize, major_str, 10) catch
-            return false;
+        const major = std.fmt.parseInt(usize, major_str, 10) catch
+            return null;
 
         // Trim any bug-fix letter, e.g. the `a` of `3.5a`.
         const digits = end: {
@@ -1241,11 +1268,27 @@ pub const Viewer = struct {
             }
             break :end minor_str[0..end];
         };
-        const got_minor = std.fmt.parseInt(usize, digits, 10) catch
-            return false;
+        const minor = std.fmt.parseInt(usize, digits, 10) catch
+            return null;
 
-        if (got_major != major) return got_major > major;
-        return got_minor >= minor;
+        return .{ .major = major, .minor = minor };
+    }
+
+    /// Whether the tmux we are talking to is at least the given version.
+    /// An unreadable version answers false: a feature we cannot confirm
+    /// is a feature we do not use.
+    fn tmuxVersionAtLeast(self: *const Viewer, major: usize, minor: usize) bool {
+        const release = self.tmuxRelease() orelse return false;
+        return release.atLeast(.{ .major = major, .minor = minor });
+    }
+
+    /// Whether the tmux we are talking to is known to be older than we
+    /// support. An unreadable version is given the benefit of the doubt:
+    /// it is far more likely a packager's naming than a tmux from before
+    /// 2020, and refusing it would lock its users out entirely.
+    fn tmuxTooOld(self: *const Viewer) bool {
+        const release = self.tmuxRelease() orelse return false;
+        return !release.atLeast(min_tmux_release);
     }
 
     /// Tell tmux the size of our control mode client.
@@ -2849,7 +2892,11 @@ pub const Viewer = struct {
                 try self.receivedPaneVisible(id, content);
             },
 
-            .tmux_version => try self.receivedTmuxVersion(content),
+            .tmux_version => try self.receivedTmuxVersion(
+                arena_alloc,
+                actions,
+                content,
+            ),
 
             .client_readonly => self.receivedReadOnly(
                 std.mem.eql(u8, std.mem.trim(u8, content, " \t\r\n"), "1"),
@@ -2859,10 +2906,29 @@ pub const Viewer = struct {
 
     fn receivedTmuxVersion(
         self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
         content: []const u8,
     ) !void {
         const line = std.mem.trim(u8, content, " \t\r\n");
         if (line.len == 0) return;
+
+        // The version on its own first, before the rest of the line has
+        // to make sense: a tmux old enough to be refused may not know
+        // every variable we ask about, and failing to read its reply
+        // would end the session without saying why.
+        const version = line[0 .. std.mem.indexOfScalar(
+            u8,
+            line,
+            Format.tmux_version.delim,
+        ) orelse line.len];
+        if (self.tmux_version.len > 0) {
+            self.alloc.free(self.tmux_version);
+            self.tmux_version = "";
+        }
+        self.tmux_version = try self.alloc.dupe(u8, version);
+
+        if (self.tmuxTooOld()) return self.refuseOldTmux(arena_alloc, actions);
 
         const data = output.parseFormatStruct(
             Format.tmux_version.Struct(),
@@ -2872,19 +2938,45 @@ pub const Viewer = struct {
             log.info("failed to parse tmux version: {s}", .{line});
             return err;
         };
-
-        if (self.tmux_version.len > 0) {
-            self.alloc.free(self.tmux_version);
-        }
-        self.tmux_version = try self.alloc.dupe(u8, data.version);
         self.receivedReadOnly(data.client_readonly);
 
-        // Now that the version is known, and only now, because the flag
-        // does not exist before 3.2 and an older server answers with an
-        // error rather than ignoring it.
+        // Now that the version is known, and only now: an unreadable
+        // version is let in (see `tmuxTooOld`), and a server that turns
+        // out not to have the flag answers with an error rather than
+        // ignoring it.
         if (self.pause_after > 0 and self.tmuxVersionAtLeast(3, 2)) {
             try self.queueCommands(&.{.{ .pause_after = self.pause_after }});
         }
+    }
+
+    /// Leave a session whose tmux is older than we support, and say why.
+    ///
+    /// Nothing has been built yet: the version is asked first on attach,
+    /// and the window list sent alongside it is answered after this. So
+    /// the user sees one clear message instead of a session that opens
+    /// and then misbehaves. We detach rather than simply stop listening,
+    /// because tmux would otherwise keep a client attached that nobody
+    /// reads, and the host's terminal would stay in control mode; the
+    /// session itself keeps running for a client that can show it.
+    fn refuseOldTmux(
+        self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+    ) Allocator.Error!void {
+        log.warn("tmux {s} is too old for control mode, detaching", .{self.tmux_version});
+        const text = try std.fmt.allocPrint(
+            arena_alloc,
+            "tmux {s} is too old: Ghostty's tmux integration needs tmux {d}.{d} or newer",
+            .{ self.tmux_version, min_tmux_release.major, min_tmux_release.minor },
+        );
+        try actions.ensureUnusedCapacity(arena_alloc, 3);
+        actions.appendAssumeCapacity(.{ .notice = .{ .kind = .unsupported, .text = text } });
+        actions.appendAssumeCapacity(.{ .command = "detach-client\n" });
+
+        // Everything after this, the window list and the `%exit` the
+        // detach earns included, is for a viewer that has gone.
+        _ = self.defunct();
+        actions.appendAssumeCapacity(.exit);
     }
 
     /// tmux told us whether this client is read-only. Only a change is
@@ -6437,7 +6529,7 @@ test "pause mode is asked for once the version allows it" {
     });
 }
 
-test "an old tmux is not asked for pause mode" {
+test "an old tmux is refused with a reason, and detached from" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{
         .pause_after = 30,
     });
@@ -6450,12 +6542,67 @@ test "an old tmux is not asked for pause mode" {
             .name = "test",
         } } } },
 
-        // 3.1 has no pause-after flag. Asking would earn an error block
-        // and nothing else.
+        // 3.1 lacks what we rely on. Its reply may not even carry every
+        // variable we asked for, which must not stop us saying so.
         .{
-            .input = .{ .tmux = .{ .block_end = "3.1c 0" } },
+            .input = .{ .tmux = .{ .block_end = "3.1c" } },
+            .commands = &.{"detach-client\n"},
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(3, actions.len);
+                    try testing.expectEqual(.unsupported, actions[0].notice.kind);
+                    try testing.expect(std.mem.indexOf(
+                        u8,
+                        actions[0].notice.text,
+                        "3.1c",
+                    ) != null);
+                    try testing.expect(std.mem.indexOf(
+                        u8,
+                        actions[0].notice.text,
+                        "3.2",
+                    ) != null);
+                    try testing.expect(actions[2] == .exit);
+                    try testing.expectEqual(.defunct, v.state);
+                }
+            }).check,
+        },
+
+        // The window list sent alongside the version is not built.
+        .{
+            .input = .{ .tmux = .{
+                .block_end = "$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 %0",
+            } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expectEqual(0, v.windows.items.len);
+                }
+            }).check,
+        },
+    });
+}
+
+test "a tmux version we cannot read is let in" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .pause_after = 30,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+
+        // A packager's scheme, not a release we can compare. It is let
+        // in, but not trusted with flags it may not have.
+        .{
+            .input = .{ .tmux = .{ .block_end = "openbsd-7.6 0" } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .exit);
+                    try testing.expectEqual(.command_queue, v.state);
                     var it = v.command_queue.iterator(.forward);
                     while (it.next()) |c| {
                         try testing.expect(c.* != .pause_after);

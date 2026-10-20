@@ -291,6 +291,8 @@ class TmuxWindowManager {
     ///   per error, and say the session may not be set up as intended.
     /// - The reason a session ended goes on the host, since the session's
     ///   own windows are about to close.
+    /// - A tmux too old to be shown is an alert on the host: nothing else
+    ///   opened, and otherwise all the user sees is `tmux -CC` returning.
     @objc private func ghosttyTmuxNotice(_ notification: Notification) {
         guard let hostView = notification.object as? Ghostty.SurfaceView else { return }
         guard let notice = notification.userInfo?[
@@ -312,6 +314,31 @@ class TmuxWindowManager {
 
         case .configError:
             tmuxConfigError(notice.text, hostedBy: hostView)
+
+        case .unsupported:
+            presentUnsupported(notice.text, hostedBy: hostView)
+        }
+    }
+
+    /// Say that the session could not be shown because its tmux is too
+    /// old, and what to do about it.
+    private func presentUnsupported(_ text: String, hostedBy hostView: Ghostty.SurfaceView) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "tmux Is Too Old"
+        alert.informativeText = """
+            \(text).
+
+            Ghostty detached without opening the session, which is still \
+            running. Update tmux where it runs, or attach to it with plain \
+            `tmux attach` instead.
+            """
+        alert.addButton(withTitle: "OK")
+
+        if let window = hostView.window, window.attachedSheet == nil {
+            alert.beginSheetModal(for: window)
+        } else {
+            hostView.showTransientNotice("tmux: \(text)", level: .error, duration: 10)
         }
     }
 

@@ -1024,6 +1024,7 @@ typedef enum {
   GHOSTTY_TMUX_NOTICE_CONFIG_ERROR,
   GHOSTTY_TMUX_NOTICE_COMMAND_ERROR,
   GHOSTTY_TMUX_NOTICE_EXIT,
+  GHOSTTY_TMUX_NOTICE_UNSUPPORTED,
 } ghostty_tmux_notice_kind_e;
 
 // apprt.action.TmuxNotice.C
@@ -1041,6 +1042,10 @@ typedef enum {
 //   EXIT           the session ended and this is tmux's reason. Sent
 //                  only when tmux gives one, just before the session's
 //                  pane surfaces are closed.
+//   UNSUPPORTED    the tmux server is too old to be shown; the text names
+//                  its version and the one needed. The client has been
+//                  detached and the session keeps running in tmux. Sent
+//                  just before the session ends.
 typedef struct {
   ghostty_tmux_notice_kind_e kind;
   const char* text;

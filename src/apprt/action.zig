@@ -1132,6 +1132,11 @@ pub const TmuxWindows = struct {
 ///     "detached" or "server exited". Sent only when tmux gives one,
 ///     right before the session's pane surfaces are closed, so a GUI that
 ///     wants to show it should not attach it to a pane surface.
+///   - `unsupported`: the tmux server is too old to be shown, so the
+///     client detached before anything was built. The text is ours and
+///     names the version found and the one needed; the session ends
+///     right after, and keeps running in tmux. Worth more than a toast:
+///     without it the user only sees `tmux -CC` return.
 ///
 /// The text is tmux's, UTF-8 in practice but not guaranteed to be, and
 /// not localized. It is only valid for the duration of the action call.
