@@ -170,9 +170,31 @@ pub const Message = union(enum) {
     else
         void,
 
+    /// How current this tmux pane's display is with tmux. See
+    /// `terminal.tmux.sink.PaneStatus`.
+    tmux_pane_status: if (terminal.options.tmux_control_mode)
+        terminal.tmux.sink.PaneStatus
+    else
+        void,
+
     /// tmux has something to tell the user. See `apprt.action.TmuxNotice`.
     tmux_notice: if (terminal.options.tmux_control_mode)
         TmuxNotice
+    else
+        void,
+
+    /// One of tmux's paste buffers changed, for the system clipboard.
+    /// See `tmux-paste-buffer-clipboard`. The receiver owns this and must
+    /// `deinit` it.
+    tmux_paste_buffer: if (terminal.options.tmux_control_mode)
+        WriteReq
+    else
+        void,
+    /// tmux's status line changed: `status-left`, the window list and
+    /// `status-right`, in that order, separated by NUL. The receiver owns
+    /// it and must `deinit` it.
+    tmux_status: if (terminal.options.tmux_control_mode)
+        WriteReq
     else
         void,
 

@@ -2533,6 +2533,112 @@ keybind: Keybinds = .{},
 /// older servers do not have the flag and are not sent it.
 @"tmux-pause-after": u32 = 0,
 
+/// How the windows of a tmux control mode session (`tmux -CC`) are shown.
+///
+///   * `tabs` - The session gets a native window of its own, and each tmux
+///     window is a tab in it. This is the default.
+///
+///   * `windows` - Each tmux window is a native window of its own.
+///
+/// Either way a tmux window's panes are splits. This is read when a tmux
+/// window first appears; windows already open stay as they are.
+///
+/// Only supported on macOS. GTK always uses tabs.
+@"tmux-window-placement": TmuxWindowPlacement = .tabs,
+
+/// Hide the terminal that ran `tmux -CC` while its session is attached.
+///
+/// That terminal shows nothing of its own while the session is attached:
+/// tmux is talking to Ghostty through it. With this set its window is
+/// ordered out once the session's windows are on screen, and comes back
+/// when the session ends or detaches, or when every window of the session
+/// is hidden. It is only hidden if it is alone in its window: a terminal
+/// sharing its window with other tabs or splits stays where it is.
+///
+/// The tmux dashboard (File > tmux > Dashboard) can show it again.
+///
+/// Only supported on macOS.
+@"tmux-hide-host": bool = false,
+
+/// How many lines of each pane's scrollback to read when attaching to a
+/// tmux control mode session (`tmux -CC`).
+///
+/// Attaching reads every pane's history so that scrollback, search and
+/// selection work as they would in Ghostty, and for a session with large
+/// histories over a slow connection that read is most of the time an
+/// attach takes. This caps it to the newest lines of each pane. Older
+/// lines stay in tmux; they are just not in Ghostty's scrollback.
+///
+/// Unset (the default) reads all of it. `0` reads none. The cap also
+/// applies to a pane created later and to one re-read after
+/// `tmux-pause-after` paused it.
+@"tmux-history-limit": ?u32 = null,
+
+/// Copy tmux's paste buffers to the system clipboard as they change, when
+/// attached to a tmux control mode session (`tmux -CC`).
+///
+/// With this set, copying in tmux's copy mode, or anything that sets a
+/// buffer (`set-buffer`, `load-buffer`), puts the text on the clipboard,
+/// as copying would in a terminal that is not running tmux. A buffer that
+/// is deleted leaves the clipboard alone, and so does a buffer larger than
+/// 192 KiB, which is not read.
+///
+/// This is not subject to `clipboard-write`: setting this is the
+/// permission. Requires tmux 3.2 or newer, and a server new enough to have
+/// the `buffer_full` format; on one without it nothing is copied.
+@"tmux-paste-buffer-clipboard": bool = false,
+
+/// Extra flags for the tmux control mode client (`tmux -CC`), set with
+/// `refresh-client -f` when the session attaches. Each is off by default.
+///
+///   * `active-pane` - This client has an active pane of its own: moving
+///     between splits in Ghostty does not move the active pane that other
+///     clients of the session see. Ghostty still follows the window's
+///     shared active pane when tmux moves it, as it does for a split or a
+///     pane closing.
+///
+///   * `no-detach-on-destroy` - When the attached session is destroyed and
+///     other sessions exist, tmux moves this client to one of them rather
+///     than ending control mode, and its windows open in place of the old
+///     session's.
+///
+/// Example: `active-pane`, `no-active-pane,no-detach-on-destroy`
+///
+/// Requires tmux 3.2 or newer; older servers are not sent the flags. A
+/// flag added in a later tmux than the server's is ignored by it.
+@"tmux-client-flags": TmuxClientFlags = .{},
+
+/// How many seconds a pane of a tmux control mode session (`tmux -CC`)
+/// may be out of sight while it keeps producing output, before tmux is
+/// asked to stop sending that output (`refresh-client -A '%pane:off'`).
+/// A pane is out of sight when its tab is not the selected one, or its
+/// window is minimized or fully covered.
+///
+/// This saves sending, and drawing, output nobody can see, which matters
+/// most over a slow connection. A pane that is quiet while hidden costs
+/// nothing either way, and is left alone.
+///
+/// The catch is tmux's: a pane that every attached client has turned off
+/// is not read from at all. So when Ghostty is the only client, a program
+/// in a hidden pane that writes a lot waits, rather than running on in
+/// the background, until the pane is shown again. When it is shown again
+/// its output is turned back on and it is read in full again, so nothing
+/// it showed is missing; anything that scrolled past while another
+/// client kept the pane running is in its scrollback.
+///
+/// Set to 0 to disable, which is the default. Requires tmux 3.2 or newer.
+@"tmux-hidden-output-off-after": u32 = 0,
+/// Show tmux's status line in the windows of a tmux control mode session
+/// (`tmux -CC`): a bar along the bottom of each window with `status-left`,
+/// the window list and `status-right`, formatted by tmux as its own
+/// status line would be, and kept up to date as they change (tmux checks
+/// about once a second). tmux's colors and styles are not reproduced.
+///
+/// Off by default, since the windows and the session are already shown
+/// as native tabs and titles. Takes effect from the next attach. Requires
+/// tmux 3.2 or newer; with an older server the bar never appears.
+@"tmux-status-bar": bool = false,
+
 /// The total amount of bytes that can be used for image data (e.g. the Kitty
 /// image protocol) per terminal screen. The maximum value is 4,294,967,295
 /// (4GiB). The default is 320MB. If this is set to zero, then all image
@@ -8924,6 +9030,18 @@ pub const ShellIntegrationFeatures = packed struct {
     @"ssh-env": bool = false,
     @"ssh-terminfo": bool = false,
     path: bool = true,
+};
+
+/// See tmux-window-placement
+pub const TmuxWindowPlacement = enum {
+    tabs,
+    windows,
+};
+
+/// See tmux-client-flags
+pub const TmuxClientFlags = packed struct {
+    @"active-pane": bool = false,
+    @"no-detach-on-destroy": bool = false,
 };
 
 /// See vt-xt-checksum-extension

@@ -47,10 +47,11 @@ terminal and the session opens as native Ghostty windows:
   Ghostty window (tmux 3.4+, with a fallback for older servers).
 - **Focus follows both ways.** Focusing a split selects the tmux pane, and
   `select-pane`/`select-window` from tmux or another client moves Ghostty.
-- **Full history on attach**, both screens, cursor and terminal modes, so
-  scrollback, search and selection are Ghostty's own. Typing, IME and
-  pastes (bracketed exactly when the pane's program asked for it) are sent
-  through tmux; queries are answered by tmux only.
+- **Full history on attach**, both screens, cursor and terminal modes
+  (modifyOtherKeys too, from tmux 3.5), so scrollback, search and
+  selection are Ghostty's own. Typing, IME and pastes (bracketed exactly
+  when the pane's program asked for it) are sent through tmux; queries are
+  answered by tmux only.
 - **The terminal that ran `tmux -CC`** shows which session it hosts and
   offers _Show Windows_ and _Detach_; it no longer swallows keys as tmux
   commands. Closing it says it detaches, and the session keeps running.
@@ -58,6 +59,17 @@ terminal and the session opens as native Ghostty windows:
   Detach) and a `tmux_detach` keybind action (unbound by default).
 - **tmux talks back**: `display-message`, tmux.conf errors, refused
   commands and the reason a session ended are shown as notices or alerts.
+- **Notifications, links and passthrough from panes**: OSC 9, OSC 777 and
+  OSC 99 notifications become native notifications of the pane they came
+  from (clicking one brings its tab and split forward), whether sent as is
+  or wrapped in tmux's `DCS tmux;` passthrough, which is unwrapped
+  whatever `allow-passthrough` says. Of what is wrapped only OSC, DCS and
+  APC sequences (clipboard, kitty graphics) take effect, since tmux never
+  sees them. OSC 8 hyperlinks are clickable, including ones in history
+  read on attach. Inside tmux, `TERM_PROGRAM` is `tmux`, so tools cannot
+  tell they are in Ghostty: Claude Code, for one, sends no notification
+  on its `auto` channel there; set it to `ghostty` (OSC 777) with
+  `claude config set --global preferredNotifChannel ghostty`.
 - **Robust sessions**: detach, `kill-session`, `kill-server`, `switch-client`
   (including to the same session), dropped ssh connections, large histories,
   floods (optional `tmux-pause-after = <seconds>`) and read-only clients
@@ -123,6 +135,7 @@ Not done yet, roughly in order of usefulness:
   consumes or rewrites, and how tools detect the terminal when
   `TERM_PROGRAM` is `tmux`.
 - Bell, activity and silence markers on tabs from tmux's window flags.
+- Passthrough of pressing hyperlinks.
 - Mirroring tab drag-and-drop (reorder, tear off) to tmux.
 - Per-pane titles (`#{pane_title}`) on splits.
 - A session picker / dashboard: list sessions, attach, choose which windows
@@ -141,6 +154,12 @@ Not done yet, roughly in order of usefulness:
   passing through DCS/image passthrough sequences.
 - A clear message for tmux older than 3.2, and a reconnect helper for
   dropped connections.
+- New splits and tabs start in the working directory of the pane they
+  were made from, as they do in plain Ghostty (`split-window -c`,
+  `new-window -c` with `#{pane_current_path}`).
+- Auto-update: the app's updater is disabled so it never updates itself
+  into the official release; it should update from this fork's releases
+  instead.
 
 ## About
 

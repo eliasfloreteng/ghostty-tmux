@@ -6,6 +6,7 @@ const key = @import("kitty/key.zig");
 pub const clipboard = @import("kitty/clipboard.zig");
 pub const color = @import("kitty/color.zig");
 pub const dnd = @import("kitty/dnd.zig");
+pub const notification = @import("kitty/notification.zig");
 pub const graphics = if (build_options.kitty_graphics) @import("kitty/graphics.zig") else struct {};
 
 pub const KeyFlags = key.Flags;

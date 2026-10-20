@@ -596,6 +596,46 @@ extension Ghostty {
             NSCursor.setHiddenUntilMouseMoves(!visible)
         }
 
+        /// Ask for a command line to run in the tmux session this surface
+        /// is a pane or the host of, as tmux's own command prompt would,
+        /// and run it. What it prints comes back as a tmux notice.
+        func promptTmuxCommand() {
+            let alert = NSAlert()
+            alert.messageText = "Run tmux Command"
+            alert.informativeText = "Runs in the tmux session, as at tmux's own command prompt. " +
+                "Join several commands with \u{201C} ; \u{201D}."
+            alert.alertStyle = .informational
+
+            let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+            textField.placeholderString = "e.g. select-layout tiled"
+            textField.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            alert.accessoryView = textField
+
+            alert.addButton(withTitle: "Run")
+            alert.addButton(withTitle: "Cancel")
+            alert.window.initialFirstResponder = textField
+
+            let completionHandler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+                guard response == .alertFirstButtonReturn,
+                      let surface = self?.surface else { return }
+                let text = textField.stringValue
+                guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                _ = text.withCString { ptr in
+                    ghostty_surface_tmux_command(surface, ptr, UInt(strlen(ptr)))
+                }
+            }
+
+            if let window {
+                alert.beginSheetModal(for: window, completionHandler: completionHandler)
+            } else {
+                completionHandler(alert.runModal())
+            }
+        }
+
+        @IBAction func tmuxRunCommand(_ sender: Any?) {
+            performTmuxAction("prompt_tmux_command")
+        }
+
         /// Set the title by prompting the user.
         func promptTitle() {
             // Create an alert dialog
@@ -1758,6 +1798,14 @@ extension Ghostty {
             performTmuxAction("tmux_detach")
         }
 
+        /// The sessions on the server and the windows of this one. Not a
+        /// binding: it is the app's own window, not something the core
+        /// does.
+        @IBAction func tmuxDashboard(_ sender: Any?) {
+            guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
+            appDelegate.tmuxWindowManager.showDashboard(for: self)
+        }
+
         // The rest of the tmux menu are the ordinary bindings: on a tmux
         // pane the core sends each to tmux instead of doing it here. They
         // have their own selectors so that they can say they are tmux's,
@@ -1781,6 +1829,30 @@ extension Ghostty {
 
         @IBAction func tmuxKillPane(_ sender: Any?) {
             performTmuxAction("close_surface")
+        }
+
+        @IBAction func tmuxSwapPanePrevious(_ sender: Any?) {
+            performTmuxAction("tmux_swap_pane:previous")
+        }
+
+        @IBAction func tmuxSwapPaneNext(_ sender: Any?) {
+            performTmuxAction("tmux_swap_pane:next")
+        }
+
+        @IBAction func tmuxRotatePanes(_ sender: Any?) {
+            performTmuxAction("tmux_rotate_window:next")
+        }
+
+        @IBAction func tmuxBreakPane(_ sender: Any?) {
+            performTmuxAction("tmux_break_pane")
+        }
+
+        @IBAction func tmuxJoinPanePrevious(_ sender: Any?) {
+            performTmuxAction("tmux_join_pane:previous")
+        }
+
+        @IBAction func tmuxJoinPaneNext(_ sender: Any?) {
+            performTmuxAction("tmux_join_pane:next")
         }
 
         private func performTmuxAction(_ action: String) {
@@ -2342,14 +2414,22 @@ extension Ghostty.SurfaceView: NSMenuItemValidation {
             item.state = readonly ? .on : .off
             return true
 
-        case #selector(tmuxDetach):
+        case #selector(tmuxDetach),
+             #selector(tmuxDashboard),
+             #selector(tmuxRunCommand):
             return tmuxPaneId != nil || hostedTmuxSession != nil
 
         case #selector(tmuxNewWindow),
              #selector(tmuxSplitRight),
              #selector(tmuxSplitDown),
              #selector(tmuxZoomPane),
-             #selector(tmuxKillPane):
+             #selector(tmuxKillPane),
+             #selector(tmuxSwapPanePrevious),
+             #selector(tmuxSwapPaneNext),
+             #selector(tmuxRotatePanes),
+             #selector(tmuxBreakPane),
+             #selector(tmuxJoinPanePrevious),
+             #selector(tmuxJoinPaneNext):
             return tmuxPaneId != nil
 
         case #selector(copy(_:)):

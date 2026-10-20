@@ -69,6 +69,52 @@ pub const SplitDirection = enum {
     up,
 };
 
+/// Which pane a pane trades places with.
+///
+/// Lives here for the same reason as `KillScope`.
+pub const SwapTarget = enum {
+    /// The pane before it in tmux's own pane order, as `swap-pane -U`
+    /// (tmux's `{` binding) has it.
+    previous,
+    /// The pane after it, as `swap-pane -D` (`}`).
+    next,
+    /// The pane beside it on that side of the window's layout.
+    left,
+    right,
+    up,
+    down,
+};
+
+/// One step either way along an order tmux keeps: a window's panes for
+/// `rotate-window`, the session's windows for `join-pane`.
+///
+/// Lives here for the same reason as `KillScope`.
+pub const Adjacent = enum {
+    previous,
+    next,
+};
+
+/// How current a pane's display is with tmux, beyond what its content
+/// shows. Displays that have room to say so should: a pane that is not
+/// `live` can look complete and not be.
+///
+/// Sync with: ghostty_action_tmux_pane_status_e
+pub const PaneStatus = enum(c_int) {
+    /// Up to date: everything tmux has for the pane is here.
+    live,
+
+    /// The screen is shown and the history above it is still being
+    /// read, so scrolling up finds less than tmux has. It arrives on its
+    /// own; nothing is wrong.
+    loading_history,
+
+    /// tmux paused the pane because we fell too far behind it
+    /// (`tmux-pause-after`), and it is being read again. What is on
+    /// screen may be stale until it is, and output from while it was
+    /// paused is gone for good.
+    catching_up,
+};
+
 pub const Op = union(enum) {
     /// Raw VT bytes: `%output` data, or capture-pane replay content.
     ///
@@ -90,6 +136,17 @@ pub const Op = union(enum) {
     /// that landed in the middle of a colour). Kept apart, the live
     /// sequence resumes where it was once the capture is in.
     replay: []const u8,
+
+    /// A string sequence (OSC, DCS or APC) that the pane's program
+    /// wrapped in tmux's passthrough escape, unwrapped. See
+    /// `passthrough.zig`.
+    ///
+    /// For the same stream as `.bytes`, which it may be split across
+    /// like any other sequence. tmux never sees it take effect, so it
+    /// must not move the cursor of a terminal that mirrors tmux's grid:
+    /// a kitty graphics placement would. The viewer's own terminal skips
+    /// it, having no use for notifications or images.
+    passthrough: []const u8,
 
     /// Make the given screen active, without any of the side effects that
     /// the DECSET alternate-screen modes carry.
@@ -148,6 +205,33 @@ pub const Op = union(enum) {
         rows: size.CellCountInt,
     },
 
+    /// The pane's title, tmux's `#{pane_title}`.
+    ///
+    /// Usually what the pane's program last set with OSC 0 or 2, which
+    /// also arrives as bytes. This covers what the bytes cannot: the
+    /// title a pane already had when we attached, and one set by tmux
+    /// itself (`select-pane -T`, or the host name tmux starts a pane
+    /// with). A consumer should treat it as an OSC 2 from the program.
+    title: []const u8,
+
+    /// The working directory of the pane's program, tmux's
+    /// `#{pane_current_path}`, on the tmux server's host.
+    ///
+    /// tmux reads this from the process itself, so it is known without
+    /// any shell integration. The host is part of it because the path
+    /// is only meaningful there: a consumer should treat it as an OSC 7
+    /// report from that host, and so ignore it unless the host is ours.
+    pwd: Pwd,
+
+    /// The pane's display is now this current with tmux. Not terminal
+    /// state: `applyOp` ignores it, and a consumer with a GUI shows it.
+    pane_status: PaneStatus,
+
+    pub const Pwd = struct {
+        host: []const u8,
+        path: []const u8,
+    };
+
     /// Copy an op so it can outlive the sink call that delivered it.
     ///
     /// A sink that hands ops to another thread has to do this: the
@@ -156,6 +240,16 @@ pub const Op = union(enum) {
         return switch (self) {
             .bytes => |b| .{ .bytes = try alloc.dupe(u8, b) },
             .replay => |b| .{ .replay = try alloc.dupe(u8, b) },
+            .title => |t| .{ .title = try alloc.dupe(u8, t) },
+            .pwd => |p| pwd: {
+                const host = try alloc.dupe(u8, p.host);
+                errdefer alloc.free(host);
+                break :pwd .{ .pwd = .{
+                    .host = host,
+                    .path = try alloc.dupe(u8, p.path),
+                } };
+            },
+            .passthrough => |b| .{ .passthrough = try alloc.dupe(u8, b) },
 
             // The parsed pane state is a flat struct of scalars and
             // slices, so walk it rather than naming the string fields:
@@ -181,6 +275,7 @@ pub const Op = union(enum) {
             .erase_all,
             .trim_trailing_blanks,
             .resize,
+            .pane_status,
             => self,
         };
     }
@@ -189,7 +284,12 @@ pub const Op = union(enum) {
     /// straight from the viewer; those payloads are not ours.
     pub fn deinit(self: Op, alloc: Allocator) void {
         switch (self) {
-            .bytes, .replay => |b| alloc.free(b),
+            .bytes, .replay, .passthrough => |b| alloc.free(b),
+            .title => |t| alloc.free(t),
+            .pwd => |p| {
+                alloc.free(p.host);
+                alloc.free(p.path);
+            },
             .pane_state => |data| freePaneState(alloc, data, null),
             else => {},
         }
@@ -243,15 +343,15 @@ pub const Sink = struct {
 
 /// Apply an op to a terminal.
 ///
-/// `.bytes` is not handled here: the caller owns the stream, because parser
-/// state has to persist across calls.
+/// `.bytes` and `.passthrough` are not handled here: the caller owns the
+/// stream, because parser state has to persist across calls.
 pub fn applyOp(
     alloc: Allocator,
     t: *Terminal,
     op: Op,
 ) !void {
     switch (op) {
-        .bytes => unreachable,
+        .bytes, .passthrough => unreachable,
 
         .replay => |b| {
             // The pen too is the live stream's and not the capture's:
@@ -293,10 +393,19 @@ pub fn applyOp(
 
         .pane_state => |data| try applyPaneState(t, data),
 
+        .title => |title| try t.setTitle(title),
+
+        // Only the path: the host is for whoever decides whether the path
+        // means anything here, and a terminal keeps no host.
+        .pwd => |p| try t.setPwd(p.path),
+
         .resize => |v| try t.resize(alloc, .{
             .cols = v.cols,
             .rows = v.rows,
         }),
+
+        // For whoever displays the terminal, not for the terminal.
+        .pane_status => {},
     }
 }
 
@@ -444,6 +553,23 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) !void {
     t.modes.set(.focus_event, data.focus_flag);
     t.modes.set(.bracketed_paste, data.bracketed_paste);
 
+    // modifyOtherKeys. Our keys reach the program as the bytes we encode
+    // them to (`send-keys -H`), so the encoding has to be the one it
+    // asked for. tmux's level 1 is ours off: we only implement 2. An
+    // empty value is a tmux before 3.5, which cannot tell us, and the
+    // flag is left as live output set it.
+    //
+    // The kitty keyboard flags have no equivalent: tmux 3.6 neither
+    // implements the protocol nor keeps the flags a program pushed, so
+    // a program that set them before we attached keeps getting legacy
+    // keys from us. Programs that ask first (`CSI ? u`) never set them
+    // under tmux, since tmux leaves that query unanswered.
+    if (std.mem.eql(u8, data.pane_key_mode, "Ext 2")) {
+        t.flags.modify_other_keys_2 = true;
+    } else if (data.pane_key_mode.len > 0) {
+        t.flags.modify_other_keys_2 = false;
+    }
+
     // Scroll region (tmux uses 0-based values)
     scroll: {
         const scroll_top = std.math.cast(
@@ -496,9 +622,19 @@ test "cloned ops own their payloads" {
     defer bytes.deinit(alloc);
     const state = try (Op{ .pane_state = data }).clone(alloc);
     defer state.deinit(alloc);
+    const title = try (Op{ .title = scratch[0..5] }).clone(alloc);
+    defer title.deinit(alloc);
+    const pwd = try (Op{ .pwd = .{
+        .host = scratch[8..13],
+        .path = scratch[16..20],
+    } }).clone(alloc);
+    defer pwd.deinit(alloc);
 
     @memset(&scratch, 'x');
 
+    try testing.expectEqualStrings("hello", title.title);
+    try testing.expectEqualStrings("block", pwd.pwd.host);
+    try testing.expectEqualStrings("8,16", pwd.pwd.path);
     try testing.expectEqualStrings("hello", bytes.bytes);
     try testing.expectEqualStrings("block", state.pane_state.cursor_shape);
     try testing.expectEqualStrings("8,16", state.pane_state.pane_tabs);
@@ -514,6 +650,7 @@ test "cloning a payload-free op copies it as-is" {
         .erase_all,
         .trim_trailing_blanks,
         .{ .resize = .{ .cols = 80, .rows = 24 } },
+        .{ .pane_status = .catching_up },
     };
 
     for (ops) |op| {
@@ -524,6 +661,36 @@ test "cloning a payload-free op copies it as-is" {
             std.meta.activeTag(copy),
         );
     }
+}
+
+test "pane state restores modifyOtherKeys as tmux reports it" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var data: PaneStateData = std.mem.zeroes(PaneStateData);
+    data.cursor_shape = "";
+    data.cursor_colour = "";
+    data.pane_tabs = "";
+
+    data.pane_key_mode = "Ext 2";
+    try applyPaneState(&t, data);
+    try testing.expect(t.flags.modify_other_keys_2);
+
+    // A tmux too old to say leaves what we have alone.
+    data.pane_key_mode = "";
+    try applyPaneState(&t, data);
+    try testing.expect(t.flags.modify_other_keys_2);
+
+    // Level 1 is not one we implement.
+    data.pane_key_mode = "Ext 1";
+    try applyPaneState(&t, data);
+    try testing.expect(!t.flags.modify_other_keys_2);
+
+    t.flags.modify_other_keys_2 = true;
+    data.pane_key_mode = "VT10x";
+    try applyPaneState(&t, data);
+    try testing.expect(!t.flags.modify_other_keys_2);
 }
 
 test "erase_all clears the scrollback as well as the display" {

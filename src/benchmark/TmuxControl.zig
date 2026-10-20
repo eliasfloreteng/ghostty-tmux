@@ -63,7 +63,9 @@ const State = struct {
     fn applyOps(ctx: *anyopaque, ops: []const tmux.Op) void {
         const self: *State = @ptrCast(@alignCast(ctx));
         for (ops) |op| switch (op) {
-            .bytes => |b| self.stream.nextSlice(b),
+            // As the surface does, less putting its cursor back after
+            // a passthrough, which this data has none of.
+            .bytes, .passthrough => |b| self.stream.nextSlice(b),
             else => tmux.sink.applyOp(
                 self.surface.gpa(),
                 &self.surface,
@@ -140,7 +142,7 @@ fn attach(self: *TmuxControl) !void {
         self.opts.@"terminal-rows",
     });
     var line_buf: [512]u8 = undefined;
-    const windows = try std.fmt.bufPrint(&line_buf, "$0 @0 1 {d} {d} {x:0>4},{s} 0 {x:0>4},{s} %0 bench", .{
+    const windows = try std.fmt.bufPrint(&line_buf, "$1 @0 1 {d} {d} {x:0>4},{s} 0 {x:0>4},{s} 0 0 0 0 %0 bench", .{
         self.opts.@"terminal-cols",
         self.opts.@"terminal-rows",
         checksum(layout),
@@ -151,11 +153,14 @@ fn attach(self: *TmuxControl) !void {
 
     const replies = [_]tmux.ControlNotification{
         .{ .block_end = "" },
-        .{ .session_changed = .{ .id = 0, .name = "bench" } },
-        .{ .block_end = "3.6 0" },
+        .{ .session_changed = .{ .id = 1, .name = "bench" } },
+        .{ .block_end = "3.6 0 bench" },
         .{ .block_end = windows },
+        // The pane's history, saved grid and grid on display, the
+        // subscriptions, then the pane state.
         .{ .block_end = "" },
         .{ .block_err = "no alternate screen" },
+        .{ .block_end = "" },
         .{ .block_end = "" },
         .{ .block_end = "" },
     };
@@ -164,6 +169,10 @@ fn attach(self: *TmuxControl) !void {
         // Attach once the window list is in, as the GUI does.
         if (i == 3) try state.viewer.attachPane(0, state.sink());
     }
+
+    // Every command the attach sent has its reply, or the data below
+    // would be measured against a session still starting up.
+    if (!state.viewer.command_queue.empty()) return error.AttachIncomplete;
 
     self.state = state;
 }

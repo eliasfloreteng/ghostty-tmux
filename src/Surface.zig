@@ -156,6 +156,11 @@ config_conditional_state: configpkg.ConditionalState,
 /// This is used to determine if we need to confirm, hold open, etc.
 child_exited: bool = false,
 
+/// The command line to run again to reattach a tmux session hosted here
+/// whose connection dropped, until it is run. Owned. See `tmuxReattach`.
+tmux_reattach_command: if (terminal.options.tmux_control_mode) ?[]const u8 else void =
+    if (terminal.options.tmux_control_mode) null else {},
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -864,6 +869,9 @@ pub fn deinit(self: *Surface) void {
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     self.io.deinit();
+    if (comptime terminal.options.tmux_control_mode) {
+        if (self.tmux_reattach_command) |v| self.alloc.free(v);
+    }
 
     if (self.inspector) |v| {
         v.deinit(self.alloc);
@@ -1207,7 +1215,33 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{
                     .session_name = windows.set.session_name,
                     .windows = windows.set.windows,
+                    .sessions = windows.set.sessions,
                 },
+            );
+        },
+
+        .tmux_paste_buffer => |req| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            defer req.deinit();
+
+            // No `clipboard-write` check and no confirmation: the user
+            // turned this on for exactly this, and a prompt on every copy
+            // in tmux would make it useless.
+            const data = try self.alloc.dupeZ(u8, req.slice());
+            defer self.alloc.free(data);
+            self.rt_surface.setClipboard(.standard, &.{.{
+                .mime = "text/plain",
+                .data = data,
+            }}, false) catch |err| {
+                log.err("error setting clipboard from tmux err={}", .{err});
+            };
+        },
+        .tmux_pane_status => |status| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_pane_status,
+                status,
             );
         },
 
@@ -1220,10 +1254,41 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const text = try alloc.dupeZ(u8, notice.text.slice());
             defer alloc.free(text);
 
+            // Kept for `tmuxReattach`, so that what is run in our shell
+            // is what the core read back from it, not whatever the GUI
+            // hands us.
+            if (notice.kind == .connection_lost) {
+                const command = try self.alloc.dupe(u8, text);
+                if (self.tmux_reattach_command) |old| self.alloc.free(old);
+                self.tmux_reattach_command = command;
+            }
+
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .tmux_notice,
                 .{ .kind = notice.kind, .text = text },
+            );
+        },
+
+        .tmux_status => |status| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            defer status.deinit();
+
+            var it = std.mem.splitScalar(u8, status.slice(), 0);
+            var parts: [3][:0]const u8 = undefined;
+            var stack = std.heap.stackFallback(512, self.alloc);
+            const alloc = stack.get();
+            var made: usize = 0;
+            defer for (parts[0..made]) |p| alloc.free(p);
+            for (&parts) |*part| {
+                part.* = try alloc.dupeZ(u8, it.next() orelse "");
+                made += 1;
+            }
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_status,
+                .{ .left = parts[0], .windows = parts[1], .right = parts[2] },
             );
         },
 
@@ -2366,6 +2431,115 @@ fn tmuxZoom(self: *Surface) bool {
     return true;
 }
 
+/// Ask tmux to swap this pane with another of its window, if this
+/// surface is a pane.
+fn tmuxSwapPane(self: *Surface, target: terminal.tmux.sink.SwapTarget) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.swapPane(pane.id, target);
+    return true;
+}
+
+/// Ask tmux to rotate the panes of this pane's window, if this surface
+/// is a pane.
+fn tmuxRotateWindow(self: *Surface, direction: terminal.tmux.sink.Adjacent) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.rotateWindow(pane.id, direction);
+    return true;
+}
+
+/// Ask tmux to give this pane a window of its own, if this surface is a
+/// pane.
+///
+/// Public because the embedded apprt calls it when a split is dragged
+/// out of its window, which AppKit handles without a binding.
+pub fn tmuxBreakPane(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.breakPane(pane.id);
+    return true;
+}
+
+/// Ask tmux to move this pane into a neighbouring window, if this
+/// surface is a pane.
+fn tmuxJoinPane(self: *Surface, window: terminal.tmux.sink.Adjacent) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.joinPane(pane.id, window);
+    return true;
+}
+
+/// Ask tmux to move this surface's pane beside `target`'s, if both are
+/// panes of the same session.
+///
+/// Public because the embedded apprt calls it for a split dragged onto
+/// another one, which AppKit handles without a binding: rearranging the
+/// split tree locally tells tmux nothing, and tmux's next layout would
+/// put the panes back where they were.
+///
+/// Returns false when either is not a tmux pane, or they are panes of
+/// different sessions -- which a GUI can drag between, but tmux cannot
+/// move a pane between.
+pub fn tmuxMovePane(
+    self: *Surface,
+    target: *Surface,
+    direction: terminal.tmux.sink.SplitDirection,
+) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    const target_pane = target.tmuxPane() orelse return false;
+    defer target_pane.router.unref();
+    if (pane.router != target_pane.router) return false;
+
+    pane.router.movePane(pane.id, target_pane.id, direction);
+    return true;
+}
+
+/// Whether this surface belongs to a tmux session: is one of its panes,
+/// or hosts it.
+fn tmuxSession(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    if (self.tmuxPane()) |pane| {
+        pane.router.unref();
+        return true;
+    }
+    return self.tmuxHosting();
+}
+
+/// Run a command line in the tmux session this surface belongs to, if
+/// it belongs to one. Like detaching, this is about the session rather
+/// than the pane, so the surface hosting it can do it too.
+///
+/// Public because the embedded apprt calls it with what its prompt for
+/// `prompt_tmux_command` was given.
+pub fn tmuxCommandLine(self: *Surface, text: []const u8) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    if (self.tmuxPane()) |pane| {
+        defer pane.router.unref();
+        pane.router.commandLine(text);
+        return true;
+    }
+
+    if (!self.tmuxHosting()) return false;
+    const router = self.tmuxRouter() orelse return false;
+    defer router.unref();
+    router.commandLine(text);
+    return true;
+}
+
 /// Leave the tmux session this surface belongs to, if it belongs to one.
 ///
 /// The pane is only how we reach the session; detaching is not about it.
@@ -2398,6 +2572,51 @@ fn tmuxSplit(
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
     pane.router.splitPane(pane.id, direction);
+    return true;
+}
+
+/// Ask the tmux session this surface hosts for something about the
+/// session as a whole: see `termio.Termio.tmuxSessionInput`.
+///
+/// Public for the embedded apprt, whose session picker has the host's
+/// surface in hand. Returns false if this surface hosts no session.
+pub fn tmuxSessionInput(
+    self: *Surface,
+    req: terminal.tmux.Viewer.Input,
+) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+    if (!self.tmuxHosting()) return false;
+    self.io.tmuxSessionInput(req);
+    return true;
+}
+/// Run again the command that started a tmux session hosted here whose
+/// connection dropped, to reattach it. See the `connection_lost` tmux
+/// notice, which carries the same command for the GUI to show.
+///
+/// Typed into the host's terminal as if by the user, Enter and all, so
+/// it runs in whatever shell is there now: the one ssh returned to. Not
+/// a paste, because a shell that brackets pastes would hold it at the
+/// prompt rather than run it.
+///
+/// Returns false if there is nothing to run: no connection dropped, the
+/// command was already run again, or a session is attached here right
+/// now. Once only, so a stale offer cannot start a second session.
+pub fn tmuxReattach(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+    if (self.tmuxHosting()) return false;
+    const command = self.tmux_reattach_command orelse return false;
+    self.tmux_reattach_command = null;
+    defer self.alloc.free(command);
+
+    const line = std.mem.concat(self.alloc, u8, &.{ command, "\r" }) catch |err| {
+        log.warn("failed to reattach tmux err={}", .{err});
+        return false;
+    };
+    defer self.alloc.free(line);
+    self.queueIo(termio.Message.writeReq(self.alloc, line) catch |err| {
+        log.warn("failed to reattach tmux err={}", .{err});
+        return false;
+    }, .unlocked);
     return true;
 }
 
@@ -3708,6 +3927,10 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
             .force = false,
         } }, .unlocked);
     }
+
+    // The backend may care whatever the program asked for: a tmux pane
+    // tells tmux, which can stop sending output nobody can see.
+    self.queueIo(.{ .visible = visible }, .unlocked);
 
     _ = self.renderer_thread.mailbox.push(global.io(), .{
         .visible = visible,
@@ -5707,6 +5930,40 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .tmux_detach => return self.tmuxDetach(),
+
+        .tmux_swap_pane => |v| return self.tmuxSwapPane(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.SwapTarget,
+                @tagName(tag),
+            ),
+        }),
+
+        .tmux_rotate_window => |v| return self.tmuxRotateWindow(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.Adjacent,
+                @tagName(tag),
+            ),
+        }),
+
+        .tmux_break_pane => return self.tmuxBreakPane(),
+
+        .tmux_command => |v| return self.tmuxCommandLine(v),
+
+        .prompt_tmux_command => {
+            if (!self.tmuxSession()) return false;
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .prompt_tmux_command,
+                {},
+            );
+        },
+
+        .tmux_join_pane => |v| return self.tmuxJoinPane(switch (v) {
+            inline else => |tag| @field(
+                terminal.tmux.sink.Adjacent,
+                @tagName(tag),
+            ),
+        }),
 
         .new_tab => {
             // On a tmux pane, a new tab is a new tmux window: the point

@@ -1002,9 +1002,33 @@ typedef struct {
   // client). Focusing it again is harmless: the core does not echo it back.
   bool has_active_pane;
   size_t active_pane_id;
+  // What tmux would mark the window with in its status line: it rang a
+  // bell, had activity (monitor-activity) or fell silent
+  // (monitor-silence) since the session was last on it. tmux sets these
+  // only on a window it is not on and clears them when it moves there,
+  // so selecting the tab is what clears them; the next snapshot says so.
+  bool bell;
+  bool activity;
+  bool silence;
   const ghostty_tmux_node_s* nodes;
   size_t nodes_len;
+  // The user hid this window (ghostty_surface_tmux_set_window_hidden, or
+  // another client of ours). Show no tab or window for it: its panes are
+  // not delivered to anything until it is shown again.
+  bool hidden;
 } ghostty_tmux_window_s;
+
+// terminal.tmux.WindowSet.Session
+//
+// A session on the server, ours or another. `name` is NUL terminated and
+// owned by the action. `windows` is only refreshed for other sessions when
+// the list is read again.
+typedef struct {
+  size_t id;
+  const char* name;
+  size_t windows;
+  size_t attached;
+} ghostty_tmux_session_s;
 
 // apprt.action.TmuxWindows.C
 //
@@ -1012,10 +1036,16 @@ typedef struct {
 // It is empty only when control mode has ended. An empty window list
 // with an empty name means the session is gone; with a name, the session
 // changed to that one and its windows follow in the next action.
+//
+// `sessions` lists every session on the server once
+// ghostty_surface_tmux_list_sessions has been called for this host, and is
+// kept current from then on; before that it is empty.
 typedef struct {
   const ghostty_tmux_window_s* windows;
   size_t len;
   const char* session_name;
+  const ghostty_tmux_session_s* sessions;
+  size_t sessions_len;
 } ghostty_action_tmux_windows_s;
 
 // apprt.action.TmuxNotice.Kind
@@ -1024,7 +1054,27 @@ typedef enum {
   GHOSTTY_TMUX_NOTICE_CONFIG_ERROR,
   GHOSTTY_TMUX_NOTICE_COMMAND_ERROR,
   GHOSTTY_TMUX_NOTICE_EXIT,
+  GHOSTTY_TMUX_NOTICE_COMMAND_OUTPUT,
+  GHOSTTY_TMUX_NOTICE_UNSUPPORTED,
+  GHOSTTY_TMUX_NOTICE_CONNECTION_LOST,
 } ghostty_tmux_notice_kind_e;
+
+// apprt.action.TmuxPaneStatus
+//
+// How current a tmux pane surface is with tmux, beyond what its content
+// shows. The target is the pane's surface. Sent on every change.
+//
+//   LIVE             up to date.
+//   LOADING_HISTORY  the screen is shown and its history is still being
+//                    read, so scrollback is short for now.
+//   CATCHING_UP      tmux paused the pane because we fell behind it
+//                    (tmux-pause-after) and it is being read again; the
+//                    screen may be stale until it is.
+typedef enum {
+  GHOSTTY_TMUX_PANE_LIVE,
+  GHOSTTY_TMUX_PANE_LOADING_HISTORY,
+  GHOSTTY_TMUX_PANE_CATCHING_UP,
+} ghostty_action_tmux_pane_status_e;
 
 // apprt.action.TmuxNotice.C
 //
@@ -1041,10 +1091,34 @@ typedef enum {
 //   EXIT           the session ended and this is tmux's reason. Sent
 //                  only when tmux gives one, just before the session's
 //                  pane surfaces are closed.
+//   COMMAND_OUTPUT what a command line the user typed printed; may be
+//                  several lines. Its errors come as COMMAND_ERROR.
+//   UNSUPPORTED    the tmux server is too old to be shown; the text names
+//                  its version and the one needed. The client has been
+//                  detached and the session keeps running in tmux. Sent
+//                  just before the session ends.
+//   CONNECTION_LOST the connection to tmux dropped without the session
+//                  ending, so it is likely still running. The text is
+//                  the command line that started it in this surface's
+//                  terminal; ghostty_surface_tmux_reattach runs it again.
+//                  Sent just before the session's windows go.
 typedef struct {
   ghostty_tmux_notice_kind_e kind;
   const char* text;
 } ghostty_action_tmux_notice_s;
+
+// apprt.action.TmuxStatus.C
+//
+// tmux's status line, when tmux-status-bar is on: status-left, the window
+// list and status-right as tmux formats them, without tmux's styles. The
+// target is the surface hosting the session. All three are NUL
+// terminated, possibly empty, and only valid for the duration of the
+// action callback.
+typedef struct {
+  const char* left;
+  const char* windows;
+  const char* right;
+} ghostty_action_tmux_status_s;
 
 // apprt.Action.Key
 typedef enum {
@@ -1120,6 +1194,9 @@ typedef enum {
   GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_TMUX_WINDOWS,
   GHOSTTY_ACTION_TMUX_NOTICE,
+  GHOSTTY_ACTION_TMUX_STATUS,
+  GHOSTTY_ACTION_PROMPT_TMUX_COMMAND,
+  GHOSTTY_ACTION_TMUX_PANE_STATUS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1166,6 +1243,8 @@ typedef union {
   ghostty_action_open_config_e open_config;
   ghostty_action_tmux_windows_s tmux_windows;
   ghostty_action_tmux_notice_s tmux_notice;
+  ghostty_action_tmux_status_s tmux_status;
+  ghostty_action_tmux_pane_status_e tmux_pane_status;
 } ghostty_action_u;
 
 typedef struct {
@@ -1300,7 +1379,47 @@ GHOSTTY_API bool ghostty_surface_tmux_close_tab(ghostty_surface_t);
 // anything that is not a tmux pane, and for a pane tmux already closed;
 // remove it as usual.
 GHOSTTY_API bool ghostty_surface_tmux_close_pane(ghostty_surface_t);
+// Move the tmux pane the first surface displays beside the one the
+// second displays, on the given side (a split dropped onto another).
+//
+// Returns true if tmux was asked; the caller must NOT also rearrange its
+// split trees, which follow tmux's layouts. Returns false if either is
+// not a tmux pane or they belong to different sessions.
+GHOSTTY_API bool ghostty_surface_tmux_move_pane(ghostty_surface_t,
+                                                ghostty_surface_t,
+                                                ghostty_action_split_direction_e);
+// Take the tmux pane this surface displays out into a tmux window of its
+// own (a split dragged out of its window).
+//
+// Returns true if tmux was asked; the caller must NOT also move the
+// split. Returns false for anything that is not a tmux pane.
+GHOSTTY_API bool ghostty_surface_tmux_break_pane(ghostty_surface_t);
+// Run a command line in the tmux session this surface belongs to, as a
+// pane or as the surface hosting it, as tmux's own command prompt would.
+// What it prints comes back as GHOSTTY_ACTION_TMUX_NOTICE. Returns false
+// if the surface belongs to no session.
+GHOSTTY_API bool ghostty_surface_tmux_command(ghostty_surface_t,
+                                              const char*,
+                                              uintptr_t);
+// Run again, in this surface's terminal, the command that started a tmux
+// session it hosted whose connection dropped (see the CONNECTION_LOST
+// notice), to reattach it. Returns false if there is nothing to run,
+// including when it already ran once.
+GHOSTTY_API bool ghostty_surface_tmux_reattach(ghostty_surface_t);
 GHOSTTY_API void ghostty_tmux_router_free(void*);
+// Session-wide requests to the tmux session a surface hosts (the surface
+// that ran `tmux -CC`). Each returns false if the surface hosts none. The
+// result arrives as a later GHOSTTY_ACTION_TMUX_WINDOWS.
+//
+// Hide a window (no tab for it; it stays in the session) or show it again.
+GHOSTTY_API bool ghostty_surface_tmux_set_window_hidden(ghostty_surface_t,
+                                                        size_t,
+                                                        bool);
+// Move the client to another session, by tmux session id.
+GHOSTTY_API bool ghostty_surface_tmux_switch_session(ghostty_surface_t,
+                                                     size_t);
+// Fill in and keep current the action's session list.
+GHOSTTY_API bool ghostty_surface_tmux_list_sessions(ghostty_surface_t);
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);

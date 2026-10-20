@@ -68,6 +68,46 @@ class TmuxWindowManager {
     }
     private var configErrors: [ObjectIdentifier: ConfigErrors] = [:]
 
+    /// Every host with a session, so a pane can lead back to the surface
+    /// that runs its session. See `host(of:)`.
+    private var hosts: [ObjectIdentifier: WeakSurface] = [:]
+
+    /// The last snapshot per host, for a dashboard opened after it.
+    private var snapshots: [ObjectIdentifier: Ghostty.Action.TmuxWindows] = [:]
+
+    /// The open dashboard per host. See `TmuxDashboardController`.
+    private var dashboards: [ObjectIdentifier: TmuxDashboardController] = [:]
+
+    /// Host windows ordered out for `tmux-hide-host`, to put back.
+    private var hiddenHostWindows: [ObjectIdentifier: NSWindow] = [:]
+
+    /// Hosts the user asked to see again while their session is attached.
+    /// Not hidden again until the session ends.
+    private var revealedHosts: Set<ObjectIdentifier> = []
+
+    /// Panes the user dragged out of their window, with where they were
+    /// dropped. See `breakOut(_:at:)`.
+    private struct BrokenOut {
+        let position: NSPoint?
+        let at: Date
+    }
+    private var brokenOut: [Key: BrokenOut] = [:]
+
+    /// Each host's windows in tmux's order, as of its last snapshot.
+    private var windowOrder: [ObjectIdentifier: [Int]] = [:]
+
+    /// An order we asked tmux for by moving a window, and until when we
+    /// wait for it rather than put the tabs back. See `tabsDidReorder`.
+    private struct PendingOrder {
+        let order: [Int]
+        let until: Date
+    }
+    private var pendingOrder: [ObjectIdentifier: PendingOrder] = [:]
+
+    /// Each host's tmux status line, for sessions that mirror it. See
+    /// `ghosttyTmuxStatus`.
+    private var statuses: [ObjectIdentifier: Ghostty.Action.TmuxStatus] = [:]
+
     init() {
         NotificationCenter.default.addObserver(
             self,
@@ -89,6 +129,16 @@ class TmuxWindowManager {
             selector: #selector(ghosttyTmuxNotice(_:)),
             name: .ghosttyTmuxNotice,
             object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttyTmuxStatus(_:)),
+            name: .ghosttyTmuxStatus,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(tabsDidReorder(_:)),
+            name: .ghosttyTabsDidReorder,
+            object: nil)
     }
 
     deinit {
@@ -102,11 +152,14 @@ class TmuxWindowManager {
         ] as? Ghostty.Action.TmuxWindows else { return }
 
         let host = ObjectIdentifier(hostView)
+        hosts[host] = .init(value: hostView)
+        snapshots[host] = action
 
         // Before anything that needs the host to still be alive: a
         // session ending is often why it is not.
         if action.windows.isEmpty {
             sessionEmptied(hostView, sessionName: action.sessionName)
+            updateDashboard(host: host)
             return
         }
 
@@ -118,7 +171,11 @@ class TmuxWindowManager {
         var liveWindows: Set<Key> = []
         var livePanes: Set<Key> = []
 
-        for window in action.windows {
+        // A hidden window is left out, as if tmux had not listed it: its
+        // tab closes, and its panes are forgotten, since nothing is
+        // delivered to them until it is shown again and they are read
+        // afresh into new surfaces.
+        for window in action.windows where !window.hidden {
             liveWindows.insert(Key(host: host, id: window.id))
             for node in window.nodes where node.kind == .pane {
                 livePanes.insert(Key(host: host, id: node.paneId))
@@ -132,9 +189,13 @@ class TmuxWindowManager {
             action.windows[a].active && !action.windows[b].active
         }
 
+        // Each tmux window in a native window of its own, rather than as
+        // tabs of one. Read per window, when it is first built.
+        let separate = ghostty.config.tmuxWindowPlacement == "windows"
+
         for index in order {
             let window = action.windows[index]
-            guard !window.nodes.isEmpty else { continue }
+            guard !window.nodes.isEmpty, !window.hidden else { continue }
 
             guard let root = node(
                 for: window,
@@ -179,7 +240,7 @@ class TmuxWindowManager {
                     controller.surfaceTree = tree
                     keepFocusInWindow(window, of: entry, host: host)
                 }
-                setTitle(controller, window.name)
+                setTitle(controller, window)
                 entry.isActive = window.active
                 followActivePane(window, of: entry, host: host)
                 continue
@@ -210,11 +271,29 @@ class TmuxWindowManager {
             // window, which the tab bar then follows. A session switched
             // to, or a window opened with `new-window -d`, would pull the
             // user into whichever tab happened to be built last.
+            //
+            // With `tmux-window-placement = windows` none of them has a
+            // tab group to join, and the same rule holds for windows: one
+            // that is not tmux's current window goes behind without being
+            // made key.
+            //
+            // A pane the user dragged out of its window comes back in a
+            // tmux window of its own, and that goes where it was dropped,
+            // as a window: the same as dragging out an ordinary split.
+            // Only for a little while: tmux may have refused, and the same
+            // pane breaking out later by other means is a new tab again.
+            let breakOut = window.nodes.lazy
+                .filter { $0.kind == .pane }
+                .compactMap { self.brokenOut.removeValue(forKey: Key(host: host, id: $0.paneId)) }
+                .first { $0.at.timeIntervalSinceNow > -5 }
+
             let controller = newController(
                 ghostty: ghostty,
                 tree: tree,
-                placement: tabParent(action.windows, of: index, host: host),
+                placement: separate || breakOut != nil ? nil : tabParent(action.windows, of: index, host: host),
+                position: breakOut?.position,
                 select: window.active,
+                activate: separate ? window.active : true,
                 hostSize: hostView.window.map { $0.contentRect(forFrameRect: $0.frame).size },
                 // Where focus goes when the tab is first shown, which for
                 // a tab made in the background is when the user picks it.
@@ -222,7 +301,8 @@ class TmuxWindowManager {
                 // tmux the user moved there, over the pane tmux had active.
                 initialFocus: window.activePaneId.flatMap { panes[Key(host: host, id: $0)]?.value })
             controller.isTmuxWindow = true
-            setTitle(controller, window.name)
+            controller.tmuxStatus = statuses[host]
+            setTitle(controller, window)
 
             let entry = WindowEntry(controller: controller)
             entry.isActive = window.active
@@ -234,11 +314,16 @@ class TmuxWindowManager {
         }
 
         prune(liveWindows: liveWindows, livePanes: livePanes, host: host)
+        windowOrder[host] = action.windows.map(\.id)
+        arrangeTabs(host: host)
         selectActiveWindow(action.windows, host: host)
         setHostedSession(hostView, action.sessionName)
 
         // The session is still going, so whatever closed was not it.
         closedWhileKey.remove(host)
+
+        syncHostHidden(hostView, ghostty: ghostty)
+        updateDashboard(host: host)
     }
 
     /// A snapshot with no windows: the session changed or ended.
@@ -267,7 +352,24 @@ class TmuxWindowManager {
 
         prune(liveWindows: [], livePanes: [], host: host)
         closedWhileKey.remove(host)
+        windowOrder.removeValue(forKey: host)
+        pendingOrder.removeValue(forKey: host)
+
+        // A session switched to keeps the status line: it is the
+        // client's, and tmux only says again what changed.
+        if ended { statuses.removeValue(forKey: host) }
         setHostedSession(hostView, ended ? nil : sessionName)
+
+        // A session change keeps the host as it was, since the new
+        // session's windows are on their way. An end gives it back, and
+        // closes what was only about the session.
+        if ended {
+            revealedHosts.remove(host)
+            restoreHost(host, makeKey: wasInSession)
+            dashboards.removeValue(forKey: host)?.close()
+            snapshots.removeValue(forKey: host)
+            hosts.removeValue(forKey: host)
+        }
 
         guard ended, wasInSession else { return }
         guard let controller = hostView.window?.windowController as? BaseTerminalController else { return }
@@ -291,6 +393,10 @@ class TmuxWindowManager {
     ///   per error, and say the session may not be set up as intended.
     /// - The reason a session ended goes on the host, since the session's
     ///   own windows are about to close.
+    /// - A tmux too old to be shown is an alert on the host: nothing else
+    ///   opened, and otherwise all the user sees is `tmux -CC` returning.
+    /// - A dropped connection is an offer, on the host, to run the command
+    ///   that started the session again and so reattach it.
     @objc private func ghosttyTmuxNotice(_ notification: Notification) {
         guard let hostView = notification.object as? Ghostty.SurfaceView else { return }
         guard let notice = notification.userInfo?[
@@ -312,6 +418,134 @@ class TmuxWindowManager {
 
         case .configError:
             tmuxConfigError(notice.text, hostedBy: hostView)
+
+        case .commandOutput:
+            tmuxCommandOutput(notice.text, hostedBy: hostView)
+
+        case .unsupported:
+            presentUnsupported(notice.text, hostedBy: hostView)
+
+        case .connectionLost:
+            offerReattach(notice.text, hostedBy: hostView)
+        }
+    }
+
+    /// tmux's status line changed: show it on every window of the session.
+    ///
+    /// Kept per host as well, for windows that open later, since tmux only
+    /// says what changed and when.
+    @objc private func ghosttyTmuxStatus(_ notification: Notification) {
+        guard let hostView = notification.object as? Ghostty.SurfaceView else { return }
+        guard let status = notification.userInfo?[
+            Notification.Name.TmuxStatusKey
+        ] as? Ghostty.Action.TmuxStatus else { return }
+
+        let host = ObjectIdentifier(hostView)
+        statuses[host] = status
+        for (key, entry) in windows where key.host == host {
+            guard let controller = entry.controller, controller.tmuxStatus != status else { continue }
+            controller.tmuxStatus = status
+        }
+    }
+
+    /// Show what a command line the user typed printed.
+    ///
+    /// A line or so is a passing notice, like a message. Anything longer
+    /// -- `list-sessions`, `show-options` -- is something to read, so it
+    /// goes in a sheet with room for it and text that can be selected
+    /// and copied.
+    private func tmuxCommandOutput(_ text: String, hostedBy hostView: Ghostty.SurfaceView) {
+        let target = noticeTarget(hostedBy: hostView)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.count == 1 && text.count <= 120 {
+            target.showTransientNotice("tmux: \(text)", duration: 8)
+            return
+        }
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 560, height: 280))
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        textView.string = text
+
+        let scrollView = NSScrollView(frame: textView.frame)
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.borderType = .bezelBorder
+        scrollView.documentView = textView
+
+        let alert = NSAlert()
+        alert.messageText = "tmux"
+        alert.accessoryView = scrollView
+        alert.addButton(withTitle: "OK")
+
+        if let window = target.window ?? hostView.window, window.attachedSheet == nil {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    /// Offer to reattach a session whose connection dropped, by running
+    /// the command that started it again in the host's terminal.
+    ///
+    /// Asked rather than done: the drop may be the network going away
+    /// for a while, the command may prompt for a password, and the user
+    /// may have meant to leave. The session's name is read before the
+    /// window list that ends it clears it from the host.
+    private func offerReattach(_ command: String, hostedBy hostView: Ghostty.SurfaceView) {
+        let session = hostView.hostedTmuxSession ?? ""
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Lost Connection to tmux"
+        alert.informativeText = """
+            The connection to \(session.isEmpty ? "the session" : "session “\(session)”") \
+            dropped, but the session is probably still running. Run the \
+            command that started it again in this terminal to reattach?
+
+            \(command)
+            """
+        alert.addButton(withTitle: "Reconnect")
+        alert.addButton(withTitle: "Not Now")
+
+        let reattach = { [weak hostView] (response: NSApplication.ModalResponse) in
+            guard response == .alertFirstButtonReturn,
+                  let hostView, let surface = hostView.surface else { return }
+            guard ghostty_surface_tmux_reattach(surface) else { return }
+            if let controller = hostView.window?.windowController as? BaseTerminalController {
+                controller.focusSurface(hostView)
+            }
+        }
+
+        // On the host's window, where the command will run and where the
+        // user is taken back to as the session's windows close.
+        guard let window = hostView.window, window.attachedSheet == nil else {
+            hostView.showTransientNotice("tmux: lost the connection", level: .error, duration: 8)
+            return
+        }
+        alert.beginSheetModal(for: window, completionHandler: reattach)
+    }
+
+    /// Say that the session could not be shown because its tmux is too
+    /// old, and what to do about it.
+    private func presentUnsupported(_ text: String, hostedBy hostView: Ghostty.SurfaceView) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "tmux Is Too Old"
+        alert.informativeText = """
+            \(text).
+
+            Ghostty detached without opening the session, which is still \
+            running. Update tmux where it runs, or attach to it with plain \
+            `tmux attach` instead.
+            """
+        alert.addButton(withTitle: "OK")
+
+        if let window = hostView.window, window.attachedSheet == nil {
+            alert.beginSheetModal(for: window)
+        } else {
+            hostView.showTransientNotice("tmux: \(text)", level: .error, duration: 10)
         }
     }
 
@@ -380,6 +614,154 @@ class TmuxWindowManager {
         }
     }
 
+    // MARK: Moving panes and windows
+
+    /// Take a tmux pane the user dragged out of its window into a tmux
+    /// window of its own, opened as a window where it was dropped.
+    ///
+    /// Nothing moves here: tmux breaks the pane out, and its window list
+    /// brings the new window. All this does is remember that the window
+    /// holding this pane should be a window rather than a tab. tmux keeps
+    /// the pane's id, which is how it is recognised.
+    func breakOut(_ view: Ghostty.SurfaceView, at position: NSPoint?) {
+        guard let surface = view.surface else { return }
+        guard let key = panes.first(where: { $0.value.value === view })?.key else { return }
+        guard ghostty_surface_tmux_break_pane(surface) else { return }
+        brokenOut[key] = BrokenOut(position: position, at: Date())
+    }
+
+    /// The tmux window ids of this host's tabs in `group`, in the order
+    /// the tabs are in.
+    private func tabOrder(of group: NSWindowTabGroup, host: ObjectIdentifier) -> [Int] {
+        group.windows.compactMap { window in
+            windows.first { $0.key.host == host && $0.value.controller?.window === window }?.key.id
+        }
+    }
+
+    /// Put this host's tabs in tmux's order, in every tab group holding
+    /// them.
+    ///
+    /// A tmux window's place in the tab bar is its place in tmux's window
+    /// order, and tmux's order moves for reasons that are not ours: a
+    /// `move_tab` sent to tmux, another client, a script. Tabs dragged into
+    /// a window of their own, or into another window's group, are left
+    /// where they are: tmux has no idea of native windows, only of order,
+    /// so only the order within each group is tmux's to decide.
+    ///
+    /// Not while an order we asked for is on its way. tmux does not say
+    /// when windows move, so the snapshots in between still have the old
+    /// one, and following them would drag the tab the user just dropped
+    /// back for a moment.
+    private func arrangeTabs(host: ObjectIdentifier) {
+        guard let order = windowOrder[host] else { return }
+        if let pending = pendingOrder[host] {
+            if pending.order != order && pending.until > Date() { return }
+            pendingOrder.removeValue(forKey: host)
+        }
+
+        let groups = windows
+            .filter { $0.key.host == host }
+            .compactMap { $0.value.controller?.window?.tabGroup }
+        var seen: Set<ObjectIdentifier> = []
+        for group in groups where seen.insert(ObjectIdentifier(group)).inserted {
+            let ours = tabOrder(of: group, host: host)
+            let wanted = order.filter { ours.contains($0) }
+            guard ours != wanted else { continue }
+
+            let selected = group.selectedWindow
+            let key = group.windows.first { $0.isKeyWindow }
+            NSAnimationContext.beginGrouping()
+            NSAnimationContext.current.duration = 0
+
+            // Each window after the one tmux has before it. Anything that
+            // is not one of ours stays where it was relative to its
+            // neighbours.
+            for (previous, id) in zip(wanted, wanted.dropFirst()) {
+                guard let before = windows[Key(host: host, id: previous)]?.controller?.window,
+                      let window = windows[Key(host: host, id: id)]?.controller?.window,
+                      let beforeIndex = group.windows.firstIndex(of: before),
+                      let index = group.windows.firstIndex(of: window),
+                      index < beforeIndex else { continue }
+                group.removeWindow(window)
+                before.addTabbedWindowSafely(window, ordered: .above)
+            }
+
+            if let selected, group.selectedWindow !== selected { group.selectedWindow = selected }
+            key?.makeKey()
+            NSAnimationContext.endGrouping()
+        }
+    }
+
+    /// The user dragged tabs around: tell tmux where this host's windows
+    /// went.
+    ///
+    /// Only for a tab dragged with the mouse. The tab bar also reorders
+    /// when we arrange it to follow tmux, and that must not be sent back
+    /// as a move: tmux is already there.
+    ///
+    /// A drag moves one tab, and that is the move asked of tmux: the tab
+    /// goes just after the one now before it (or before the one after it,
+    /// when it is first), worked out in tmux's whole window order, since
+    /// windows of the session in other native windows are part of it too.
+    /// It is sent as `move_tab`, which on a tmux pane moves its window.
+    @objc private func tabsDidReorder(_ notification: Notification) {
+        guard let event = NSApp.currentEvent,
+              [.leftMouseDragged, .leftMouseUp].contains(event.type) else { return }
+        guard let group = (notification.object as? NSWindow)?.tabGroup else { return }
+
+        let hosts = Set(windows.keys.map(\.host))
+        for host in hosts {
+            guard let order = windowOrder[host] else { continue }
+            let tabs = tabOrder(of: group, host: host)
+            let tmux = order.filter { tabs.contains($0) }
+            guard tabs != tmux, let moved = Self.movedWindow(from: tmux, to: tabs) else { continue }
+
+            guard let from = order.firstIndex(of: moved),
+                  let at = tabs.firstIndex(of: moved) else { continue }
+            let to: Int
+            if at > 0, let before = order.firstIndex(of: tabs[at - 1]) {
+                to = before < from ? before + 1 : before
+            } else if at + 1 < tabs.count, let after = order.firstIndex(of: tabs[at + 1]) {
+                to = after > from ? after - 1 : after
+            } else {
+                continue
+            }
+            guard to != from else { continue }
+
+            guard let controller = windows[Key(host: host, id: moved)]?.controller,
+                  let surface = (controller.focusedSurface ?? controller.surfaceTree.first)?.surface
+            else { continue }
+
+            var expected = order
+            expected.remove(at: from)
+            expected.insert(moved, at: to)
+            pendingOrder[host] = PendingOrder(order: expected, until: Date().addingTimeInterval(2))
+
+            let action = "move_tab:\(to - from)"
+            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
+                Ghostty.logger.warning("action failed action=\(action, privacy: .public)")
+            }
+        }
+    }
+
+    /// The one window whose move turns `old` into `new`, if one does.
+    /// Both hold the same windows.
+    static func movedWindow(from old: [Int], to new: [Int]) -> Int? {
+        guard old.count == new.count,
+              let i = old.indices.first(where: { old[$0] != new[$0] }) else { return nil }
+
+        // Moved back to here from later on, or moved on from here.
+        for candidate in [new[i], old[i]] {
+            var moved = old
+            guard let from = moved.firstIndex(of: candidate),
+                  let to = new.firstIndex(of: candidate) else { continue }
+            moved.remove(at: from)
+            moved.insert(candidate, at: to)
+            if moved == new { return candidate }
+        }
+        return nil
+    }
+
     // MARK: Host
 
     /// Tell the host which session it is hosting, or that it is not any
@@ -394,8 +776,102 @@ class TmuxWindowManager {
         let host = ObjectIdentifier(hostView)
         let candidates = windows.filter { $0.key.host == host }
         let entry = candidates.first { $0.value.isActive }?.value ?? candidates.first?.value
-        guard let window = entry?.controller?.window else { return }
+        guard let window = entry?.controller?.window else {
+            // Nothing on screen: every window may be hidden. The
+            // dashboard is where they can be shown again.
+            showDashboard(for: hostView)
+            return
+        }
         window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Bring forward one tmux window of the session hosted by `hostView`.
+    func showWindow(id: Int, hostedBy hostView: Ghostty.SurfaceView) {
+        let key = Key(host: ObjectIdentifier(hostView), id: id)
+        windows[key]?.controller?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: Dashboard
+
+    /// The surface running the session `view` belongs to: itself if it
+    /// hosts one, else the host of the session it is a pane of.
+    func host(of view: Ghostty.SurfaceView) -> Ghostty.SurfaceView? {
+        if view.hostedTmuxSession != nil { return view }
+        guard let key = panes.first(where: { $0.value.value === view })?.key else { return nil }
+        return hosts[key.host]?.value
+    }
+
+    /// Open the dashboard for the session `view` hosts or belongs to.
+    func showDashboard(for view: Ghostty.SurfaceView) {
+        guard let hostView = host(of: view) else { return }
+        let host = ObjectIdentifier(hostView)
+
+        let dashboard: TmuxDashboardController
+        if let existing = dashboards[host] {
+            dashboard = existing
+        } else {
+            dashboard = TmuxDashboardController(hostView: hostView, manager: self)
+            dashboard.onClose = { [weak self, weak dashboard] in
+                guard let self, let dashboard else { return }
+                if self.dashboards[host] === dashboard { self.dashboards.removeValue(forKey: host) }
+            }
+            dashboards[host] = dashboard
+        }
+
+        if let snapshot = snapshots[host] {
+            dashboard.update(snapshot, hostHidden: hiddenHostWindows[host] != nil)
+        }
+        dashboard.present()
+    }
+
+    private func updateDashboard(host: ObjectIdentifier) {
+        guard let dashboard = dashboards[host], let snapshot = snapshots[host] else { return }
+        dashboard.update(snapshot, hostHidden: hiddenHostWindows[host] != nil)
+    }
+
+    // MARK: Hiding the host
+
+    /// Show the host again, and keep it shown for the rest of the session.
+    func revealHost(_ hostView: Ghostty.SurfaceView) {
+        let host = ObjectIdentifier(hostView)
+        revealedHosts.insert(host)
+        restoreHost(host, makeKey: true)
+        updateDashboard(host: host)
+    }
+
+    /// Order the host's window out, or back in, for `tmux-hide-host`.
+    ///
+    /// Hidden only while some window of the session is on screen: with
+    /// none (all of them hidden, say) the host is the one place left to
+    /// reach the session from. And only when the host is alone in its
+    /// window, since hiding a window hides whatever else is in it.
+    private func syncHostHidden(_ hostView: Ghostty.SurfaceView, ghostty: Ghostty.App) {
+        let host = ObjectIdentifier(hostView)
+        let onScreen = windows.contains { key, entry in
+            key.host == host && entry.controller?.window != nil
+        }
+        guard ghostty.config.tmuxHideHost, onScreen, !revealedHosts.contains(host) else {
+            restoreHost(host, makeKey: false)
+            return
+        }
+        guard hiddenHostWindows[host] == nil else { return }
+
+        guard let window = hostView.window,
+              let controller = window.windowController as? BaseTerminalController,
+              controller.surfaceTree.root == .leaf(view: hostView),
+              (window.tabGroup?.windows.count ?? 1) <= 1 else { return }
+
+        hiddenHostWindows[host] = window
+        window.orderOut(nil)
+    }
+
+    private func restoreHost(_ host: ObjectIdentifier, makeKey: Bool) {
+        guard let window = hiddenHostWindows.removeValue(forKey: host) else { return }
+        if makeKey {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            window.orderFront(nil)
+        }
     }
 
     /// Bring forward the tab for the window tmux is currently on.
@@ -420,7 +896,19 @@ class TmuxWindowManager {
         guard let active = windows.first(where: { $0.active }) else { return }
         guard let controller = self.windows[Key(host: host, id: active.id)]?.controller,
               let window = controller.window else { return }
-        guard let group = window.tabGroup else { return }
+
+        // A window of its own (`tmux-window-placement = windows`): the
+        // same rule, with the session's windows standing in for the tab
+        // group. Brought forward only if one of them is key.
+        guard let group = window.tabGroup, group.windows.count > 1 else {
+            guard !window.isKeyWindow else { return }
+            let sessionKey = self.windows.contains { key, entry in
+                key.host == host && (entry.controller?.window?.isKeyWindow ?? false)
+            }
+            guard sessionKey else { return }
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
         guard group.selectedWindow !== window else { return }
         guard group.windows.contains(where: { $0.isKeyWindow }) else { return }
 
@@ -581,7 +1069,9 @@ class TmuxWindowManager {
         ghostty: Ghostty.App,
         tree: SplitTree<Ghostty.SurfaceView>,
         placement: (window: NSWindow, ordered: NSWindow.OrderingMode)?,
+        position: NSPoint? = nil,
         select: Bool,
+        activate: Bool,
         hostSize: CGSize?,
         initialFocus: Ghostty.SurfaceView?
     ) -> TerminalController {
@@ -601,8 +1091,10 @@ class TmuxWindowManager {
         return TerminalController.newWindow(
             ghostty,
             tree: tree,
+            position: position,
             contentSize: hostSize,
-            initialFocus: initialFocus)
+            initialFocus: initialFocus,
+            activate: activate)
     }
 
     /// Where a new tab for `windows[index]` goes: after or before a window
@@ -649,14 +1141,35 @@ class TmuxWindowManager {
         return window
     }
 
-    /// Show the tmux window's name as the window title.
+    /// Show the tmux window's name as the window title, marked with its
+    /// alerts the way tmux's status line marks them.
     ///
     /// tmux owns what a tmux window is called, so this goes in as the
-    /// override: the surface titles underneath are the shell's idea of a
-    /// title, which is a different thing. Assigning only on a change
-    /// keeps this off the main thread's work list for the common case
-    /// where tmux re-reports a layout that did not move.
-    private func setTitle(_ controller: TerminalController, _ name: String) {
+    /// override: the surface titles underneath are the panes' own titles,
+    /// which is a different thing. Assigning only on a change keeps this
+    /// off the main thread's work list for the common case where tmux
+    /// re-reports a layout that did not move.
+    ///
+    /// The marks are tmux's, not ours to clear: tmux sets them only on a
+    /// window it is not on and clears them when it moves there, and
+    /// selecting the tab is what moves it. A bell is not marked again when
+    /// the pane that rang it already shows one: that bell reached the
+    /// surface as well (the bell feature `title`), and both would say the
+    /// same thing.
+    private func setTitle(
+        _ controller: TerminalController,
+        _ window: Ghostty.Action.TmuxWindows.Window
+    ) {
+        var marks: [String] = []
+        if window.alerts.bell && !(controller.focusedSurface?.bell ?? false) {
+            marks.append("🔔")
+        }
+        if window.alerts.activity { marks.append("•") }
+        if window.alerts.silence { marks.append("💤") }
+
+        let name = ([marks.joined()] + [window.name])
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
         let wanted = name.isEmpty ? nil : name
         if controller.titleOverride != wanted {
             controller.titleOverride = wanted

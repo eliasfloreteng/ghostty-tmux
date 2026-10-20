@@ -1927,6 +1927,106 @@ pub const CAPI = struct {
         return surface.core_surface.tmuxClosePane();
     }
 
+    /// Hide a window of the tmux session this surface hosts from the GUI,
+    /// or show it again. The window stays in the session; the next window
+    /// list carries the change. Returns false if this surface hosts no
+    /// session.
+    export fn ghostty_surface_tmux_set_window_hidden(
+        surface: *Surface,
+        window_id: usize,
+        hidden: bool,
+    ) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxSessionInput(.{ .hide_window = .{
+            .window_id = window_id,
+            .hidden = hidden,
+        } });
+    }
+
+    /// Move the tmux client this surface hosts to another session on the
+    /// same server. The session's windows replace the current ones, as
+    /// for any session change. Returns false if this surface hosts no
+    /// session.
+    export fn ghostty_surface_tmux_switch_session(
+        surface: *Surface,
+        session_id: usize,
+    ) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxSessionInput(.{ .switch_session = .{
+            .session_id = session_id,
+        } });
+    }
+
+    /// Read the server's sessions into the window list action, and keep
+    /// them current from now on. Calling it again refreshes counts tmux
+    /// does not announce. Returns false if this surface hosts no session.
+    export fn ghostty_surface_tmux_list_sessions(surface: *Surface) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxSessionInput(.list_sessions);
+    }
+    /// Move the tmux pane `surface` displays beside the one `target`
+    /// displays, on the given side: Ghostty's split drag and drop, for
+    /// tmux panes.
+    ///
+    /// Moving a split in the split tree tells tmux nothing, and tmux's
+    /// next layout would put it back, so tmux has to move it.
+    ///
+    /// Returns true if tmux was asked, in which case the caller must
+    /// leave its split trees alone: the panes move when tmux's layouts
+    /// say they have. Returns false if either is not a tmux pane, or they
+    /// are panes of different sessions; a tmux pane cannot be moved
+    /// anywhere tmux does not have, so the caller should refuse the drop
+    /// if either is a tmux pane at all.
+    export fn ghostty_surface_tmux_move_pane(
+        surface: *Surface,
+        target: *Surface,
+        direction: apprt.action.SplitDirection,
+    ) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxMovePane(
+            &target.core_surface,
+            switch (direction) {
+                .right => .right,
+                .left => .left,
+                .down => .down,
+                .up => .up,
+            },
+        );
+    }
+
+    /// Take the tmux pane this surface displays out into a tmux window of
+    /// its own: a split dragged out of its window, for tmux panes.
+    ///
+    /// Returns true if tmux was asked, in which case the caller must not
+    /// move the split itself; the new window arrives with tmux's next
+    /// window list. Returns false for anything that is not a tmux pane.
+    export fn ghostty_surface_tmux_break_pane(surface: *Surface) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxBreakPane();
+    }
+
+    /// Run a command line in the tmux session this surface belongs to:
+    /// what the prompt `prompt_tmux_command` asks for was typed into.
+    ///
+    /// Returns false if the surface belongs to no session.
+    export fn ghostty_surface_tmux_command(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxCommandLine(ptr[0..len]);
+    }
+
+    /// Run again the command that started a tmux session hosted by this
+    /// surface whose connection dropped, to reattach it. See the
+    /// `connection_lost` tmux notice. Returns false if there is nothing to
+    /// run, including when it already ran.
+    export fn ghostty_surface_tmux_reattach(surface: *Surface) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxReattach();
+    }
+
     /// Release a reference from ghostty_surface_tmux_router that was not
     /// handed to a surface config.
     export fn ghostty_tmux_router_free(router_: ?*anyopaque) void {

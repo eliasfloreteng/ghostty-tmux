@@ -73,6 +73,20 @@ pub const Backend = union(Kind) {
         }
     }
 
+    pub fn visibilityChanged(
+        self: *Backend,
+        td: *termio.Termio.ThreadData,
+        visible: bool,
+    ) void {
+        switch (self.*) {
+            // A process does not care whether anyone is looking. A
+            // program that does asks with mode 2033, which is answered
+            // above the backend.
+            .exec => {},
+            .tmux => |*t| t.visibilityChanged(td, visible),
+        }
+    }
+
     pub fn resize(
         self: *Backend,
         grid_size: renderer.GridSize,

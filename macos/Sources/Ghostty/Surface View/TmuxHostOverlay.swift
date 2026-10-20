@@ -30,7 +30,7 @@ extension Ghostty {
                         .font(.title2)
                         .multilineTextAlignment(.center)
 
-                    Text("The session's windows are open in their own tabs. Detaching leaves it running in tmux.")
+                    Text("The session's windows are open in their own tabs. Detaching leaves it running in tmux. The dashboard lists the server's sessions and chooses which windows have tabs.")
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
@@ -39,6 +39,10 @@ extension Ghostty {
                         Button("Show Windows") {
                             guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
                             appDelegate.tmuxWindowManager.showWindows(hostedBy: surfaceView)
+                        }
+
+                        Button("Dashboard…") {
+                            surfaceView.tmuxDashboard(nil)
                         }
 
                         Button("Detach") {
