@@ -2866,3 +2866,17 @@ test "live: dragging a divider that leaves a pane alone still moves it" {
     try testing.expectEqual(c - 3, try height(&session, "%2"));
     try testing.expect(!session.exited);
 }
+
+test "live: a synchronized, relatively positioned redraw looks the same here as in tmux" {
+    if (!enabled()) return error.SkipZigTest;
+
+    // How an Ink app (Claude Code) redraws: each frame inside a
+    // synchronized update (2026), moving the cursor back up over the
+    // last frame and erasing each line before drawing it, in box drawing
+    // characters with colours. Relative moves mean any line out of place
+    // or any frame lost shows. Frames keep coming through the attach and
+    // a resize, then stop so the result can be compared.
+    try expectFollowsTmuxThroughResizes(
+        \\printf 'prompt$ claude\r\n'; i=0; while [ $i -lt 60 ]; do printf '\033[?2026h'; [ $i -gt 0 ] && printf '\033[6A\r'; printf '\033[2K\033[38;5;174m╭──────────────────────────────╮\033[0m\r\n'; printf '\033[2K\033[38;5;174m│\033[0m \033[1mframe %03d\033[0m                   \033[38;5;174m│\033[0m\r\n' $i; printf '\033[2K\033[38;5;174m│\033[0m \033[48;5;236m> type here               \033[0m   \033[38;5;174m│\033[0m\r\n'; printf '\033[2K\033[38;5;174m╰──────────────────────────────╯\033[0m\r\n'; printf '\033[2K  \033[2m? for shortcuts\033[0m\r\n\033[2K\r\n'; printf '\033[?2026l'; i=$((i+1)); sleep 0.05; done; exec sleep 60
+    , "0");
+}
