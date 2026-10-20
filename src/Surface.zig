@@ -354,6 +354,8 @@ const DerivedConfig = struct {
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
+    tab_inherit_working_directory: bool,
+    split_inherit_working_directory: bool,
 
     const Link = struct {
         regex: oni.Regex,
@@ -435,6 +437,8 @@ const DerivedConfig = struct {
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
+            .tab_inherit_working_directory = config.@"tab-inherit-working-directory",
+            .split_inherit_working_directory = config.@"split-inherit-working-directory",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -2390,6 +2394,11 @@ pub fn tmuxClosePane(self: *Surface) bool {
 
 /// Ask tmux for a new window, if this surface is a tmux pane.
 ///
+/// The window starts in this pane's working directory, as a new tab
+/// starts in the focused surface's in plain Ghostty, unless
+/// `tab-inherit-working-directory` is off: tmux's own default then, as
+/// `working-directory` would be for a local tab.
+///
 /// Returns false for an ordinary surface, which is the caller's signal to
 /// do the local thing instead.
 fn tmuxNewWindow(self: *Surface) bool {
@@ -2397,7 +2406,9 @@ fn tmuxNewWindow(self: *Surface) bool {
 
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
-    pane.router.newWindow();
+    pane.router.newWindow(
+        if (self.config.tab_inherit_working_directory) pane.id else null,
+    );
     return true;
 }
 
@@ -2562,7 +2573,9 @@ fn tmuxDetach(self: *Surface) bool {
     return true;
 }
 
-/// Ask tmux to split this pane, if this surface is one.
+/// Ask tmux to split this pane, if this surface is one. The new pane
+/// starts in this one's working directory unless
+/// `split-inherit-working-directory` is off, as in plain Ghostty.
 fn tmuxSplit(
     self: *Surface,
     direction: terminal.tmux.Viewer.Input.Split.Direction,
@@ -2571,7 +2584,11 @@ fn tmuxSplit(
 
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
-    pane.router.splitPane(pane.id, direction);
+    pane.router.splitPane(
+        pane.id,
+        direction,
+        self.config.split_inherit_working_directory,
+    );
     return true;
 }
 

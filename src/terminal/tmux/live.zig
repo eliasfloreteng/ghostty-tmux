@@ -1534,7 +1534,7 @@ test "live: a new tab is a new tmux window" {
     try session.waitFor(attached);
     try testing.expectEqual(1, session.viewer.windows.items.len);
 
-    try session.input(.new_window);
+    try session.input(.{ .new_window = .{} });
 
     // tmux answers with %window-add, which re-lists, which is what makes
     // the window appear here. Nothing is remembered in between.
@@ -1551,6 +1551,74 @@ test "live: a new tab is a new tmux window" {
     });
     defer alloc.free(count);
     try testing.expectEqualStrings("2", std.mem.trim(u8, count, " \r\n"));
+    try testing.expect(!session.exited);
+}
+
+test "live: a new split and a new tab start where their pane is" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    // A directory whose name tmux would mangle if it were not quoted
+    // and escaped: a quote, a space, and what would be a format.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "it's #{host} here");
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPathFile(
+        testing.io,
+        "it's #{host} here",
+        &buf,
+    )];
+
+    // Every new pane runs `sleep`, which stays where it is started; a
+    // shell's startup files might not. `-c` is a format even from the
+    // command line, hence the doubled `#`.
+    const escaped = try std.mem.replaceOwned(u8, alloc, dir, "#", "##");
+    defer alloc.free(escaped);
+    for ([_][]const []const u8{
+        &.{ "set-option", "-g", "default-command", "sleep 60" },
+        &.{ "respawn-pane", "-k", "-t", "%0", "-c", escaped, "sleep 60" },
+    }) |args| alloc.free(try session.ask(args));
+
+    // What the subscription says, which is all `-c` is made from.
+    @memcpy(session.scratch[0..dir.len], dir);
+    session.scratch_len = dir.len;
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(0) orelse return false;
+            return std.mem.eql(u8, pane.path, v.scratch[0..v.scratch_len]);
+        }
+    }.pred);
+
+    try session.input(.{ .split = .{
+        .pane_id = 0,
+        .direction = .right,
+        .inherit_working_directory = true,
+    } });
+    try session.input(.{ .new_window = .{ .inherit_from = 0 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 3 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // tmux's own word for where each pane is.
+    const out = try session.ask(&.{
+        "list-panes", "-s", "-F", "#{pane_current_path}",
+    });
+    defer alloc.free(out);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| : (n += 1) {
+        try testing.expectEqualStrings(dir, line);
+    }
+    try testing.expectEqual(3, n);
     try testing.expect(!session.exited);
 }
 
