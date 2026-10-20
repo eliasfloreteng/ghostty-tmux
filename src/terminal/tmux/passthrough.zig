@@ -91,8 +91,8 @@ pub const Unwrapper = struct {
         string_esc,
     };
 
-    /// Whether output without an ESC in it would come out of `feed` as
-    /// it went in, so a caller can skip it.
+    /// Whether nothing is held back or open: no partial prefix, and no
+    /// passthrough or wrapped sequence under way.
     pub fn idle(self: *const Unwrapper) bool {
         return self.state == .ground and self.inner == .ground;
     }
@@ -124,16 +124,41 @@ pub const Unwrapper = struct {
         while (i < input.len) {
             switch (self.state) {
                 .ground => {
-                    const end = std.mem.indexOfScalarPos(
+                    // The pane's output runs up to the next ESC that opens
+                    // a passthrough, as one slice of `input`, however many
+                    // other escape sequences are in it: a TUI's output is
+                    // mostly escape sequences, and splitting at each would
+                    // hand the parser and every display a run per colour.
+                    // Only a prefix the input ends part way into has to be
+                    // held back to find out what it is.
+                    var pos = i;
+                    const esc = while (std.mem.indexOfScalarPos(
                         u8,
                         input,
-                        i,
+                        pos,
                         0x1B,
-                    ) orelse input.len;
-                    if (end > i) try self.pane(input[i..end], handler);
-                    if (end == input.len) return;
-                    self.state = .{ .prefix = 1 };
-                    i = end + 1;
+                    )) |esc| {
+                        const seen = @min(input.len - esc, prefix.len);
+                        if (std.mem.eql(
+                            u8,
+                            input[esc..][0..seen],
+                            prefix[0..seen],
+                        )) break esc;
+                        pos = esc + 1;
+                    } else input.len;
+
+                    if (esc > i) try self.pane(input[i..esc], handler);
+                    if (esc == input.len) return;
+
+                    const seen = @min(input.len - esc, prefix.len);
+                    if (seen < prefix.len) {
+                        self.state = .{ .prefix = @intCast(seen) };
+                        return;
+                    }
+
+                    // `inner` is left as it was: see `.prefix`.
+                    self.state = .body;
+                    i = esc + prefix.len;
                 },
 
                 .prefix => |n| {
@@ -277,12 +302,17 @@ const TestCollector = struct {
     alloc: std.mem.Allocator,
     runs: std.ArrayList(struct { kind: Kind, bytes: std.ArrayList(u8) }) = .empty,
 
+    /// Every call to `emit`, before adjacent runs of a kind are joined:
+    /// how finely the output was cut.
+    emits: usize = 0,
+
     fn deinit(self: *TestCollector) void {
         for (self.runs.items) |*r| r.bytes.deinit(self.alloc);
         self.runs.deinit(self.alloc);
     }
 
     pub fn emit(self: *TestCollector, kind: Kind, bytes: []const u8) !void {
+        self.emits += 1;
         if (self.runs.items.len == 0 or
             self.runs.items[self.runs.items.len - 1].kind != kind)
         {
@@ -417,4 +447,80 @@ test "an ESC inside a wrapped string ends it" {
     // second rather than by ST.
     _ = try unwrapAll(&.{"\x1bPtmux;\x1b\x1b]9;a\x1b\x1b]9;b\x07\x1b\\"}, &c);
     try c.expect(&.{.{ .passthrough, "\x1b]9;a\x1b\\\x1b]9;b\x07" }});
+}
+
+test "a pane's escape sequences come out as one run, in place" {
+    // A TUI's repaint: colours, cursor moves, an OSC, and a DCS that is
+    // not tmux's, with no passthrough anywhere.
+    const input = "\x1b[?2026h\x1b[1;1H\x1b[32m\xe2\x94\x82\x1b[m\x0f row\x1b[K" ++
+        "\x1b]0;t\x07\x1bPq#0\x1b\\\x1bP\x1bPt\x1b[?2026l";
+
+    const Recorder = struct {
+        input: []const u8,
+        calls: usize = 0,
+
+        pub fn emit(self: *@This(), kind: Kind, bytes: []const u8) !void {
+            self.calls += 1;
+            try testing.expectEqual(Kind.pane, kind);
+            // A slice of the input itself, not a copy or a constant.
+            try testing.expectEqual(self.input.ptr, bytes.ptr);
+            try testing.expectEqual(self.input.len, bytes.len);
+        }
+    };
+
+    var r: Recorder = .{ .input = input };
+    var u: Unwrapper = .{};
+    try u.feed(input, &r);
+    try testing.expectEqual(1, r.calls);
+    try testing.expect(u.idle());
+}
+
+test "pane output either side of a passthrough is a run each" {
+    var c: TestCollector = .{ .alloc = testing.allocator };
+    defer c.deinit();
+    _ = try unwrapAll(&.{
+        "\x1b[31ma\x1b[m\x1bPtmux;\x1b\x1b]9;hi\x07\x1b\\\x1b[2Jb\x1b[H",
+    }, &c);
+    try c.expect(&.{
+        .{ .pane, "\x1b[31ma\x1b[m" },
+        .{ .passthrough, "\x1b]9;hi\x07" },
+        .{ .pane, "\x1b[2Jb\x1b[H" },
+    });
+    // Left of it, the wrapped OSC (its start, body and BEL), right of it.
+    try testing.expectEqual(5, c.emits);
+}
+
+test "an input ending part way into a prefix holds only the prefix back" {
+    inline for (1..prefix.len) |held| {
+        var c: TestCollector = .{ .alloc = testing.allocator };
+        defer c.deinit();
+
+        var u: Unwrapper = .{};
+        try u.feed("\x1b[1mbold" ++ prefix[0..held], &c);
+        try c.expect(&.{.{ .pane, "\x1b[1mbold" }});
+        try testing.expect(!u.idle());
+
+        // It was a passthrough after all.
+        try u.feed(prefix[held..] ++ "\x1b\x1b]9;x\x07\x1b\\after", &c);
+        try c.expect(&.{
+            .{ .pane, "\x1b[1mbold" },
+            .{ .passthrough, "\x1b]9;x\x07" },
+            .{ .pane, "after" },
+        });
+        try testing.expect(u.idle());
+    }
+}
+
+test "a held prefix that turns out not to be ours is given back whole" {
+    inline for (1..prefix.len) |held| {
+        var c: TestCollector = .{ .alloc = testing.allocator };
+        defer c.deinit();
+        // The byte after the held part breaks the prefix, and is itself
+        // an ESC starting a colour.
+        _ = try unwrapAll(&.{
+            "a" ++ prefix[0..held],
+            "\x1b[1mb",
+        }, &c);
+        try c.expect(&.{.{ .pane, "a" ++ prefix[0..held] ++ "\x1b[1mb" }});
+    }
 }
