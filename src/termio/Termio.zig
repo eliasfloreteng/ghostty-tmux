@@ -225,6 +225,7 @@ pub const DerivedConfig = struct {
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
     tmux_pause_after: u32,
+    tmux_hidden_output_off_after: u32,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -264,6 +265,7 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .tmux_pause_after = config.@"tmux-pause-after",
+            .tmux_hidden_output_off_after = config.@"tmux-hidden-output-off-after",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
@@ -516,6 +518,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .zoomPane = tmuxHostZoomPane,
     .moveWindow = tmuxHostMoveWindow,
     .renameWindow = tmuxHostRenameWindow,
+    .paneShown = tmuxHostPaneShown,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -623,6 +626,14 @@ fn tmuxHostMoveWindow(ctx: *anyopaque, pane_id: usize, amount: isize) void {
     self.tmuxHostInput(.{ .move_window = .{
         .pane_id = pane_id,
         .amount = amount,
+    } });
+}
+
+fn tmuxHostPaneShown(ctx: *anyopaque, pane_id: usize, shown: bool) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .pane_shown = .{
+        .pane_id = pane_id,
+        .shown = shown,
     } });
 }
 
@@ -1065,6 +1076,13 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 
     // We always notify our backend of focus changes.
     try self.backend.focusGained(td, focused);
+}
+
+/// Whether the surface can be seen: it is in a selected tab of a window
+/// that is neither minimized nor covered. Only a tmux pane cares, to let
+/// tmux stop sending output nobody can see.
+pub fn visibilityChanged(self: *Termio, td: *ThreadData, visible: bool) void {
+    self.backend.visibilityChanged(td, visible);
 }
 
 /// Process output from the pty. This is the manual API that users can

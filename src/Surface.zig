@@ -3709,6 +3709,10 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
         } }, .unlocked);
     }
 
+    // The backend may care whatever the program asked for: a tmux pane
+    // tells tmux, which can stop sending output nobody can see.
+    self.queueIo(.{ .visible = visible }, .unlocked);
+
     _ = self.renderer_thread.mailbox.push(global.io(), .{
         .visible = visible,
     }, .{ .forever = {} });
