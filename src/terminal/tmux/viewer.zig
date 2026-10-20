@@ -3188,6 +3188,7 @@ pub const Viewer = struct {
             .{ .switch_screen = .primary },
             .erase_and_home,
             .{ .bytes = control.unescape(buf, saved) },
+            .trim_trailing_blanks,
         });
     }
 
@@ -3214,6 +3215,7 @@ pub const Viewer = struct {
             .{ .switch_screen = screen_key },
             .erase_and_home,
             .{ .bytes = control.unescape(buf, content) },
+            .trim_trailing_blanks,
         });
     }
 
@@ -3625,14 +3627,14 @@ const Command = union(enum) {
                 //   is in the alternate screen and holds the primary
                 // (no -q: "no alternate screen" is the answer we want)
                 // The rest as above.
-                "capture-pane -p -e -C -a -t %{d}\n",
+                "capture-pane -p -e -C -N -a -t %{d}\n",
                 .{id},
             ),
 
             .pane_visible => |id| try writer.print(
                 // The grid on display, as above.
                 // (no -S/-E = capture visible area only)
-                "capture-pane -p -e -C -q -t %{d}\n",
+                "capture-pane -p -e -C -N -q -t %{d}\n",
                 .{id},
             ),
 
@@ -4021,11 +4023,11 @@ test "initial flow" {
             .contains_tags = &.{.windows},
             .commands = &.{
                 "capture-pane -p -e -C -q -S - -E -1 -t %0",
-                "capture-pane -p -e -C -a -t %0",
-                "capture-pane -p -e -C -q -t %0",
+                "capture-pane -p -e -C -N -a -t %0",
+                "capture-pane -p -e -C -N -q -t %0",
                 "capture-pane -p -e -C -q -S - -E -1 -t %1",
-                "capture-pane -p -e -C -a -t %1",
-                "capture-pane -p -e -C -q -t %1",
+                "capture-pane -p -e -C -N -a -t %1",
+                "capture-pane -p -e -C -N -q -t %1",
                 "list-panes -s -F",
             },
         },
@@ -4284,8 +4286,8 @@ test "layout_change does not wait for commands already in flight" {
             .contains_tags = &.{.windows},
             .commands = &.{
                 "capture-pane -p -e -C -q -S - -E -1 -t %2",
-                "capture-pane -p -e -C -a -t %2",
-                "capture-pane -p -e -C -q -t %2",
+                "capture-pane -p -e -C -N -a -t %2",
+                "capture-pane -p -e -C -N -q -t %2",
                 "list-panes",
             },
             .check = (struct {
@@ -4826,8 +4828,8 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
         "display-message",
         "list-windows",
         "capture-pane -p -e -C -q -S - -E -1 -t %42\n",
-        "capture-pane -p -e -C -a -t %42\n",
-        "capture-pane -p -e -C -q -t %42\n",
+        "capture-pane -p -e -C -N -a -t %42\n",
+        "capture-pane -p -e -C -N -q -t %42\n",
         "list-panes",
     };
 

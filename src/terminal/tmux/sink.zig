@@ -101,6 +101,23 @@ pub const Op = union(enum) {
     /// the kitty keyboard flags) tmux has no way to tell us again.
     erase_all,
 
+    /// Turn the blanks a capture padded each row out with back into the
+    /// empty cells they were.
+    ///
+    /// A capture without `-N` stops each row at its last non-blank cell,
+    /// which throws away every trailing cell painted only with a
+    /// background or reverse video: the bar along the bottom of a TUI,
+    /// a highlighted selection line, a panel's fill. The program drew
+    /// those once and has no reason to draw them again, so they stay
+    /// missing. `-N` keeps them, but as spaces in whatever style was
+    /// current, and spaces are text: they would be copied with a
+    /// selection and carried by a reflow. So the visible captures ask
+    /// for `-N` and follow their replay with this, which empties every
+    /// trailing space with the default style on rows that do not wrap,
+    /// leaving exactly the cells a trimmed capture would have left plus
+    /// the styled ones it would have lost.
+    trim_trailing_blanks,
+
     /// Cursor position, modes, scroll region and tab stops, as tmux
     /// reported them.
     pane_state: PaneStateData,
@@ -145,6 +162,7 @@ pub const Op = union(enum) {
             .scroll_into_history,
             .erase_and_home,
             .erase_all,
+            .trim_trailing_blanks,
             .resize,
             => self,
         };
@@ -237,12 +255,41 @@ pub fn applyOp(
             t.setCursorPos(1, 1);
         },
 
+        .trim_trailing_blanks => trimTrailingBlanks(t),
+
         .pane_state => |data| try applyPaneState(t, data),
 
         .resize => |v| try t.resize(alloc, .{
             .cols = v.cols,
             .rows = v.rows,
         }),
+    }
+}
+
+/// See `Op.trim_trailing_blanks`. Only the active area of the active
+/// screen: that is where a visible capture lands.
+fn trimTrailingBlanks(t: *Terminal) void {
+    const screen = t.screens.active;
+    for (0..t.rows) |y| {
+        const pin = screen.pages.pin(.{ .active = .{
+            .y = @intCast(y),
+        } }) orelse continue;
+
+        // A wrapped row's trailing spaces are part of its line, and a
+        // full one has nothing trailing to trim.
+        if (pin.rowAndCell().row.wrap) continue;
+
+        const cells = pin.cells(.all);
+        var x = cells.len;
+        while (x > 0) : (x -= 1) {
+            const cell = &cells[x - 1];
+            if (cell.content_tag != .codepoint or
+                cell.content.codepoint.data != ' ' or
+                cell.style_id != 0 or
+                cell.hyperlink or
+                cell.wide != .narrow) break;
+            cell.content.codepoint.data = 0;
+        }
     }
 }
 
@@ -421,6 +468,7 @@ test "cloning a payload-free op copies it as-is" {
         .scroll_into_history,
         .erase_and_home,
         .erase_all,
+        .trim_trailing_blanks,
         .{ .resize = .{ .cols = 80, .rows = 24 } },
     };
 
@@ -457,4 +505,41 @@ test "erase_all clears the scrollback as well as the display" {
 
     // Content only: modes are left alone.
     try testing.expect(t.modes.get(.bracketed_paste));
+}
+
+test "trim_trailing_blanks empties plain padding and keeps painted cells" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{ .cols = 8, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // What `capture-pane -N -e` sends: a word padded with plain spaces,
+    // a bar painted in a colour, and a word followed by reverse video.
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ab      ");
+    stream.nextSlice("\x1b[2;1H\x1b[44m        \x1b[49m");
+    stream.nextSlice("\x1b[3;1Hc \x1b[7m  \x1b[27m    ");
+
+    try applyOp(alloc, &t, .trim_trailing_blanks);
+
+    const screen = t.screens.active;
+    const cell = struct {
+        fn at(s: anytype, x: u16, y: u16) @import("../page.zig").Cell {
+            return s.pages.getCell(.{ .active = .{ .x = x, .y = y } }).?.cell.*;
+        }
+    }.at;
+
+    // Plain padding is gone: empty cells, as a trimmed capture leaves.
+    try testing.expectEqual(@as(u21, 'b'), cell(screen, 1, 0).codepoint());
+    for (2..8) |x| try testing.expectEqual(@as(u21, 0), cell(screen, @intCast(x), 0).codepoint());
+
+    // The painted bar is all still there.
+    for (0..8) |x| try testing.expect(cell(screen, @intCast(x), 1).style_id != 0);
+
+    // Reverse video blanks are kept, the plain ones after them are not,
+    // and the plain space before them is inner, so it stays.
+    try testing.expectEqual(@as(u21, ' '), cell(screen, 1, 2).codepoint());
+    try testing.expect(cell(screen, 2, 2).style_id != 0);
+    try testing.expect(cell(screen, 3, 2).style_id != 0);
+    for (4..8) |x| try testing.expectEqual(@as(u21, 0), cell(screen, @intCast(x), 2).codepoint());
 }
