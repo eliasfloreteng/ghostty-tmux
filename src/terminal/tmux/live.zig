@@ -2645,3 +2645,115 @@ test "live: an attach shows exactly what tmux has, background colours included" 
     try expectMatchesTmux(&session, 0);
     try testing.expect(!session.exited);
 }
+
+/// Pump until tmux has been quiet for a while: nothing read for
+/// `quiet_ms`, and nothing of ours waiting on a reply. A TUI repaints in
+/// bursts, and comparing in the middle of one compares two moments.
+fn settle(session: *Session, quiet_ms: u64) !void {
+    var quiet: u64 = 0;
+    var rounds: usize = 0;
+    while (rounds < timeout_ms / poll_ms) : (rounds += 1) {
+        if (try session.pump() or !session.viewer.command_queue.empty()) {
+            quiet = 0;
+        } else {
+            quiet += poll_ms;
+            if (quiet >= quiet_ms) return;
+        }
+    }
+    return error.TimedOutWaitingForTmux;
+}
+
+/// Resize a lone pane the way its surface would, and wait until tmux
+/// has done it and the program in it has repainted.
+fn resizeAndSettle(session: *Session, pane_id: usize, cols: u16, rows: u16) !void {
+    try session.input(.{ .resize = .{
+        .pane_id = pane_id,
+        .cols = cols,
+        .rows = rows,
+    } });
+
+    const target = try std.fmt.allocPrint(session.alloc, "%{d}", .{pane_id});
+    defer session.alloc.free(target);
+    var want_buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{d}x{d}", .{ cols, rows });
+
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        if (rounds >= timeout_ms / poll_ms) return error.TimedOutWaitingForTmux;
+        _ = try session.pump();
+        const out = try session.ask(&.{
+            "display-message", "-p", "-t", target, "#{pane_width}x#{pane_height}",
+        });
+        defer session.alloc.free(out);
+        if (std.mem.eql(u8, std.mem.trim(u8, out, " \r\n"), want)) break;
+    }
+    try settle(session, 400);
+}
+
+/// Attach to `command`, check the pane against tmux, then put it through
+/// the resizes a window goes through (growing to fullscreen, shrinking
+/// back, a narrower window) and check it after each.
+fn expectFollowsTmuxThroughResizes(command: []const u8, ready: []const u8) !void {
+    const alloc = testing.allocator;
+    var session = try Session.startWith(alloc, testing.io, 80, 24, command, .{
+        .ready = .{ .target = ":0", .format = "#{alternate_on}", .expect = ready },
+    });
+    defer session.deinit();
+    try session.waitFor(attached);
+    const pane_id = session.viewer.windows.items[0].layout.content.pane;
+    try settle(&session, 400);
+
+    try expectMatchesTmux(&session, pane_id);
+
+    const sizes = [_][2]u16{ .{ 132, 40 }, .{ 80, 24 }, .{ 60, 30 }, .{ 100, 18 } };
+    for (sizes) |s| {
+        resizeAndSettle(&session, pane_id, s[0], s[1]) catch |err| {
+            log.err("resizing to {d}x{d} failed", .{ s[0], s[1] });
+            return err;
+        };
+        expectMatchesTmux(&session, pane_id) catch |err| {
+            log.err("after resizing to {d}x{d}", .{ s[0], s[1] });
+            return err;
+        };
+    }
+    try testing.expect(!session.exited);
+}
+
+/// A throwaway git repository with something to show, and lazygit in it
+/// with a config directory of its own, so nothing about the machine
+/// leaks in and nothing is fetched.
+const lazygit_command =
+    \\d=$(mktemp -d) && cd "$d" && git init -q && printf 'one\n' > a && git add a && git -c user.name=t -c user.email=t@t commit -qm first && printf 'two\n' >> a && printf 'new\n' > b && mkdir cfg && printf 'git:\n  autoFetch: false\nupdate:\n  method: never\ndisableStartupPopups: true\n' > cfg/config.yml && exec lazygit -ucd "$d/cfg"
+;
+
+test "live: lazygit looks the same here as in tmux, through resizes" {
+    if (!enabled()) return error.SkipZigTest;
+    if (!haveCommand("lazygit")) return error.SkipZigTest;
+    try expectFollowsTmuxThroughResizes(lazygit_command, "1");
+}
+
+test "live: neovim looks the same here as in tmux, through resizes" {
+    if (!enabled()) return error.SkipZigTest;
+    if (!haveCommand("nvim")) return error.SkipZigTest;
+    try expectFollowsTmuxThroughResizes(
+        \\d=$(mktemp -d) && seq -f 'line %g of a file long enough to need wrapping when the window is narrow' 1 200 > "$d/f" && exec nvim --clean -c 'set number cursorline laststatus=2 wrap' -c 'normal 40G' "$d/f"
+    , "1");
+}
+
+test "live: a shell with long wrapped lines looks the same here as in tmux, through resizes" {
+    if (!enabled()) return error.SkipZigTest;
+
+    // The primary screen, which both sides reflow on a resize. Lines long
+    // enough to wrap at every width used, so the wrap of each one decides
+    // where everything after it lands.
+    try expectFollowsTmuxThroughResizes(
+        \\seq -f 'a long line number %g that goes on and on and wraps at narrower widths for sure' 1 30; printf '\033[44mtail\033[K\033[0m\n$ '; exec sleep 60
+    , "0");
+}
+
+/// Whether a program is on PATH, for tests that drive one.
+fn haveCommand(name: []const u8) bool {
+    const out = run(testing.allocator, &.{ "sh", "-c", "command -v \"$0\"", name }) catch return false;
+    testing.allocator.free(out);
+    return true;
+}
