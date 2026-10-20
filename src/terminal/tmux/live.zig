@@ -46,6 +46,8 @@ const ptypkg = @import("../../pty.zig");
 const osfile = @import("../../os/file.zig");
 const global = @import("../../global.zig");
 const Viewer = @import("viewer.zig").Viewer;
+const sinkpkg = @import("sink.zig");
+const Sink = sinkpkg.Sink;
 
 const log = std.log.scoped(.tmux_live);
 
@@ -2439,5 +2441,161 @@ test "live: characters are as wide here as tmux makes them" {
 
         try session.input(.{ .write = .{ .pane_id = pane_id, .data = "\r" } });
     }
+    try testing.expect(!session.exited);
+}
+
+/// A sink that keeps what a display would be handed as passthrough, which
+/// the viewer's own terminal skips.
+const PassthroughSink = struct {
+    alloc: Allocator,
+    passthrough: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *PassthroughSink) void {
+        self.passthrough.deinit(self.alloc);
+    }
+
+    fn sink(self: *PassthroughSink) Sink {
+        return .{ .ctx = self, .vtable = &.{
+            .ops = ops,
+            .close = close,
+        } };
+    }
+
+    fn ops(ctx: *anyopaque, list: []const sinkpkg.Op) void {
+        const self: *PassthroughSink = @ptrCast(@alignCast(ctx));
+        for (list) |op| switch (op) {
+            .passthrough => |b| self.passthrough.appendSlice(
+                self.alloc,
+                b,
+            ) catch @panic("OOM"),
+            else => {},
+        };
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
+test "live: a notification wrapped for tmux's passthrough reaches the display" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    var session = try Session.start(alloc, testing.io, 80, 24, "sh");
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    var recorder: PassthroughSink = .{ .alloc = alloc };
+    defer recorder.deinit();
+    try session.viewer.attachPane(0, recorder.sink());
+
+    // As Claude Code writes them with $TMUX set, and with
+    // `allow-passthrough` at its default, off: tmux sends a control
+    // client the pane's raw output either way. The text and cursor
+    // movement in the second wrapper are not for us. The text is spelled
+    // through a variable so that the echoed command line does not show
+    // it either.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "j=junk; printf '\\033Ptmux;\\033\\033]777;notify;Claude Code;done\\033\\033\\\\\\033\\\\" ++
+            "\\033Ptmux;'\"$j\"'-text\\033\\033[H\\033\\033]9;nine\\007\\033\\\\'; echo; echo END\r",
+    } });
+    try session.waitForPaneText(0, "\nEND");
+
+    var rounds: usize = 0;
+    while (rounds < timeout_ms / poll_ms and
+        std.mem.indexOf(u8, recorder.passthrough.items, "nine") == null) : (rounds += 1)
+    {
+        _ = try session.pump();
+    }
+    try testing.expectEqualStrings(
+        "\x1b]777;notify;Claude Code;done\x1b\\\x1b]9;nine\x07",
+        recorder.passthrough.items,
+    );
+
+    const text = try session.paneText(0);
+    defer alloc.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "junk-text") == null);
+    try testing.expect(!session.exited);
+}
+
+test "live: OSC 8 hyperlinks survive the attach capture and live output" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // tmux keeps a pane's hyperlinks in its grid whatever the clients'
+    // `hyperlinks` terminal feature says (that only decides whether tmux
+    // draws them on a tty client), `capture-pane -e` writes them back
+    // out as OSC 8, and live output carries the program's own OSC 8 raw.
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "printf '\\033]8;;https://example.com/old\\033\\\\OLD\\033]8;;\\033\\\\\\r\\n'; exec sh",
+        // The link has been printed once the cursor is on the next line.
+        .{ .ready = .{
+            .target = ":0",
+            .format = "#{cursor_y}",
+            .expect = "1",
+        } },
+    );
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    // Captured on attach.
+    try testing.expect(paneHasLink(&session, "https://example.com/old"));
+
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "printf '\\033]8;;https://example.com/new\\033\\\\NEW\\033]8;;\\033\\\\\\n'\r",
+    } });
+    try session.waitForPaneText(0, "\nNEW");
+    try testing.expect(paneHasLink(&session, "https://example.com/new"));
+    try testing.expect(!session.exited);
+}
+
+/// Whether a row of pane 0 starts with a hyperlink to `uri`.
+fn paneHasLink(session: *Session, uri: []const u8) bool {
+    const pane = session.viewer.panes.get(0).?;
+    const screen: *Screen = pane.terminal.screens.active;
+    var it = screen.pages.rowIterator(.right_down, .{ .screen = .{} }, null);
+    while (it.next()) |row| {
+        const cell = &row.cells(.all)[0];
+        if (!cell.hyperlink) continue;
+        const page = row.node.page();
+        const id = page.lookupHyperlink(cell) orelse continue;
+        const link = page.hyperlink_set.get(page.memory, id);
+        if (std.mem.eql(u8, link.uri.slice(page.memory), uri)) return true;
+    }
+    return false;
+}
+
+test "live: a pane's modifyOtherKeys is restored on attach" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // tmux only records the request with `extended-keys` on.
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "printf '\\033[>4;2m'; sleep 60",
+        .{
+            .config = "set -s extended-keys on",
+            .ready = .{
+                .target = ":0",
+                .format = "#{pane_key_mode}",
+                .expect = "Ext 2",
+            },
+        },
+    );
+    defer session.deinit();
+    try session.waitFor(attached);
+
+    const pane = session.viewer.panes.get(0).?;
+    try testing.expect(pane.terminal.flags.modify_other_keys_2);
     try testing.expect(!session.exited);
 }
