@@ -123,6 +123,7 @@ Not done yet, roughly in order of usefulness:
   consumes or rewrites, and how tools detect the terminal when
   `TERM_PROGRAM` is `tmux`.
 - Bell, activity and silence markers on tabs from tmux's window flags.
+- Passthrough of pressing hyperlinks.
 - Mirroring tab drag-and-drop (reorder, tear off) to tmux.
 - Per-pane titles (`#{pane_title}`) on splits.
 - A session picker / dashboard: list sessions, attach, choose which windows
