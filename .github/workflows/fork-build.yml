@@ -24,6 +24,20 @@
 #   APPLE_NOTARY_KEY     an App Store Connect API key (.p8 contents)
 #   APPLE_NOTARY_KEY_ID  its key ID
 #   APPLE_NOTARY_ISSUER  its issuer ID
+#
+# Updates. The app updates itself from this fork's releases with Sparkle
+# when this secret is set:
+#
+#   SPARKLE_PRIVATE_KEY  a Sparkle EdDSA private key, as exported by
+#                        Sparkle's `generate_keys -x <file>`
+#
+# The build then carries the matching public key and reads the appcast
+# attached to the latest release, and each release of main gets an
+# appcast.xml listing itself, signed with the key along with its
+# download. Builds of other branches are prereleases with none. Without
+# the secret a release has no appcast and its app's updater is disabled.
+# Updates work for ad-hoc signed builds too, since Sparkle trusts the
+# EdDSA signature; changing the key later strands every installed build.
 name: Build fork
 
 on:
@@ -57,6 +71,10 @@ jobs:
       # Secrets cannot be tested in a step's `if`, so expose whether they
       # are set.
       NOTARIZE: ${{ secrets.APPLE_NOTARY_KEY_ID != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+      # Only a build of main becomes the latest release, and so an update.
+      # A build of another branch (by hand) is released as a prerelease,
+      # without an appcast. After a sync, github.ref is main too.
+      MAIN: ${{ github.ref == 'refs/heads/main' }}
     steps:
       # After a sync, build what the sync pushed: the tip of main, not the
       # commit the sync workflow itself ran on.
@@ -147,9 +165,26 @@ jobs:
           echo "Signing as $IDENTITY." | tee -a "$GITHUB_STEP_SUMMARY"
           echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
 
+      # The public key is derived from the private one, so the app can never
+      # carry a key that does not verify its own updates.
+      - name: Read update key
+        if: steps.release.outputs.exists == 'false'
+        id: updates
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "No SPARKLE_PRIVATE_KEY; the updater is disabled and no appcast is published." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          key=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | swift dist/macos/sparkle-public-key.swift)
+          echo "Updates from this fork's releases, verified with $key." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "public-key=$key" >> "$GITHUB_OUTPUT"
+
       - name: Package Ghostty tmux.app
         if: steps.release.outputs.exists == 'false'
         env:
+          FORK_SPARKLE_PUBLIC_KEY: ${{ steps.updates.outputs.public-key }}
           SIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
           # Notarization requires a secure timestamp.
           SIGN_TIMESTAMP: ${{ env.NOTARIZE == 'true' && '1' || '' }}
@@ -178,8 +213,42 @@ jobs:
       - name: Zip
         if: steps.release.outputs.exists == 'false'
         run: |
+          mkdir "$RUNNER_TEMP/release"
           cd "$RUNNER_TEMP"
-          ditto -c -k --sequesterRsrc --keepParent "Ghostty tmux.app" Ghostty-tmux.zip
+          ditto -c -k --sequesterRsrc --keepParent "Ghostty tmux.app" release/Ghostty-tmux.zip
+
+      # The appcast lists this release alone: the app reads the appcast of
+      # whichever release is the latest, so the newest build is all it
+      # needs. Sparkle's own generate_appcast signs the download and, as
+      # the app requires (SURequireSignedFeed), the appcast itself.
+      - name: Generate appcast
+        if: steps.release.outputs.exists == 'false' && steps.updates.outputs.public-key != '' && env.MAIN == 'true'
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          TAG: ${{ steps.release.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The tools of the Sparkle the app is built with.
+          sparkle_version=$(jq -r '.pins[] | select(.identity == "sparkle") | .state.version' \
+            macos/Ghostty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved)
+          sparkle="$RUNNER_TEMP/sparkle"
+          mkdir "$sparkle"
+          curl -fsSL -o "$sparkle/sparkle.zip" \
+            "https://github.com/sparkle-project/Sparkle/releases/download/$sparkle_version/Sparkle-for-Swift-Package-Manager.zip"
+          unzip -q "$sparkle/sparkle.zip" -d "$sparkle"
+
+          appcast="$RUNNER_TEMP/release/appcast.xml"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle/bin/generate_appcast" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/$REPO/releases/download/$TAG/" \
+            --link "https://github.com/$REPO/releases/tag/$TAG" \
+            -o "$appcast" \
+            "$RUNNER_TEMP/release"
+
+          # Never publish an appcast the app would reject.
+          grep -q 'sparkle:edSignature=' "$appcast"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$sparkle/bin/sign_update" --verify --ed-key-file - "$appcast"
+          echo "Generated a signed appcast." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish release
         if: steps.release.outputs.exists == 'false'
@@ -188,25 +257,45 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
           SHA: ${{ steps.release.outputs.sha }}
           IDENTITY: ${{ steps.cert.outputs.identity }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          version=$("macos/build/ReleaseLocal/Ghostty.app/Contents/MacOS/ghostty" +version | sed -n 's/^Ghostty //p' | head -1)
+          app="$RUNNER_TEMP/Ghostty tmux.app"
+          plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$app/Contents/Info.plist" 2>/dev/null; }
+          version=$(plist CFBundleShortVersionString)
+          build=$(plist CFBundleVersion)
           if [ "$IDENTITY" = "-" ]; then
             signing="Ad-hoc signed. After unzipping, run \`xattr -dr com.apple.quarantine \"Ghostty tmux.app\"\` once."
           else
             signing="Signed as $IDENTITY."
           fi
+          if plist SUFeedURL > /dev/null; then
+            updates="It updates itself to the latest build of \`main\` (Check for Updates…, or the \`auto-update\` option)."
+          else
+            updates="It does not update itself: this build was made without an update key."
+          fi
+          assets=("$RUNNER_TEMP/release/Ghostty-tmux.zip")
+          if [ -f "$RUNNER_TEMP/release/appcast.xml" ]; then
+            assets+=("$RUNNER_TEMP/release/appcast.xml")
+          fi
+          if [ "$MAIN" = true ]; then
+            latest=--latest
+          else
+            latest=--prerelease
+          fi
           {
-            echo "Ghostty with native tmux control mode, built from \`main\` at $SHA."
+            echo "Ghostty with native tmux control mode, built from \`$BRANCH\` at $SHA."
             echo
-            echo "Version: \`$version\`"
+            echo "Version: \`$version\` (build $build)"
             echo
             echo "$signing"
             echo
-            echo "Changes since the previous build: see the commits of \`main\`."
+            echo "$updates"
+            echo
+            echo "Changes since the previous build: see the commits of \`$BRANCH\`."
           } > "$RUNNER_TEMP/notes.md"
-          gh release create "$TAG" "$RUNNER_TEMP/Ghostty-tmux.zip" \
+          gh release create "$TAG" "${assets[@]}" \
             --target "$(git rev-parse HEAD)" \
             --title "Ghostty tmux $(date -u +%Y-%m-%d) ($SHA)" \
             --notes-file "$RUNNER_TEMP/notes.md" \
-            --latest
+            "$latest"
           echo "Published $TAG." >> "$GITHUB_STEP_SUMMARY"

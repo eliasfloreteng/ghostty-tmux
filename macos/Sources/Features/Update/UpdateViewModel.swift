@@ -316,8 +316,7 @@ enum UpdateState: Equatable {
         let reply: @Sendable (SPUUserUpdateChoice) -> Void
 
         var releaseNotes: ReleaseNotes? {
-            let currentCommit = Bundle.main.infoDictionary?["GhosttyCommit"] as? String
-            return ReleaseNotes(displayVersionString: appcastItem.displayVersionString, currentCommit: currentCommit)
+            ReleaseNotes(appcastItem: appcastItem)
         }
     }
 
@@ -325,6 +324,22 @@ enum UpdateState: Equatable {
         case commit(URL)
         case compareTip(URL)
         case tagged(URL)
+        case release(URL)
+
+        /// The release notes of an update. A build that updates from its own
+        /// feed (`SUFeedURL` in its Info.plist, as a fork's does) links to
+        /// the page the appcast item names, the release it came from; any
+        /// other links to Ghostty's notes for the item's version.
+        init?(appcastItem: SUAppcastItem, bundle: Bundle = .main) {
+            if bundle.object(forInfoDictionaryKey: "SUFeedURL") != nil {
+                guard let url = appcastItem.infoURL else { return nil }
+                self = .release(url)
+                return
+            }
+
+            let currentCommit = bundle.infoDictionary?["GhosttyCommit"] as? String
+            self.init(displayVersionString: appcastItem.displayVersionString, currentCommit: currentCommit)
+        }
 
         init?(displayVersionString: String, currentCommit: String?) {
             let version = displayVersionString
@@ -374,6 +389,7 @@ enum UpdateState: Equatable {
             case .commit(let url): return url
             case .compareTip(let url): return url
             case .tagged(let url): return url
+            case .release(let url): return url
             }
         }
 
@@ -381,7 +397,7 @@ enum UpdateState: Equatable {
             switch self {
             case .commit: return "View GitHub Commit"
             case .compareTip: return "Changes Since This Tip Release"
-            case .tagged: return "View Release Notes"
+            case .tagged, .release: return "View Release Notes"
             }
         }
     }
@@ -409,8 +425,7 @@ enum UpdateState: Equatable {
 
         var releaseNotes: ReleaseNotes? {
             guard let appcastItem else { return nil }
-            let currentCommit = Bundle.main.infoDictionary?["GhosttyCommit"] as? String
-            return ReleaseNotes(displayVersionString: appcastItem.displayVersionString, currentCommit: currentCommit)
+            return ReleaseNotes(appcastItem: appcastItem)
         }
     }
 }

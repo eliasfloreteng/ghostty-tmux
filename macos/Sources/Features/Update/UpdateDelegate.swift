@@ -3,6 +3,13 @@ import Cocoa
 
 extension UpdateDriver: SPUUpdaterDelegate {
     func feedURLString(for updater: SPUUpdater) -> String? {
+        // A build that names its own feed with SUFeedURL in its Info.plist,
+        // such as a fork's, updates from that feed alone, whatever the
+        // channel. Returning nil makes Sparkle use it.
+        if Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil {
+            return nil
+        }
+
         guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else {
             return nil
         }
