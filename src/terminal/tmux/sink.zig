@@ -115,6 +115,29 @@ pub const Op = union(enum) {
         rows: size.CellCountInt,
     },
 
+    /// The pane's title, tmux's `#{pane_title}`.
+    ///
+    /// Usually what the pane's program last set with OSC 0 or 2, which
+    /// also arrives as bytes. This covers what the bytes cannot: the
+    /// title a pane already had when we attached, and one set by tmux
+    /// itself (`select-pane -T`, or the host name tmux starts a pane
+    /// with). A consumer should treat it as an OSC 2 from the program.
+    title: []const u8,
+
+    /// The working directory of the pane's program, tmux's
+    /// `#{pane_current_path}`, on the tmux server's host.
+    ///
+    /// tmux reads this from the process itself, so it is known without
+    /// any shell integration. The host is part of it because the path
+    /// is only meaningful there: a consumer should treat it as an OSC 7
+    /// report from that host, and so ignore it unless the host is ours.
+    pwd: Pwd,
+
+    pub const Pwd = struct {
+        host: []const u8,
+        path: []const u8,
+    };
+
     /// Copy an op so it can outlive the sink call that delivered it.
     ///
     /// A sink that hands ops to another thread has to do this: the
@@ -122,6 +145,15 @@ pub const Op = union(enum) {
     pub fn clone(self: Op, alloc: Allocator) Allocator.Error!Op {
         return switch (self) {
             .bytes => |b| .{ .bytes = try alloc.dupe(u8, b) },
+            .title => |t| .{ .title = try alloc.dupe(u8, t) },
+            .pwd => |p| pwd: {
+                const host = try alloc.dupe(u8, p.host);
+                errdefer alloc.free(host);
+                break :pwd .{ .pwd = .{
+                    .host = host,
+                    .path = try alloc.dupe(u8, p.path),
+                } };
+            },
 
             // The parsed pane state is a flat struct of scalars and
             // slices, so walk it rather than naming the string fields:
@@ -155,6 +187,11 @@ pub const Op = union(enum) {
     pub fn deinit(self: Op, alloc: Allocator) void {
         switch (self) {
             .bytes => |b| alloc.free(b),
+            .title => |t| alloc.free(t),
+            .pwd => |p| {
+                alloc.free(p.host);
+                alloc.free(p.path);
+            },
             .pane_state => |data| freePaneState(alloc, data, null),
             else => {},
         }
@@ -238,6 +275,12 @@ pub fn applyOp(
         },
 
         .pane_state => |data| try applyPaneState(t, data),
+
+        .title => |title| try t.setTitle(title),
+
+        // Only the path: the host is for whoever decides whether the path
+        // means anything here, and a terminal keeps no host.
+        .pwd => |p| try t.setPwd(p.path),
 
         .resize => |v| try t.resize(alloc, .{
             .cols = v.cols,
@@ -405,9 +448,19 @@ test "cloned ops own their payloads" {
     defer bytes.deinit(alloc);
     const state = try (Op{ .pane_state = data }).clone(alloc);
     defer state.deinit(alloc);
+    const title = try (Op{ .title = scratch[0..5] }).clone(alloc);
+    defer title.deinit(alloc);
+    const pwd = try (Op{ .pwd = .{
+        .host = scratch[8..13],
+        .path = scratch[16..20],
+    } }).clone(alloc);
+    defer pwd.deinit(alloc);
 
     @memset(&scratch, 'x');
 
+    try testing.expectEqualStrings("hello", title.title);
+    try testing.expectEqualStrings("block", pwd.pwd.host);
+    try testing.expectEqualStrings("8,16", pwd.pwd.path);
     try testing.expectEqualStrings("hello", bytes.bytes);
     try testing.expectEqualStrings("block", state.pane_state.cursor_shape);
     try testing.expectEqualStrings("8,16", state.pane_state.pane_tabs);

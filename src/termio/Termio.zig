@@ -225,6 +225,7 @@ pub const DerivedConfig = struct {
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
     tmux_pause_after: u32,
+    tmux_hidden_output_off_after: u32,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -264,6 +265,7 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .tmux_pause_after = config.@"tmux-pause-after",
+            .tmux_hidden_output_off_after = config.@"tmux-hidden-output-off-after",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
@@ -451,6 +453,14 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
                 .{err},
             ),
 
+            // As the program would have said it, so the surface hears of
+            // it the same way: OSC 2 and OSC 7.
+            .title => |title| self.terminal_stream.handler.windowTitle(
+                title,
+            ) catch |err| log.warn("tmux pane title failed err={}", .{err}),
+
+            .pwd => |pwd| self.tmuxPanePwd(pwd),
+
             else => terminalpkg.tmux.sink.applyOp(
                 self.alloc,
                 &self.terminal,
@@ -465,6 +475,29 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
     // Ops other than bytes schedule no render of their own, so one
     // wakeup covers the batch.
     self.terminal_stream.handler.queueRender() catch unreachable;
+}
+
+/// Report a tmux pane's working directory as an OSC 7 from the tmux
+/// server's host would, so the same rule applies to it: a path on another
+/// machine is ignored. The `kitty-shell-cwd` scheme takes the path as it
+/// is, so it needs no escaping. Caller holds the renderer mutex.
+fn tmuxPanePwd(self: *Termio, pwd: terminalpkg.tmux.Op.Pwd) void {
+    if (pwd.host.len == 0 or pwd.path.len == 0) return;
+
+    var buf: [4096]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        &buf,
+        "kitty-shell-cwd://{s}{s}",
+        .{ pwd.host, pwd.path },
+    ) catch {
+        log.warn("tmux pane path too long, ignoring", .{});
+        return;
+    };
+
+    self.terminal_stream.handler.reportPwd(url) catch |err| log.warn(
+        "tmux pane path failed err={}",
+        .{err},
+    );
 }
 
 /// How the tmux router asks us to talk to the tmux server.
@@ -485,6 +518,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .zoomPane = tmuxHostZoomPane,
     .moveWindow = tmuxHostMoveWindow,
     .renameWindow = tmuxHostRenameWindow,
+    .paneShown = tmuxHostPaneShown,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -592,6 +626,14 @@ fn tmuxHostMoveWindow(ctx: *anyopaque, pane_id: usize, amount: isize) void {
     self.tmuxHostInput(.{ .move_window = .{
         .pane_id = pane_id,
         .amount = amount,
+    } });
+}
+
+fn tmuxHostPaneShown(ctx: *anyopaque, pane_id: usize, shown: bool) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .pane_shown = .{
+        .pane_id = pane_id,
+        .shown = shown,
     } });
 }
 
@@ -1034,6 +1076,13 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 
     // We always notify our backend of focus changes.
     try self.backend.focusGained(td, focused);
+}
+
+/// Whether the surface can be seen: it is in a selected tab of a window
+/// that is neither minimized nor covered. Only a tmux pane cares, to let
+/// tmux stop sending output nobody can see.
+pub fn visibilityChanged(self: *Termio, td: *ThreadData, visible: bool) void {
+    self.backend.visibilityChanged(td, visible);
 }
 
 /// Process output from the pty. This is the manual API that users can

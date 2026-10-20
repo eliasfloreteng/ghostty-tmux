@@ -143,6 +143,13 @@ pub const Router = struct {
                 pane_id: usize,
                 name: []const u8,
             ) void,
+
+            /// The pane's display came into sight or went out of it.
+            paneShown: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                shown: bool,
+            ) void,
         };
     };
 
@@ -530,6 +537,15 @@ pub const Router = struct {
         self.host.vtable.zoomPane(self.host.ctx, pane_id);
     }
 
+    /// Tell the session whether this pane's display can be seen: its tab
+    /// is selected and its window neither minimized nor covered.
+    pub fn paneShown(self: *Router, pane_id: usize, shown: bool) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.paneShown(self.host.ctx, pane_id, shown);
+    }
+
     /// Tell the session the user has moved into this pane.
     pub fn selectPane(self: *Router, pane_id: usize) void {
         if (!self.paneOpen(pane_id)) return;
@@ -685,6 +701,10 @@ const TestHost = struct {
         pane_id: usize,
         scope: KillScope,
     }) = .empty,
+    shown: std.ArrayList(struct {
+        pane_id: usize,
+        shown: bool,
+    }) = .empty,
 
     const vtable: Router.Host.VTable = .{
         .write = write,
@@ -699,7 +719,16 @@ const TestHost = struct {
         .zoomPane = zoomPane,
         .moveWindow = moveWindow,
         .renameWindow = renameWindow,
+        .paneShown = paneShown,
     };
+
+    fn paneShown(ctx: *anyopaque, pane_id: usize, shown: bool) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.shown.append(self.alloc, .{
+            .pane_id = pane_id,
+            .shown = shown,
+        }) catch @panic("oom");
+    }
 
     fn killWindows(
         ctx: *anyopaque,
@@ -769,6 +798,7 @@ const TestHost = struct {
         self.kills.deinit(self.alloc);
         self.splits.deinit(self.alloc);
         self.window_kills.deinit(self.alloc);
+        self.shown.deinit(self.alloc);
         self.selected_panes.deinit(self.alloc);
         self.zoomed_panes.deinit(self.alloc);
         self.window_moves.deinit(self.alloc);
@@ -1060,6 +1090,27 @@ test "input reaches the host and stops when the pane does" {
     tr.router.writePaste(5, "nope");
     try testing.expectEqual(1, tr.host.writes.items.len);
     try testing.expectEqual(1, tr.host.pastes.items.len);
+}
+
+test "whether a pane can be seen reaches the host while it is open" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    const sink = try tr.router.createChannel(5);
+
+    tr.router.paneShown(5, false);
+    tr.router.paneShown(5, true);
+    tr.router.paneShown(1234, false);
+    try testing.expectEqual(2, tr.host.shown.items.len);
+    try testing.expectEqual(5, tr.host.shown.items[0].pane_id);
+    try testing.expect(!tr.host.shown.items[0].shown);
+    try testing.expect(tr.host.shown.items[1].shown);
+
+    sink.close();
+    tr.router.paneShown(5, false);
+    try testing.expectEqual(2, tr.host.shown.items.len);
 }
 
 test "detachHost closes every pane and blocks further host calls" {

@@ -818,21 +818,30 @@ pub const Parser = struct {
             // `name $session @window index %pane ... : value`. The ids
             // are `-` for a subscription that is not about a window or
             // pane, and tmux(1) reserves room for more arguments before
-            // the colon, so only the name and the value are taken: the
-            // name is the first argument (subscription names cannot
-            // contain a space or a colon) and the value is everything
-            // after the first " : ".
+            // the colon, so anything after the pane is ignored. The name
+            // is the first argument (subscription names cannot contain a
+            // space or a colon) and the value is everything after the
+            // first " : ".
             const rest = restOfLine(line, cmd);
             const sep = std.mem.indexOf(u8, rest, " : ") orelse {
                 log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
                 break :cmd;
             };
-            const name_end = std.mem.indexOfScalar(u8, rest, ' ') orelse unreachable;
+
+            var args = std.mem.splitScalar(u8, rest[0..sep], ' ');
+            const name = args.next() orelse unreachable;
+            const session_id = prefixedId(args.next(), '$');
+            const window_id = prefixedId(args.next(), '@');
+            _ = args.next(); // The window's index in the session.
+            const pane_id = prefixedId(args.next(), '%');
 
             // Important: do not clear the buffer, both point into it.
             self.state = .idle;
             return .{ .subscription_changed = .{
-                .name = rest[0..name_end],
+                .name = name,
+                .session_id = session_id,
+                .window_id = window_id,
+                .pane_id = pane_id,
                 .value = rest[sep + 3 ..],
             } };
         } else {
@@ -851,6 +860,14 @@ pub const Parser = struct {
     /// it, for notifications whose only argument is free text.
     fn restOfLine(line: []const u8, cmd: []const u8) []const u8 {
         return if (line.len > cmd.len + 1) line[cmd.len + 1 ..] else "";
+    }
+
+    /// An id written with its sigil, such as `@3`, or null for anything
+    /// else: tmux writes `-` for an id that does not apply.
+    fn prefixedId(arg: ?[]const u8, sigil: u8) ?usize {
+        const s = arg orelse return null;
+        if (s.len < 2 or s[0] != sigil) return null;
+        return std.fmt.parseInt(usize, s[1..], 10) catch null;
     }
 
     // Mark the tmux state as broken.
@@ -1094,8 +1111,18 @@ pub const Notification = union(enum) {
     },
 
     /// A subscription set with `refresh-client -B` changed value.
+    ///
+    /// tmux checks subscriptions once a second and sends one of these per
+    /// session, window or pane whose value differs from the last it sent
+    /// this client, so the first check after subscribing reports every
+    /// one of them. The ids say which one this is: a subscription to all
+    /// panes (`%*`) has all three, one to all windows (`@*`) no pane, and
+    /// one about the session neither a window nor a pane.
     subscription_changed: struct {
         name: []const u8,
+        session_id: ?usize = null,
+        window_id: ?usize = null,
+        pane_id: ?usize = null,
         value: []const u8,
     },
 
@@ -1821,10 +1848,28 @@ test "tmux subscription-changed" {
     try testing.expect(pane == .subscription_changed);
     try testing.expectEqualStrings("sub1", pane.subscription_changed.name);
     try testing.expectEqualStrings("cat : x", pane.subscription_changed.value);
+    try testing.expectEqual(0, pane.subscription_changed.session_id);
+    try testing.expectEqual(0, pane.subscription_changed.window_id);
+    try testing.expectEqual(0, pane.subscription_changed.pane_id);
+
+    const window = (try testLine(&c, "%subscription-changed w $2 @7 3 - : 100")).?;
+    try testing.expectEqualStrings("w", window.subscription_changed.name);
+    try testing.expectEqual(2, window.subscription_changed.session_id);
+    try testing.expectEqual(7, window.subscription_changed.window_id);
+    try testing.expectEqual(null, window.subscription_changed.pane_id);
+    try testing.expectEqualStrings("100", window.subscription_changed.value);
 
     const session = (try testLine(&c, "%subscription-changed s2 $1 - - - : ")).?;
     try testing.expectEqualStrings("s2", session.subscription_changed.name);
+    try testing.expectEqual(1, session.subscription_changed.session_id);
+    try testing.expectEqual(null, session.subscription_changed.window_id);
+    try testing.expectEqual(null, session.subscription_changed.pane_id);
     try testing.expectEqualStrings("", session.subscription_changed.value);
+
+    // Arguments a later tmux adds before the colon are not ids.
+    const future = (try testLine(&c, "%subscription-changed f $0 @1 0 %4 extra : v")).?;
+    try testing.expectEqual(4, future.subscription_changed.pane_id);
+    try testing.expectEqualStrings("v", future.subscription_changed.value);
 }
 
 test "tmux every 3.6 notification parses without breaking the parser" {

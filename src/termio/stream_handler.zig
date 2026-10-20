@@ -49,6 +49,11 @@ pub const StreamHandler = struct {
     /// leave pause mode off. Read when a control mode session starts.
     tmux_pause_after: u32 = 0,
 
+    /// Seconds a tmux pane may be out of sight, and still producing
+    /// output, before its output is turned off, or 0 never to. Read when
+    /// a control mode session starts.
+    tmux_hidden_output_off_after: u32 = 0,
+
     /// The color reporting format for OSC requests.
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
 
@@ -291,6 +296,7 @@ pub const StreamHandler = struct {
         self.enquiry_response = config.enquiry_response;
         self.xt_checksum_report = config.xt_checksum_report;
         self.tmux_pause_after = config.tmux_pause_after;
+        self.tmux_hidden_output_off_after = config.tmux_hidden_output_off_after;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
@@ -354,6 +360,7 @@ pub const StreamHandler = struct {
             .linefeed_mode,
             .kitty_clipboard_grant_read,
             .kitty_clipboard_grant_write,
+            .visible,
             => false,
         };
     }
@@ -636,6 +643,7 @@ pub const StreamHandler = struct {
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(global.io(), self.alloc, .{
                             .pause_after = self.tmux_pause_after,
+                            .hidden_output_off_after = self.tmux_hidden_output_off_after,
                         });
                         errdefer viewer.deinit();
 
@@ -1262,7 +1270,7 @@ pub const StreamHandler = struct {
     //-------------------------------------------------------------------------
     // OSC
 
-    fn windowTitle(self: *StreamHandler, title: []const u8) !void {
+    pub fn windowTitle(self: *StreamHandler, title: []const u8) !void {
         var buf: [256]u8 = undefined;
         if (title.len >= buf.len) {
             log.warn("change title requested larger than our buffer size, ignoring", .{});
@@ -1788,7 +1796,7 @@ pub const StreamHandler = struct {
         try self.terminal.semanticPrompt(cmd);
     }
 
-    fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+    pub fn reportPwd(self: *StreamHandler, url: []const u8) !void {
         // Special handling for the empty URL. We treat the empty URL
         // as resetting the pwd as if we never saw a pwd. I can't find any
         // other terminal that does this but it seems like a reasonable

@@ -94,7 +94,8 @@ const Session = struct {
 
     /// Somewhere for short answers from `ask` to live so tests do not
     /// have to free every one of them.
-    scratch: [64]u8 = undefined,
+    scratch: [1024]u8 = undefined,
+    scratch_len: usize = 0,
 
     /// How many `%pause` notifications tmux has sent us. A test that
     /// means to provoke one should check that it did.
@@ -2440,4 +2441,152 @@ test "live: characters are as wide here as tmux makes them" {
         try session.input(.{ .write = .{ .pane_id = pane_id, .data = "\r" } });
     }
     try testing.expect(!session.exited);
+}
+
+test "live: pane titles and working directories arrive by subscription" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try testing.expect(session.viewer.server_host.len > 0);
+
+    // Set by tmux itself, so nothing about it is in the pane's output:
+    // only the subscription can tell us.
+    {
+        const out = try session.ask(&.{ "select-pane", "-t", "%0", "-T", "a live title" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(0) orelse return false;
+            const title = pane.terminal.getTitle() orelse return false;
+            return std.mem.eql(u8, title, "a live title");
+        }
+    }.pred);
+
+    // tmux reads the working directory from the process, so `sleep`
+    // has one without any shell integration.
+    const want = try session.ask(&.{ "display-message", "-p", "-t", "%0", "#{pane_current_path}" });
+    defer alloc.free(want);
+    const path = std.mem.trim(u8, want, " \r\n");
+    @memcpy(session.scratch[0..path.len], path);
+    session.scratch_len = path.len;
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(0) orelse return false;
+            const pwd = pane.terminal.getPwd() orelse return false;
+            return std.mem.eql(u8, pwd, v.scratch[0..v.scratch_len]);
+        }
+    }.pred);
+    try testing.expect(!session.exited);
+}
+
+test "live: a bell in another window flags it until tmux moves there" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    {
+        const out = try session.ask(&.{
+            "new-window", "-d", "-n", "ringer", "sh -c 'sleep 0.3; printf \"\\a\"; sleep 60'",
+        });
+        alloc.free(out);
+    }
+
+    const ringing = struct {
+        fn pred(v: *Session) bool {
+            for (v.viewer.windows.items) |w| {
+                if (std.mem.eql(u8, w.name, "ringer")) return w.alerts.bell;
+            }
+            return false;
+        }
+    }.pred;
+    try session.waitFor(ringing);
+
+    // Moving there, as selecting its tab would, clears it.
+    {
+        const out = try session.ask(&.{ "select-window", "-t", ":ringer" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            for (v.viewer.windows.items) |w| {
+                if (std.mem.eql(u8, w.name, "ringer")) return w.active and !w.alerts.bell;
+            }
+            return false;
+        }
+    }.pred);
+    try testing.expect(!session.exited);
+}
+
+test "live: a hidden pane's output goes off, and it catches up when shown" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "i=0; while :; do i=$((i+1)); echo tick-$i; sleep 0.05; done",
+        .{ .viewer = .{ .hidden_output_off_after = 1 } },
+    );
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try session.input(.{ .pane_shown = .{ .pane_id = 0, .shown = false } });
+
+    // As if it had been out of sight for a while; the next output turns
+    // it off.
+    const pane = session.viewer.panes.get(0).?;
+    pane.hidden_since = pane.hidden_since.?.subDuration(.fromSeconds(2));
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.get(0).?.output_off and v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // Nothing more arrives while it is off, so the pane falls behind.
+    const before = try session.paneText(0);
+    defer alloc.free(before);
+    var rounds: usize = 0;
+    while (rounds < 25) : (rounds += 1) _ = try session.pump();
+    const during = try session.paneText(0);
+    defer alloc.free(during);
+    try testing.expectEqualStrings(before, during);
+
+    // Shown again, it is read again and is current.
+    try session.input(.{ .pane_shown = .{ .pane_id = 0, .shown = true } });
+    try session.waitFor(attached);
+    const now = try session.ask(&.{ "capture-pane", "-p", "-t", "%0" });
+    defer alloc.free(now);
+    const last = lastTick(now) orelse return error.NoTicks;
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const text = v.paneText(0) catch return false;
+            defer v.alloc.free(text);
+            return lastTick(text) != null;
+        }
+    }.pred);
+    const shown = try session.paneText(0);
+    defer alloc.free(shown);
+    try testing.expect(lastTick(shown).? + 20 >= last);
+    try testing.expect(!session.exited);
+}
+
+/// The number of the last `tick-N` line in `text`.
+fn lastTick(text: []const u8) ?usize {
+    var result: ?usize = null;
+    var it = std.mem.tokenizeAny(u8, text, " \r\n");
+    while (it.next()) |word| {
+        if (!std.mem.startsWith(u8, word, "tick-")) continue;
+        result = std.fmt.parseInt(usize, word["tick-".len..], 10) catch continue;
+    }
+    return result;
 }
