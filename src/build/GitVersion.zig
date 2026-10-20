@@ -56,8 +56,21 @@ pub fn detect(b: *std.Build) !Version {
         break :short_hash std.mem.trim(u8, output, &std.ascii.whitespace);
     };
 
+    // Only release tags (vX.Y.Z) and "tip" mean anything here. Other tags,
+    // such as this fork's `build-<sha>` release tags, are ignored.
     const tag = b.runAllowFail(
-        &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "describe", "--exact-match", "--tags" },
+        &[_][]const u8{
+            "git",
+            "-C",
+            b.build_root.path orelse ".",
+            "describe",
+            "--exact-match",
+            "--tags",
+            "--match",
+            "v*",
+            "--match",
+            "tip",
+        },
         &code,
         .ignore,
     ) catch |err| switch (err) {
