@@ -243,6 +243,25 @@ extension Ghostty {
             return String(cString: ptr)
         }
 
+        /// `tmux-window-placement`: "tabs" or "windows".
+        var tmuxWindowPlacement: String {
+            let defaultValue = "tabs"
+            guard let config = self.config else { return defaultValue }
+            var v: UnsafePointer<Int8>?
+            let key = "tmux-window-placement"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
+            guard let ptr = v else { return defaultValue }
+            return String(cString: ptr)
+        }
+
+        var tmuxHideHost: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "tmux-hide-host"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var windowDecorations: Bool {
             let defaultValue = true
             guard let config = self.config else { return defaultValue }

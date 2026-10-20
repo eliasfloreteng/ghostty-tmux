@@ -230,6 +230,12 @@
                                             </connections>
                                         </menuItem>
                                         <menuItem isSeparatorItem="YES" id="tMx-Sp-003"/>
+                                        <menuItem title="Dashboard…" id="tMx-DB-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxDashboard:" target="-1" id="tMx-DB-Act"/>
+                                            </connections>
+                                        </menuItem>
                                         <menuItem title="Detach" id="tMx-Dt-Itm">
                                             <modifierMask key="keyEquivalentModifierMask"/>
                                             <connections>
