@@ -179,7 +179,7 @@ class TmuxWindowManager {
                     controller.surfaceTree = tree
                     keepFocusInWindow(window, of: entry, host: host)
                 }
-                setTitle(controller, window.name)
+                setTitle(controller, window)
                 entry.isActive = window.active
                 followActivePane(window, of: entry, host: host)
                 continue
@@ -222,7 +222,7 @@ class TmuxWindowManager {
                 // tmux the user moved there, over the pane tmux had active.
                 initialFocus: window.activePaneId.flatMap { panes[Key(host: host, id: $0)]?.value })
             controller.isTmuxWindow = true
-            setTitle(controller, window.name)
+            setTitle(controller, window)
 
             let entry = WindowEntry(controller: controller)
             entry.isActive = window.active
@@ -649,14 +649,35 @@ class TmuxWindowManager {
         return window
     }
 
-    /// Show the tmux window's name as the window title.
+    /// Show the tmux window's name as the window title, marked with its
+    /// alerts the way tmux's status line marks them.
     ///
     /// tmux owns what a tmux window is called, so this goes in as the
-    /// override: the surface titles underneath are the shell's idea of a
-    /// title, which is a different thing. Assigning only on a change
-    /// keeps this off the main thread's work list for the common case
-    /// where tmux re-reports a layout that did not move.
-    private func setTitle(_ controller: TerminalController, _ name: String) {
+    /// override: the surface titles underneath are the panes' own titles,
+    /// which is a different thing. Assigning only on a change keeps this
+    /// off the main thread's work list for the common case where tmux
+    /// re-reports a layout that did not move.
+    ///
+    /// The marks are tmux's, not ours to clear: tmux sets them only on a
+    /// window it is not on and clears them when it moves there, and
+    /// selecting the tab is what moves it. A bell is not marked again when
+    /// the pane that rang it already shows one: that bell reached the
+    /// surface as well (the bell feature `title`), and both would say the
+    /// same thing.
+    private func setTitle(
+        _ controller: TerminalController,
+        _ window: Ghostty.Action.TmuxWindows.Window
+    ) {
+        var marks: [String] = []
+        if window.alerts.bell && !(controller.focusedSurface?.bell ?? false) {
+            marks.append("🔔")
+        }
+        if window.alerts.activity { marks.append("•") }
+        if window.alerts.silence { marks.append("💤") }
+
+        let name = ([marks.joined()] + [window.name])
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
         let wanted = name.isEmpty ? nil : name
         if controller.titleOverride != wanted {
             controller.titleOverride = wanted
