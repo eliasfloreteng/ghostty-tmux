@@ -124,7 +124,8 @@ const Session = struct {
     }
 
     const StartOptions = struct {
-        viewer: Viewer.Options = .{},
+        /// Lazy history by default, as the app attaches.
+        viewer: Viewer.Options = .{ .lazy_history = true },
 
         /// The server's `history-limit`, if not tmux's default. It only
         /// applies to panes created after it is set, so it has to be set
@@ -1974,6 +1975,48 @@ test "live: a large styled history does not break the attach" {
     const text = try session.paneText(0);
     defer alloc.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "050000 coloured history") != null);
+    try testing.expect(!session.exited);
+}
+
+test "live: a big history attaches screen first and fills in after" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "seq 50000 | awk '{ printf \"\\033[3%dm%06d coloured history\\033[0m\\n\", $1 % 8, $1 }'; exec cat",
+        .{ .history_limit = 60000, .min_history = 49_000 },
+    );
+    defer session.deinit();
+
+    // The screen is there while the history is still on its way: the
+    // history is megabytes, and arrives over many reads after it.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(0) orelse return false;
+            if (pane.status != .loading_history) return false;
+            const text = v.paneText(0) catch return false;
+            defer v.alloc.free(text);
+            return std.mem.indexOf(u8, text, "050000 coloured history") != null;
+        }
+    }.pred);
+
+    // And then all of it is, exactly as an eager attach would have it.
+    try session.waitFor(attached);
+    const pane = session.viewer.panes.get(0).?;
+    try testing.expectEqual(.live, pane.status);
+    const text = try pane.terminal.screens.get(.primary).?.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(text);
+    // The shadow terminal keeps only the newest of it, so this checks
+    // the lines nearest the screen: there, and once each.
+    try testing.expectEqual(1, std.mem.count(u8, text, "049990 coloured history"));
+    try testing.expectEqual(1, std.mem.count(u8, text, "049999 coloured history"));
     try testing.expect(!session.exited);
 }
 

@@ -224,6 +224,9 @@ pub const Viewer = struct {
     /// 0 for tmux's own behaviour. See `Options.pause_after`.
     pause_after: u32 = 0,
 
+    /// See `Options.lazy_history`.
+    lazy_history: bool = false,
+
     /// Whether tmux has made this client read-only, by `attach -r` or
     /// `switch-client -r`. See `refuseReadOnly`.
     ///
@@ -676,8 +679,9 @@ pub const Viewer = struct {
         ///
         /// A read replaces the pane's content wholesale, scrollback and
         /// all. Applied reply by reply, a pane read again while it is on
-        /// screen, after a pause say, would show an empty screen in
-        /// between, for as long as a large history took to arrive.
+        /// screen -- for its history after a lazy attach, or after a
+        /// pause -- would show an empty screen in between, for as long
+        /// as a large history took to arrive.
         ///
         /// `read_history` is only set for a full read, one that started
         /// with the history; an empty slice is a history tmux could not
@@ -765,6 +769,15 @@ pub const Viewer = struct {
         /// Which of the two is worse belongs to the user.
         pause_after: u32 = 0,
 
+        /// Show each new pane's screen before reading its history, so a
+        /// session with a lot of history appears at once rather than
+        /// after all of it has crossed the wire. See `queuePaneReads`.
+        ///
+        /// Off by default because it reads every new pane's screen
+        /// twice, and because the replies it adds are noise for anything
+        /// that is not about attaching; a display wants it on.
+        lazy_history: bool = false,
+
         /// The command line that started control mode in the host
         /// terminal, if it is known and running it again would reattach.
         /// See `host_command.read`. Copied; empty if unknown.
@@ -803,6 +816,7 @@ pub const Viewer = struct {
             .windows = .empty,
             .panes = .empty,
             .pause_after = opts.pause_after,
+            .lazy_history = opts.lazy_history,
             .paste_buffer = paste_buffer: {
                 var token: [8]u8 = undefined;
                 io.random(&token);
@@ -2646,7 +2660,7 @@ pub const Viewer = struct {
     }
 
     /// The captures that read a pane's screens without its history: the
-    /// tail of `paneCaptures`.
+    /// tail of `paneCaptures`, on their own for a lazy attach.
     fn screenCaptures(pane_id: usize) [2]Command {
         return .{
             .{ .pane_saved = pane_id },
@@ -2801,13 +2815,30 @@ pub const Viewer = struct {
         }
     }
 
-    /// Read new panes from tmux, whole: their content, then their state
+    /// Read new panes from tmux: their content, then their state
     /// (terminal modes, cursor positions and so on).
+    ///
+    /// Eagerly, each pane is read whole, history and all, and nothing of
+    /// the next pane arrives before the last pane's history has. With
+    /// `lazy_history` every pane's screen is read first, cheaply, and
+    /// the full reads follow: the session is on screen as soon as its
+    /// screens are, and its history fills in behind. The full read
+    /// replaces the screen read rather than adding to it, since the two
+    /// cannot be stitched together: output arriving in between moves
+    /// lines into tmux's history that our screen already scrolled. It is
+    /// applied in one go (see `Pane.read_history`), so the pane does not
+    /// blank while it arrives, and once it has, the pane is exactly what
+    /// an eager read would have made it.
     fn queuePaneReads(
         self: *Viewer,
         panes: *const PanesMap,
         ids: []const usize,
     ) !void {
+        if (self.lazy_history) {
+            for (ids) |id| try self.queueCommands(&screenCaptures(id));
+            try self.queueCommands(&.{.pane_state});
+        }
+
         for (ids) |id| {
             try self.queueCommands(&paneCaptures(id));
             const pane = panes.get(id) orelse continue;
@@ -2831,6 +2862,7 @@ pub const Viewer = struct {
         // the session that just ended.
         var replacement: Viewer = try .init(self.io, self.alloc, .{
             .pause_after = self.pause_after,
+            .lazy_history = self.lazy_history,
             .reattach_command = self.reattach_command,
         });
         errdefer replacement.deinit();
@@ -7082,6 +7114,84 @@ test "a paused pane says it is catching up until it is read again" {
     try testing.expectEqual(.catching_up, viewer.panes.get(0).?.status);
     try testViewer(&viewer, read[2..]);
     try testing.expectEqual(.live, viewer.panes.get(0).?.status);
+}
+
+test "a lazy attach shows each screen before reading its history" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .lazy_history = true,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end = "$0 @0 1 83 44 " ++ two_panes_vertical ++
+                    " 0 " ++ two_panes_vertical ++ " %0",
+            } },
+            // Both screens and their state first, then both panes whole.
+            .commands = &.{
+                "capture-pane -p -e -C -a -t %0",
+                "capture-pane -p -e -C -q -t %0",
+                "capture-pane -p -e -C -a -t %1",
+                "capture-pane -p -e -C -q -t %1",
+                "list-panes -s -F",
+                "capture-pane -p -e -C -q -S - -E -1 -t %0",
+                "capture-pane -p -e -C -a -t %0",
+                "capture-pane -p -e -C -q -t %0",
+                "capture-pane -p -e -C -q -S - -E -1 -t %1",
+                "capture-pane -p -e -C -a -t %1",
+                "capture-pane -p -e -C -q -t %1",
+                "list-panes -s -F",
+            },
+        },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "screen" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.get(0).?;
+                    try testing.expectEqual(.loading_history, pane.status);
+                    const str = try pane.terminal.screens.active.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expectEqualStrings("screen", str);
+                }
+            }).check,
+        },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    });
+
+    // The full read replaces the screen read, history and all.
+    const first = testPrimaryCaptureSteps("old", "screen");
+    try testViewer(&viewer, &first);
+    {
+        const pane: *Viewer.Pane = viewer.panes.get(0).?;
+        try testing.expectEqual(.live, pane.status);
+        const screen = pane.terminal.screens.active;
+        const history = try screen.dumpStringAlloc(testing.allocator, .{ .history = .{} });
+        defer testing.allocator.free(history);
+        try testing.expectEqualStrings("old", history);
+        const active = try screen.dumpStringAlloc(testing.allocator, .{ .active = .{} });
+        defer testing.allocator.free(active);
+        try testing.expectEqualStrings("screen", active);
+    }
+    try testing.expectEqual(.loading_history, viewer.panes.get(1).?.status);
+
+    const second = testPrimaryCaptureSteps("", "");
+    try testViewer(&viewer, &second);
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+    try testing.expectEqual(.live, viewer.panes.get(1).?.status);
+    try testing.expect(viewer.command_queue.empty());
 }
 
 test "a layout change keeps the window name" {

@@ -663,6 +663,7 @@ pub const StreamHandler = struct {
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(global.io(), self.alloc, .{
                             .pause_after = self.tmux_pause_after,
+                            .lazy_history = true,
                             .reattach_command = reattach orelse "",
                         });
                         errdefer viewer.deinit();
