@@ -1262,7 +1262,7 @@ pub const StreamHandler = struct {
     //-------------------------------------------------------------------------
     // OSC
 
-    fn windowTitle(self: *StreamHandler, title: []const u8) !void {
+    pub fn windowTitle(self: *StreamHandler, title: []const u8) !void {
         var buf: [256]u8 = undefined;
         if (title.len >= buf.len) {
             log.warn("change title requested larger than our buffer size, ignoring", .{});
@@ -1788,7 +1788,7 @@ pub const StreamHandler = struct {
         try self.terminal.semanticPrompt(cmd);
     }
 
-    fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+    pub fn reportPwd(self: *StreamHandler, url: []const u8) !void {
         // Special handling for the empty URL. We treat the empty URL
         // as resetting the pwd as if we never saw a pwd. I can't find any
         // other terminal that does this but it seems like a reasonable

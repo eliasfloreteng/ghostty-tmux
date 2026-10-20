@@ -451,6 +451,14 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
                 .{err},
             ),
 
+            // As the program would have said it, so the surface hears of
+            // it the same way: OSC 2 and OSC 7.
+            .title => |title| self.terminal_stream.handler.windowTitle(
+                title,
+            ) catch |err| log.warn("tmux pane title failed err={}", .{err}),
+
+            .pwd => |pwd| self.tmuxPanePwd(pwd),
+
             else => terminalpkg.tmux.sink.applyOp(
                 self.alloc,
                 &self.terminal,
@@ -465,6 +473,29 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
     // Ops other than bytes schedule no render of their own, so one
     // wakeup covers the batch.
     self.terminal_stream.handler.queueRender() catch unreachable;
+}
+
+/// Report a tmux pane's working directory as an OSC 7 from the tmux
+/// server's host would, so the same rule applies to it: a path on another
+/// machine is ignored. The `kitty-shell-cwd` scheme takes the path as it
+/// is, so it needs no escaping. Caller holds the renderer mutex.
+fn tmuxPanePwd(self: *Termio, pwd: terminalpkg.tmux.Op.Pwd) void {
+    if (pwd.host.len == 0 or pwd.path.len == 0) return;
+
+    var buf: [4096]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        &buf,
+        "kitty-shell-cwd://{s}{s}",
+        .{ pwd.host, pwd.path },
+    ) catch {
+        log.warn("tmux pane path too long, ignoring", .{});
+        return;
+    };
+
+    self.terminal_stream.handler.reportPwd(url) catch |err| log.warn(
+        "tmux pane path failed err={}",
+        .{err},
+    );
 }
 
 /// How the tmux router asks us to talk to the tmux server.
