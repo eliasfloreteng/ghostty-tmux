@@ -143,6 +143,12 @@ Not done yet, roughly in order of usefulness:
   passing through DCS/image passthrough sequences.
 - A clear message for tmux older than 3.2, and a reconnect helper for
   dropped connections.
+- New splits and tabs start in the working directory of the pane they
+  were made from, as they do in plain Ghostty (`split-window -c`,
+  `new-window -c` with `#{pane_current_path}`).
+- Auto-update: the app's updater is disabled so it never updates itself
+  into the official release; it should update from this fork's releases
+  instead.
 
 ## About
 
