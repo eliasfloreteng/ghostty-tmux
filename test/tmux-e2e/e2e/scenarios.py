@@ -772,12 +772,30 @@ def gui_failed_split_notice(ctx: Context) -> None:
 
 # -- menu ------------------------------------------------------------------------
 
-TMUX_ITEMS = ["New Window", "Split Right", "Split Down", "Zoom Pane", "Kill Pane…", "Detach"]
+TMUX_ITEMS = [
+    "New Window",
+    "Split Right",
+    "Split Down",
+    "Zoom Pane",
+    "Swap Pane with Previous",
+    "Swap Pane with Next",
+    "Rotate Panes",
+    "Break Pane into New Window",
+    "Join Pane to Previous Window",
+    "Join Pane to Next Window",
+    "Kill Pane…",
+    "Run Command…",
+    "Detach",
+]
+
+# The items that are about the session rather than a pane, which the
+# gateway can do too.
+GATEWAY_ITEMS = ["Run Command…", "Detach"]
 
 
 @scenario
 def tmux_menu_enabled(ctx: Context) -> None:
-    """File > tmux items are enabled on a tmux pane, only Detach on the gateway, none elsewhere."""
+    """File > tmux items are enabled on a tmux pane, only the session's on the gateway, none elsewhere."""
     ctx.attach()
     plain = ctx.app.new_window()
     plain_term = wait_until(
@@ -797,8 +815,11 @@ def tmux_menu_enabled(ctx: Context) -> None:
     check(all(pane[i] for i in TMUX_ITEMS), f"on a tmux pane every item should be enabled: {pane}")
 
     gateway = items_with_focus(ctx.gateway)
-    check(gateway["Detach"], f"Detach should be enabled on the gateway: {gateway}")
-    check(not any(gateway[i] for i in TMUX_ITEMS if i != "Detach"), f"only Detach belongs to the gateway: {gateway}")
+    check(all(gateway[i] for i in GATEWAY_ITEMS), f"{GATEWAY_ITEMS} should be enabled on the gateway: {gateway}")
+    check(
+        not any(gateway[i] for i in TMUX_ITEMS if i not in GATEWAY_ITEMS),
+        f"only {GATEWAY_ITEMS} belong to the gateway: {gateway}",
+    )
 
     other = items_with_focus(plain_term)
     check(not any(other[i] for i in TMUX_ITEMS), f"nothing should be enabled outside tmux: {other}")
@@ -1294,3 +1315,154 @@ def switch_client_same_session(ctx: Context) -> None:
             f"the panes changed: {before} -> {ctx.describe()}",
         )
     ctx.wait_synced()
+
+
+# -- rearranging panes and tabs ------------------------------------------------
+
+
+def pane_order(ctx: Context, name: str) -> list[str]:
+    return [p.id for p in ctx.tmux.window(SESSION, name).panes]
+
+
+def gui_tab_order(ctx: Context) -> list[str]:
+    return [t.name for t in ctx.tmux_tabs()]
+
+
+@scenario
+def gui_swap_and_rotate_panes(ctx: Context) -> None:
+    """`tmux_swap_pane` and `tmux_rotate_window` rearrange the tmux window's panes."""
+    two_window_layout(ctx)
+    ctx.tmux.run("select-window", "-t", f"{SESSION}:beta")
+    before = pane_order(ctx, "beta")
+    term = ctx.terminal_for_pane(before[0])
+
+    ctx.app.perform(term, "tmux_swap_pane:next")
+    wait_until(
+        lambda: pane_order(ctx, "beta") == [before[1], before[0], before[2]],
+        timeout=ctx.timeout,
+        desc="the first two panes of 'beta' to trade places",
+        describe_state=ctx.describe,
+    )
+    # Focus goes with the pane that moved.
+    check(ctx.active_pane("beta") == before[0], f"{before[0]} should still be active{ctx.describe()}")
+
+    ctx.app.perform(term, "tmux_rotate_window:next")
+    wait_until(
+        lambda: pane_order(ctx, "beta") != [before[1], before[0], before[2]],
+        timeout=ctx.timeout,
+        desc="the panes of 'beta' to rotate",
+        describe_state=ctx.describe,
+    )
+    ctx.wait_synced()
+
+
+@scenario
+def gui_break_and_join_pane(ctx: Context) -> None:
+    """`tmux_break_pane` gives a pane a tab of its own; `tmux_join_pane` puts it back."""
+    two_window_layout(ctx)
+    ctx.tmux.run("select-window", "-t", f"{SESSION}:beta")
+    pane = pane_order(ctx, "beta")[1]
+    ctx.app.perform(ctx.terminal_for_pane(pane), "tmux_break_pane")
+    wait_until(
+        lambda: len(ctx.windows()) == 3 and len(ctx.tmux.window(SESSION, "beta").panes) == 2,
+        timeout=ctx.timeout,
+        desc=f"{pane} to be broken out into a third window",
+        describe_state=ctx.describe,
+    )
+    ctx.wait_synced()
+
+    # The new window is after 'beta', so 'beta' is the one before it.
+    ctx.app.perform(ctx.terminal_for_pane(pane), "tmux_join_pane:previous")
+    wait_until(
+        lambda: len(ctx.windows()) == 2 and pane in pane_order(ctx, "beta"),
+        timeout=ctx.timeout,
+        desc=f"{pane} to be joined back into 'beta'",
+        describe_state=ctx.describe,
+    )
+    ctx.wait_synced()
+
+
+@scenario
+def gui_move_tab_two_along(ctx: Context) -> None:
+    """`move_tab:2` moves the tmux window two along, and the tabs follow tmux's order."""
+    ctx.attach({"alpha": 1, "beta": 1, "gamma": 1})
+    term = ctx.tab_for_window("alpha").terminals[0].id
+    ctx.app.perform(term, "move_tab:2")
+    want = ["beta", "gamma", "alpha"]
+    wait_until(
+        lambda: [w.name for w in ctx.windows()] == want,
+        timeout=ctx.timeout,
+        desc=f"tmux's windows in the order {want}",
+        describe_state=ctx.describe,
+    )
+    wait_until(
+        lambda: gui_tab_order(ctx) == want,
+        timeout=ctx.timeout,
+        desc=f"the tabs in the order {want}",
+        describe_state=ctx.describe,
+    )
+
+
+@scenario
+def tmux_swap_window_reorders_tabs(ctx: Context) -> None:
+    """`tmux swap-window` from outside reorders the tabs (tmux 3.2+, within a few seconds)."""
+    ctx.attach({"alpha": 1, "beta": 1, "gamma": 1})
+    ctx.tmux.run("swap-window", "-d", "-s", f"{SESSION}:alpha", "-t", f"{SESSION}:gamma")
+    want = ["gamma", "beta", "alpha"]
+    wait_until(
+        lambda: gui_tab_order(ctx) == want,
+        timeout=ctx.timeout,
+        desc=f"the tabs in the order {want}",
+        describe_state=ctx.describe,
+    )
+
+
+@scenario
+def gui_tmux_command(ctx: Context) -> None:
+    """`tmux_command:<line>` runs the line in the session (the prompt is the same path)."""
+    two_window_layout(ctx)
+    term = ctx.tab_for_window("alpha").terminals[0].id
+    ctx.app.perform(term, "tmux_command:rename-window -t alpha typed ; select-window -t beta")
+    wait_until(
+        lambda: {w.name for w in ctx.windows()} == {"typed", "beta"} and ctx.tmux.window(SESSION, "beta").active,
+        timeout=ctx.timeout,
+        desc="both commands of the line to have run",
+        describe_state=ctx.describe,
+    )
+    ctx.wait_synced()
+
+    # From the gateway too: it is the session's, not a pane's.
+    ctx.app.perform(ctx.gateway, "tmux_command:rename-window -t beta from-gateway")
+    wait_until(
+        lambda: "from-gateway" in {w.name for w in ctx.windows()},
+        timeout=ctx.timeout,
+        desc="the gateway's command to have run",
+        describe_state=ctx.describe,
+    )
+
+
+@scenario
+def gui_status_bar(ctx: Context) -> None:
+    """`tmux-status-bar = true` shows tmux's status line (screenshot; verify manually)."""
+    ctx.app.relaunch("tmux-status-bar = true\n")
+    try:
+        ctx.app.close_all_windows(timeout=ctx.timeout)
+        ctx.tmux.add_config("set -g status-right 'e2e-status-right'\n")
+        ctx.attach()
+        # tmux checks subscriptions about once a second.
+        time.sleep(3)
+        shots = screenshot(ctx.app.pid, ctx.out_dir, "gui_status_bar")
+    finally:
+        ctx.gateway = ""
+        ctx.app.relaunch()
+    raise Skip(f"the status bar is SwiftUI text AppleScript cannot read; inspect {', '.join(map(str, shots))}")
+
+
+@scenario
+def gui_drag_tabs_and_splits(ctx: Context) -> None:
+    """Dragging tabs and splits is mirrored to tmux (needs a mouse; manual)."""
+    raise Skip(
+        "drag and drop is not scriptable here; verify manually: drag a tmux tab along the tab bar "
+        "(tmux list-windows follows), drag a split onto another pane's edge (join-pane), and out of "
+        "the window (break-pane, opening as a window where it was dropped)"
+    )
