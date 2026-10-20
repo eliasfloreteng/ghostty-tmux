@@ -788,6 +788,24 @@ extension Ghostty {
             case GHOSTTY_ACTION_TMUX_NOTICE:
                 return tmuxNotice(app, target: target, v: action.action.tmux_notice)
 
+            case GHOSTTY_ACTION_TMUX_STATUS:
+                guard target.tag == GHOSTTY_TARGET_SURFACE,
+                      let surface = target.target.surface,
+                      let surfaceView = self.surfaceView(from: surface) else { return false }
+                NotificationCenter.default.post(
+                    name: .ghosttyTmuxStatus,
+                    object: surfaceView,
+                    userInfo: [SwiftUI.Notification.Name.TmuxStatusKey: Action.TmuxStatus(c: action.action.tmux_status)]
+                )
+                return true
+
+            case GHOSTTY_ACTION_PROMPT_TMUX_COMMAND:
+                guard target.tag == GHOSTTY_TARGET_SURFACE,
+                      let surface = target.target.surface,
+                      let surfaceView = self.surfaceView(from: surface) else { return false }
+                surfaceView.promptTmuxCommand()
+                return true
+
             default:
                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue, privacy: .public)")
                 return false

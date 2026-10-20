@@ -68,6 +68,13 @@
                 <outlet property="menuSplitUp" destination="Ggp-7N-GbX" id="YJF-uq-S4Y"/>
                 <outlet property="menuTerminalInspector" destination="QwP-M5-fvh" id="wJi-Dh-S9f"/>
                 <outlet property="menuTmuxDetach" destination="tMx-Dt-Itm" id="tMx-Dt-Out"/>
+                <outlet property="menuTmuxSwapPanePrevious" destination="tMx-SwP-Itm" id="tMx-SwP-Out"/>
+                <outlet property="menuTmuxSwapPaneNext" destination="tMx-SwN-Itm" id="tMx-SwN-Out"/>
+                <outlet property="menuTmuxRotatePanes" destination="tMx-Rot-Itm" id="tMx-Rot-Out"/>
+                <outlet property="menuTmuxBreakPane" destination="tMx-Brk-Itm" id="tMx-Brk-Out"/>
+                <outlet property="menuTmuxJoinPanePrevious" destination="tMx-JnP-Itm" id="tMx-JnP-Out"/>
+                <outlet property="menuTmuxJoinPaneNext" destination="tMx-JnN-Itm" id="tMx-JnN-Out"/>
+                <outlet property="menuTmuxRunCommand" destination="tMx-Cmd-Itm" id="tMx-Cmd-Out"/>
                 <outlet property="menuToggleFullScreen" destination="8kY-Pi-KaY" id="yQg-6V-OO6"/>
                 <outlet property="menuToggleVisibility" destination="DOX-wA-ilh" id="iBj-Bc-2bq"/>
                 <outlet property="menuUndo" destination="r83-CV-syt" id="bU9-0b-xgQ"/>
@@ -222,6 +229,43 @@
                                                 <action selector="tmuxZoomPane:" target="-1" id="tMx-ZP-Act"/>
                                             </connections>
                                         </menuItem>
+                                        <menuItem isSeparatorItem="YES" id="tMx-Sp-004"/>
+                                        <menuItem title="Swap Pane with Previous" id="tMx-SwP-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxSwapPanePrevious:" target="-1" id="tMx-SwP-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Swap Pane with Next" id="tMx-SwN-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxSwapPaneNext:" target="-1" id="tMx-SwN-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Rotate Panes" id="tMx-Rot-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxRotatePanes:" target="-1" id="tMx-Rot-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Break Pane into New Window" id="tMx-Brk-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxBreakPane:" target="-1" id="tMx-Brk-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Join Pane to Previous Window" id="tMx-JnP-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxJoinPanePrevious:" target="-1" id="tMx-JnP-Act"/>
+                                            </connections>
+                                        </menuItem>
+                                        <menuItem title="Join Pane to Next Window" id="tMx-JnN-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxJoinPaneNext:" target="-1" id="tMx-JnN-Act"/>
+                                            </connections>
+                                        </menuItem>
                                         <menuItem isSeparatorItem="YES" id="tMx-Sp-002"/>
                                         <menuItem title="Kill Pane…" id="tMx-KP-Itm">
                                             <modifierMask key="keyEquivalentModifierMask"/>
@@ -230,6 +274,12 @@
                                             </connections>
                                         </menuItem>
                                         <menuItem isSeparatorItem="YES" id="tMx-Sp-003"/>
+                                        <menuItem title="Run Command…" id="tMx-Cmd-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxRunCommand:" target="-1" id="tMx-Cmd-Act"/>
+                                            </connections>
+                                        </menuItem>
                                         <menuItem title="Detach" id="tMx-Dt-Itm">
                                             <modifierMask key="keyEquivalentModifierMask"/>
                                             <connections>
