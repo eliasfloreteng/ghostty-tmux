@@ -36,6 +36,25 @@ pub const WindowSet = struct {
     /// session name, so the two cannot be confused.
     session_name: [:0]const u8,
 
+    /// Every session on the server, ours included, in tmux's order. Empty
+    /// until the GUI asks for it; see `Viewer.sessions`.
+    sessions: []const Session,
+
+    pub const Session = extern struct {
+        /// The tmux session ID, the `$N` of `switch-client -t`.
+        id: usize,
+
+        /// NUL terminated, owned by the set's arena.
+        name: [*:0]const u8,
+
+        /// How many windows it has. A session other than ours is only
+        /// counted when the list is read, so this can lag behind.
+        windows: usize,
+
+        /// How many clients are attached to it, us included.
+        attached: usize,
+    };
+
     pub const Window = extern struct {
         /// The tmux window ID. Stable for the lifetime of a viewer.
         id: usize,
@@ -91,6 +110,12 @@ pub const WindowSet = struct {
         /// empty: a window always has at least one pane.
         nodes: [*]const Node,
         nodes_len: usize,
+
+        /// Whether the user has hidden this window. A GUI should show no
+        /// tab or window for it: its panes are not read, and nothing is
+        /// delivered to anything displaying them, until it is shown
+        /// again. It is still in the session. See `Viewer.Window.hidden`.
+        hidden: bool,
 
         pub fn nodeSlice(self: Window) []const Node {
             return self.nodes[0..self.nodes_len];
@@ -164,6 +189,7 @@ pub const WindowSet = struct {
         gpa: Allocator,
         session_name: []const u8,
         windows: []const Viewer.Window,
+        sessions: []const Viewer.Session,
     ) Allocator.Error!*WindowSet {
         const self = try gpa.create(WindowSet);
         errdefer gpa.destroy(self);
@@ -172,6 +198,7 @@ pub const WindowSet = struct {
             .arena = .init(gpa),
             .windows = &.{},
             .session_name = "",
+            .sessions = &.{},
         };
         errdefer self.arena.deinit();
 
@@ -202,10 +229,20 @@ pub const WindowSet = struct {
                 .silence = src.alerts.silence,
                 .nodes = owned.ptr,
                 .nodes_len = owned.len,
+                .hidden = src.hidden,
             };
         }
 
         self.windows = copy;
+
+        const sessions_copy = try alloc.alloc(Session, sessions.len);
+        for (sessions, sessions_copy) |src, *dst| dst.* = .{
+            .id = src.id,
+            .name = try alloc.dupeZ(u8, src.name),
+            .windows = src.windows,
+            .attached = src.attached,
+        };
+        self.sessions = sessions_copy;
         return self;
     }
 
@@ -294,7 +331,7 @@ test "single pane window" {
     var window = try testWindow(alloc, 0, 83, 44, "83x44,0,0,0");
     defer window.deinit(alloc);
 
-    const set = try WindowSet.create(alloc, "", &.{window});
+    const set = try WindowSet.create(alloc, "", &.{window}, &.{});
     defer set.destroy();
 
     try testing.expectEqual(1, set.windows.len);
@@ -327,7 +364,7 @@ test "vertical split" {
     );
     defer window.deinit(alloc);
 
-    const set = try WindowSet.create(alloc, "", &.{window});
+    const set = try WindowSet.create(alloc, "", &.{window}, &.{});
     defer set.destroy();
 
     const nodes = set.windows[0].nodeSlice();
@@ -361,7 +398,7 @@ test "nested split keeps siblings contiguous" {
     );
     defer window.deinit(alloc);
 
-    const set = try WindowSet.create(alloc, "", &.{window});
+    const set = try WindowSet.create(alloc, "", &.{window}, &.{});
     defer set.destroy();
 
     try testing.expectEqual(3, set.windows[0].id);
@@ -395,7 +432,7 @@ test "multiple windows" {
     var w1 = try testWindow(alloc, 7, 80, 24, "80x24,0,0,5");
     defer w1.deinit(alloc);
 
-    const set = try WindowSet.create(alloc, "", &.{ w0, w1 });
+    const set = try WindowSet.create(alloc, "", &.{ w0, w1 }, &.{});
     defer set.destroy();
 
     try testing.expectEqual(2, set.windows.len);
@@ -405,7 +442,7 @@ test "multiple windows" {
 }
 
 test "empty window list" {
-    const set = try WindowSet.create(testing.allocator, "", &.{});
+    const set = try WindowSet.create(testing.allocator, "", &.{}, &.{});
     defer set.destroy();
     try testing.expectEqual(0, set.windows.len);
     try testing.expectEqualStrings("", set.session_name);
@@ -418,7 +455,7 @@ test "session name is copied and NUL terminated" {
     const set = set: {
         const name = try alloc.dupe(u8, "work");
         defer alloc.free(name);
-        break :set try WindowSet.create(alloc, name, &.{});
+        break :set try WindowSet.create(alloc, name, &.{}, &.{});
     };
     defer set.destroy();
 
@@ -433,7 +470,7 @@ test "alerts cross as flags" {
     defer window.deinit(alloc);
     window.alerts = .{ .bell = true, .silence = true };
 
-    const set = try WindowSet.create(alloc, "", &.{window});
+    const set = try WindowSet.create(alloc, "", &.{window}, &.{});
     defer set.destroy();
 
     try testing.expect(set.windows[0].bell);
@@ -451,10 +488,38 @@ test "active pane crosses as a flag and an id" {
     var unknown = try testWindow(alloc, 1, 83, 44, "83x44,0,0,3");
     defer unknown.deinit(alloc);
 
-    const set = try WindowSet.create(alloc, "", &.{ known, unknown });
+    const set = try WindowSet.create(alloc, "", &.{ known, unknown }, &.{});
     defer set.destroy();
 
     try testing.expect(set.windows[0].has_active_pane);
     try testing.expectEqual(2, set.windows[0].active_pane_id);
     try testing.expect(!set.windows[1].has_active_pane);
+}
+
+test "hidden windows and the session list are copied" {
+    const alloc = testing.allocator;
+
+    var shown = try testWindow(alloc, 0, 83, 44, "83x44,0,0,0");
+    defer shown.deinit(alloc);
+    var hidden = try testWindow(alloc, 1, 83, 44, "83x44,0,0,1");
+    defer hidden.deinit(alloc);
+    hidden.hidden = true;
+
+    // Freed before the set is read, so a set that borrowed it would fail.
+    const set = set: {
+        const name = try alloc.dupe(u8, "other one");
+        defer alloc.free(name);
+        break :set try WindowSet.create(alloc, "work", &.{ shown, hidden }, &.{
+            .{ .id = 0, .name = "work", .windows = 2, .attached = 1 },
+            .{ .id = 5, .name = name, .windows = 1, .attached = 0 },
+        });
+    };
+    defer set.destroy();
+
+    try testing.expect(!set.windows[0].hidden);
+    try testing.expect(set.windows[1].hidden);
+    try testing.expectEqual(2, set.sessions.len);
+    try testing.expectEqual(5, set.sessions[1].id);
+    try testing.expectEqualStrings("other one", std.mem.span(set.sessions[1].name));
+    try testing.expectEqual(1, set.sessions[0].attached);
 }

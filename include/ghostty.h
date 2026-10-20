@@ -1012,7 +1012,23 @@ typedef struct {
   bool silence;
   const ghostty_tmux_node_s* nodes;
   size_t nodes_len;
+  // The user hid this window (ghostty_surface_tmux_set_window_hidden, or
+  // another client of ours). Show no tab or window for it: its panes are
+  // not delivered to anything until it is shown again.
+  bool hidden;
 } ghostty_tmux_window_s;
+
+// terminal.tmux.WindowSet.Session
+//
+// A session on the server, ours or another. `name` is NUL terminated and
+// owned by the action. `windows` is only refreshed for other sessions when
+// the list is read again.
+typedef struct {
+  size_t id;
+  const char* name;
+  size_t windows;
+  size_t attached;
+} ghostty_tmux_session_s;
 
 // apprt.action.TmuxWindows.C
 //
@@ -1020,10 +1036,16 @@ typedef struct {
 // It is empty only when control mode has ended. An empty window list
 // with an empty name means the session is gone; with a name, the session
 // changed to that one and its windows follow in the next action.
+//
+// `sessions` lists every session on the server once
+// ghostty_surface_tmux_list_sessions has been called for this host, and is
+// kept current from then on; before that it is empty.
 typedef struct {
   const ghostty_tmux_window_s* windows;
   size_t len;
   const char* session_name;
+  const ghostty_tmux_session_s* sessions;
+  size_t sessions_len;
 } ghostty_action_tmux_windows_s;
 
 // apprt.action.TmuxNotice.Kind
@@ -1385,6 +1407,19 @@ GHOSTTY_API bool ghostty_surface_tmux_command(ghostty_surface_t,
 // including when it already ran once.
 GHOSTTY_API bool ghostty_surface_tmux_reattach(ghostty_surface_t);
 GHOSTTY_API void ghostty_tmux_router_free(void*);
+// Session-wide requests to the tmux session a surface hosts (the surface
+// that ran `tmux -CC`). Each returns false if the surface hosts none. The
+// result arrives as a later GHOSTTY_ACTION_TMUX_WINDOWS.
+//
+// Hide a window (no tab for it; it stays in the session) or show it again.
+GHOSTTY_API bool ghostty_surface_tmux_set_window_hidden(ghostty_surface_t,
+                                                        size_t,
+                                                        bool);
+// Move the client to another session, by tmux session id.
+GHOSTTY_API bool ghostty_surface_tmux_switch_session(ghostty_surface_t,
+                                                     size_t);
+// Fill in and keep current the action's session list.
+GHOSTTY_API bool ghostty_surface_tmux_list_sessions(ghostty_surface_t);
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);

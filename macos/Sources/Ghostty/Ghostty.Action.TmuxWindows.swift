@@ -13,6 +13,21 @@ extension Ghostty.Action {
         /// start with a snapshot that has no windows.
         let sessionName: String
 
+        /// Every session on the server, ours included. Empty until
+        /// `ghostty_surface_tmux_list_sessions` has been called for the
+        /// host, and kept current after that.
+        let sessions: [Session]
+
+        /// A session on the server the host is attached to.
+        struct Session {
+            let id: Int
+            let name: String
+            let windows: Int
+
+            /// How many clients are attached, us included when it is ours.
+            let attached: Int
+        }
+
         /// A single tmux window and its flattened layout tree. Node index 0
         /// is the root of the tree.
         struct Window {
@@ -38,6 +53,11 @@ extension Ghostty.Action {
             /// tmux's active pane in this window, if it is known. Focus
             /// starts here and follows it when it changes.
             let activePaneId: Int?
+
+            /// The user hid this window: it stays in the session but gets
+            /// no tab. Its panes are not delivered to anything until it is
+            /// shown again.
+            let hidden: Bool
 
             /// What tmux would mark the window with in its status line:
             /// it rang a bell, had activity, or fell silent since the
@@ -114,6 +134,18 @@ extension Ghostty.Action {
         init(c: ghostty_action_tmux_windows_s) {
             self.sessionName = c.session_name.map { String(cString: $0) } ?? ""
 
+            if c.sessions_len > 0, let cSessions = c.sessions {
+                self.sessions = UnsafeBufferPointer(start: cSessions, count: c.sessions_len).map {
+                    Session(
+                        id: $0.id,
+                        name: $0.name.map { String(cString: $0) } ?? "",
+                        windows: $0.windows,
+                        attached: $0.attached)
+                }
+            } else {
+                self.sessions = []
+            }
+
             guard c.len > 0, let cWindows = c.windows else {
                 self.windows = []
                 return
@@ -138,6 +170,7 @@ extension Ghostty.Action {
                     height: cWindow.height,
                     zoomedPaneId: cWindow.zoomed ? cWindow.zoomed_pane_id : nil,
                     activePaneId: cWindow.has_active_pane ? cWindow.active_pane_id : nil,
+                    hidden: cWindow.hidden,
                     alerts: Alerts(
                         bell: cWindow.bell,
                         activity: cWindow.activity,

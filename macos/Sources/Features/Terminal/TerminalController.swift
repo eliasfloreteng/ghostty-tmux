@@ -384,7 +384,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         contentSize: CGSize? = nil,
         initialFocus: Ghostty.SurfaceView? = nil,
         confirmUndo: Bool = true,
-        inheritBackgroundOpacity: Bool? = nil
+        inheritBackgroundOpacity: Bool? = nil,
+        activate: Bool = true
     ) -> TerminalController {
         // Calculate the target frame based on the tree's view bounds
         // before moving into the new window
@@ -406,7 +407,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Showing window in current event loop works so far with dragging surface into
         // a new window, but remember to defer the cascade when you move it inside
         // `scheduleInitialPresentation` to solve other issues in the future.
-        c.showWindowSafely(self)
+        //
+        // Not activated, it goes behind the key window without becoming
+        // key, so that its surfaces do not take focus. For a tmux window
+        // that matters the same way it does for an unselected tab (see
+        // `newTab`): focus would make it tmux's current window.
+        if activate {
+            c.showWindowSafely(self)
+        } else if let window = c.window {
+            window.order(.below, relativeTo: NSApp.keyWindow?.windowNumber ?? 0)
+        }
         c.scheduleInitialPresentation {
             if let window = c.window {
                 // If we have a tree size, resize the window's content to match

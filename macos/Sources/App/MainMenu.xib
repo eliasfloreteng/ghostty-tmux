@@ -280,6 +280,12 @@
                                                 <action selector="tmuxRunCommand:" target="-1" id="tMx-Cmd-Act"/>
                                             </connections>
                                         </menuItem>
+                                        <menuItem title="Dashboard…" id="tMx-DB-Itm">
+                                            <modifierMask key="keyEquivalentModifierMask"/>
+                                            <connections>
+                                                <action selector="tmuxDashboard:" target="-1" id="tMx-DB-Act"/>
+                                            </connections>
+                                        </menuItem>
                                         <menuItem title="Detach" id="tMx-Dt-Itm">
                                             <modifierMask key="keyEquivalentModifierMask"/>
                                             <connections>

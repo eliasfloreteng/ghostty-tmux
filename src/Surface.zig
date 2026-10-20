@@ -1215,10 +1215,27 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{
                     .session_name = windows.set.session_name,
                     .windows = windows.set.windows,
+                    .sessions = windows.set.sessions,
                 },
             );
         },
 
+        .tmux_paste_buffer => |req| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            defer req.deinit();
+
+            // No `clipboard-write` check and no confirmation: the user
+            // turned this on for exactly this, and a prompt on every copy
+            // in tmux would make it useless.
+            const data = try self.alloc.dupeZ(u8, req.slice());
+            defer self.alloc.free(data);
+            self.rt_surface.setClipboard(.standard, &.{.{
+                .mime = "text/plain",
+                .data = data,
+            }}, false) catch |err| {
+                log.err("error setting clipboard from tmux err={}", .{err});
+            };
+        },
         .tmux_pane_status => |status| tmux: {
             if (comptime !terminal.options.tmux_control_mode) break :tmux;
             _ = try self.rt_app.performAction(
@@ -2558,6 +2575,20 @@ fn tmuxSplit(
     return true;
 }
 
+/// Ask the tmux session this surface hosts for something about the
+/// session as a whole: see `termio.Termio.tmuxSessionInput`.
+///
+/// Public for the embedded apprt, whose session picker has the host's
+/// surface in hand. Returns false if this surface hosts no session.
+pub fn tmuxSessionInput(
+    self: *Surface,
+    req: terminal.tmux.Viewer.Input,
+) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+    if (!self.tmuxHosting()) return false;
+    self.io.tmuxSessionInput(req);
+    return true;
+}
 /// Run again the command that started a tmux session hosted here whose
 /// connection dropped, to reattach it. See the `connection_lost` tmux
 /// notice, which carries the same command for the GUI to show.

@@ -507,9 +507,11 @@ pub const Action = union(Key) {
         // For ABI compatibility, we expect that this is our union size.
         // At the time of writing, we don't promise ABI compatibility
         // so we can change this but I want to be aware of it.
+        //
+        // 40 since tmux_windows carries the session list (five words).
         assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
             4 => 24,
-            8 => 24,
+            8 => 40,
             else => unreachable,
         });
     }
@@ -1102,11 +1104,17 @@ pub const TmuxWindows = struct {
     session_name: [:0]const u8,
     windows: []const terminal.tmux.WindowSet.Window,
 
+    /// Every session on the server, once the GUI has asked for them
+    /// (`ghostty_surface_tmux_list_sessions`); empty before.
+    sessions: []const terminal.tmux.WindowSet.Session = &.{},
+
     // Sync with: ghostty_action_tmux_windows_s
     pub const C = extern struct {
         windows: [*]const terminal.tmux.WindowSet.Window,
         len: usize,
         session_name: [*:0]const u8,
+        sessions: [*]const terminal.tmux.WindowSet.Session,
+        sessions_len: usize,
     };
 
     pub fn cval(self: TmuxWindows) C {
@@ -1114,6 +1122,8 @@ pub const TmuxWindows = struct {
             .windows = self.windows.ptr,
             .len = self.windows.len,
             .session_name = self.session_name.ptr,
+            .sessions = self.sessions.ptr,
+            .sessions_len = self.sessions.len,
         };
     }
 

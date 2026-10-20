@@ -1798,6 +1798,14 @@ extension Ghostty {
             performTmuxAction("tmux_detach")
         }
 
+        /// The sessions on the server and the windows of this one. Not a
+        /// binding: it is the app's own window, not something the core
+        /// does.
+        @IBAction func tmuxDashboard(_ sender: Any?) {
+            guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
+            appDelegate.tmuxWindowManager.showDashboard(for: self)
+        }
+
         // The rest of the tmux menu are the ordinary bindings: on a tmux
         // pane the core sends each to tmux instead of doing it here. They
         // have their own selectors so that they can say they are tmux's,
@@ -2407,6 +2415,7 @@ extension Ghostty.SurfaceView: NSMenuItemValidation {
             return true
 
         case #selector(tmuxDetach),
+             #selector(tmuxDashboard),
              #selector(tmuxRunCommand):
             return tmuxPaneId != nil || hostedTmuxSession != nil
 
