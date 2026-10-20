@@ -102,14 +102,17 @@ pub const Router = struct {
             kill: *const fn (ctx: *anyopaque, pane_id: usize) void,
 
             /// The GUI asked for a new tab, which for a tmux surface
-            /// means a new tmux window.
-            newWindow: *const fn (ctx: *anyopaque) void,
+            /// means a new tmux window, starting in the working
+            /// directory of `inherit_from` if there is one.
+            newWindow: *const fn (ctx: *anyopaque, inherit_from: ?usize) void,
 
-            /// The GUI asked to split a pane.
+            /// The GUI asked to split a pane, and whether the new one
+            /// starts in its working directory.
             split: *const fn (
                 ctx: *anyopaque,
                 pane_id: usize,
                 direction: SplitDirection,
+                inherit_working_directory: bool,
             ) void,
 
             /// The GUI closed a tab, which for a tmux surface means
@@ -549,11 +552,12 @@ pub const Router = struct {
 
     /// Ask the session for a new window. Not tied to a pane: a new tab
     /// belongs to the session, and the pane the user happened to be in
-    /// does not narrow it.
-    pub fn newWindow(self: *Router) void {
+    /// does not narrow it. That pane, as `inherit_from`, only says
+    /// where the window's shell starts; null leaves that to tmux.
+    pub fn newWindow(self: *Router, inherit_from: ?usize) void {
         if (!self.hostAcquire()) return;
         defer self.hostRelease();
-        self.host.vtable.newWindow(self.host.ctx);
+        self.host.vtable.newWindow(self.host.ctx, inherit_from);
     }
 
     /// Ask the session to rename this pane's window.
@@ -667,16 +671,23 @@ pub const Router = struct {
         self.host.vtable.detach(self.host.ctx);
     }
 
-    /// Ask tmux to split a pane, putting the new one on the given side.
+    /// Ask tmux to split a pane, putting the new one on the given side,
+    /// and starting it in the pane's working directory if asked to.
     pub fn splitPane(
         self: *Router,
         pane_id: usize,
         direction: SplitDirection,
+        inherit_working_directory: bool,
     ) void {
         if (!self.paneOpen(pane_id)) return;
         if (!self.hostAcquire()) return;
         defer self.hostRelease();
-        self.host.vtable.split(self.host.ctx, pane_id, direction);
+        self.host.vtable.split(
+            self.host.ctx,
+            pane_id,
+            direction,
+            inherit_working_directory,
+        );
     }
 
     /// Ask tmux to close windows. `pane_id` names the window the user
@@ -786,7 +797,8 @@ const TestHost = struct {
         rows: usize,
     }) = .empty,
     kills: std.ArrayList(usize) = .empty,
-    new_windows: usize = 0,
+    /// Each new window's `inherit_from`.
+    new_windows: std.ArrayList(?usize) = .empty,
     detaches: usize = 0,
     selected_panes: std.ArrayList(usize) = .empty,
     zoomed_panes: std.ArrayList(usize) = .empty,
@@ -798,6 +810,7 @@ const TestHost = struct {
     splits: std.ArrayList(struct {
         pane_id: usize,
         direction: SplitDirection,
+        inherit_working_directory: bool,
     }) = .empty,
     window_kills: std.ArrayList(struct {
         pane_id: usize,
@@ -904,9 +917,9 @@ const TestHost = struct {
         }) catch @panic("oom");
     }
 
-    fn newWindow(ctx: *anyopaque) void {
+    fn newWindow(ctx: *anyopaque, inherit_from: ?usize) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
-        self.new_windows += 1;
+        self.new_windows.append(self.alloc, inherit_from) catch @panic("oom");
     }
 
     fn detach(ctx: *anyopaque) void {
@@ -939,11 +952,17 @@ const TestHost = struct {
         }) catch @panic("oom");
     }
 
-    fn split(ctx: *anyopaque, pane_id: usize, direction: SplitDirection) void {
+    fn split(
+        ctx: *anyopaque,
+        pane_id: usize,
+        direction: SplitDirection,
+        inherit_working_directory: bool,
+    ) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
         self.splits.append(self.alloc, .{
             .pane_id = pane_id,
             .direction = direction,
+            .inherit_working_directory = inherit_working_directory,
         }) catch @panic("oom");
     }
 
@@ -958,6 +977,7 @@ const TestHost = struct {
         self.pastes.deinit(self.alloc);
         self.resizes.deinit(self.alloc);
         self.kills.deinit(self.alloc);
+        self.new_windows.deinit(self.alloc);
         self.splits.deinit(self.alloc);
         self.window_kills.deinit(self.alloc);
         self.shown.deinit(self.alloc);
@@ -1309,6 +1329,35 @@ test "rearranging panes reaches the host only for panes still open" {
     tr.router.swapPane(5, .left);
     tr.router.movePane(6, 5, .up);
     try testing.expectEqual(5, tr.host.pane_moves.items.len);
+}
+
+test "new windows and splits say where they start" {
+    const alloc = testing.allocator;
+    var tr: TestRouter = undefined;
+    try tr.init(alloc);
+    defer tr.deinit();
+
+    const five = try tr.router.createChannel(5);
+
+    tr.router.newWindow(5);
+    tr.router.newWindow(null);
+    tr.router.splitPane(5, .right, true);
+    tr.router.splitPane(5, .down, false);
+
+    try testing.expectEqualSlices(?usize, &.{ 5, null }, tr.host.new_windows.items);
+    try testing.expectEqual(2, tr.host.splits.items.len);
+    try testing.expect(tr.host.splits.items[0].inherit_working_directory);
+    try testing.expect(!tr.host.splits.items[1].inherit_working_directory);
+
+    // A window belongs to the session, so one asked for from a pane
+    // that has closed is still made; the viewer starts it in tmux's
+    // default directory if it no longer knows the pane. A split of a
+    // closed pane has nothing to split.
+    five.close();
+    tr.router.newWindow(5);
+    tr.router.splitPane(5, .right, true);
+    try testing.expectEqual(3, tr.host.new_windows.items.len);
+    try testing.expectEqual(2, tr.host.splits.items.len);
 }
 
 test "a command line reaches the host until it goes away" {

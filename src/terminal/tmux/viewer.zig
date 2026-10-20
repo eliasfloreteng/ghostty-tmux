@@ -519,11 +519,9 @@ pub const Viewer = struct {
         /// second attached client can pin our panes small.
         client_size: ClientSize,
 
-        /// Ask tmux to kill a pane, because the thing displaying it was
-        /// closed.
         /// Ask tmux for a new window in this session, because the GUI
         /// asked for a new tab.
-        new_window: void,
+        new_window: NewWindow,
 
         /// Leave the session, because the user asked to detach.
         detach: void,
@@ -546,6 +544,8 @@ pub const Viewer = struct {
         /// Ask tmux to close windows, because the GUI closed a tab.
         kill_windows: KillWindows,
 
+        /// Ask tmux to kill a pane, because the thing displaying it was
+        /// closed.
         kill_pane: KillPane,
 
         /// Whatever displays this pane came into sight or went out of it:
@@ -614,7 +614,19 @@ pub const Viewer = struct {
             pane_id: usize,
             direction: Direction,
 
+            /// Start the new pane in the working directory of the one
+            /// being split, as a split does in plain Ghostty. See
+            /// `startDirectory`.
+            inherit_working_directory: bool = false,
+
             pub const Direction = sinkpkg.SplitDirection;
+        };
+
+        pub const NewWindow = struct {
+            /// The pane whose working directory the new window starts
+            /// in, as a new tab does in plain Ghostty, or null to leave
+            /// it to tmux. See `startDirectory`.
+            inherit_from: ?usize = null,
         };
 
         pub const KillWindows = struct {
@@ -999,6 +1011,16 @@ pub const Viewer = struct {
         /// again. See `syncLayouts`.
         reread: bool = false,
 
+        /// The pane's working directory as tmux last reported it,
+        /// `#{pane_current_path}`: a path on the server's host. Owned;
+        /// empty until tmux has said.
+        ///
+        /// Kept apart from the terminal's pwd, which is what the display
+        /// is told. The pane's program writes that one too, with its
+        /// own OSC 7, as a URL; a new pane started where this one is
+        /// needs the plain path tmux understands. See `startDirectory`.
+        path: []const u8 = "",
+
         pub fn create(
             io: std.Io,
             alloc: Allocator,
@@ -1039,12 +1061,14 @@ pub const Viewer = struct {
             self.paused = false;
             self.status = .live;
             self.reread = false;
+            self.path = "";
 
             return self;
         }
 
         pub fn destroy(self: *Pane, alloc: Allocator) void {
             if (self.sink) |s| s.close();
+            if (self.path.len > 0) alloc.free(self.path);
             if (self.read_history) |v| alloc.free(v);
             if (self.read_saved) |v| alloc.free(v);
             self.stream.deinit();
@@ -1285,7 +1309,7 @@ pub const Viewer = struct {
             .paste => self.nextPaste(input.paste),
             .resize => self.nextResize(input.resize),
             .client_size => self.nextClientSize(input.client_size),
-            .new_window => self.nextNewWindow(),
+            .new_window => self.nextNewWindow(input.new_window),
             .detach => self.nextDetach(),
             .select_pane => self.nextSelectPane(input.select_pane),
             .zoom_pane => self.nextZoomPane(input.zoom_pane),
@@ -1872,10 +1896,12 @@ pub const Viewer = struct {
     /// No target: tmux puts it in the client's session, which is the one
     /// we are attached to. The `%window-add` that follows is what makes
     /// it appear here, so nothing needs to be remembered in between.
-    fn nextNewWindow(self: *Viewer) []const Action {
+    fn nextNewWindow(self: *Viewer, req: Input.NewWindow) []const Action {
         if (self.state != .command_queue) return &.{};
 
-        return self.queueUserCommand("new-window\n", .{}) catch {
+        return self.queueUserCommand("new-window{f}\n", .{
+            self.startDirectory(req.inherit_from),
+        }) catch {
             log.warn("failed to queue new-window", .{});
             return &.{};
         };
@@ -1973,9 +1999,10 @@ pub const Viewer = struct {
     /// Write a window name as a single tmux command argument.
     ///
     /// This is the only place in the stack where user text becomes part
-    /// of a command, so it is worth setting out exactly what is being
-    /// defended against. A name has to survive two layers, and quoting
-    /// only helps with one of them.
+    /// of a command (a pane's working directory, from `startDirectory`,
+    /// comes through here too), so it is worth setting out exactly what
+    /// is being defended against. A name has to survive two layers, and
+    /// quoting only helps with one of them.
     ///
     /// 1. **Control bytes are dropped**, the newline above all. tmux
     ///    reads control mode input a line at a time
@@ -2018,6 +2045,59 @@ pub const Viewer = struct {
         }
         try writer.writeByte('\'');
     }
+
+    /// The `-c` that starts a new pane or window where a pane is, as
+    /// plain Ghostty starts a new split or tab in the directory of the
+    /// surface it came from. See `StartDirectory`.
+    ///
+    /// The directory is the one tmux last reported for the pane (see
+    /// `Pane.path`), not tmux's own `-c '#{pane_current_path}'`, the
+    /// usual way to say this in a tmux binding: tmux expands that
+    /// against the active pane of the session's current window,
+    /// whatever `-t` names (spawn.c gives the expansion no pane, and
+    /// format.c falls back to that one). The pane the user asked from
+    /// is not always that one --
+    /// focus may not have reached tmux yet, another client may have
+    /// moved it, and `new-window` has no pane to target at all. The
+    /// subscription keeps the reported one current to within a second.
+    fn startDirectory(self: *const Viewer, pane_id: ?usize) StartDirectory {
+        const id = pane_id orelse return .{ .path = null };
+        const pane = self.panes.get(id) orelse return .{ .path = null };
+
+        // tmux has not said yet, or could not find out.
+        if (pane.path.len == 0) return .{ .path = null };
+
+        // A path that `writeQuotedName` would have to change to send
+        // is not the pane's directory any more; tmux's own default is
+        // a better place to start than somewhere else.
+        for (pane.path) |c| if (c < 0x20 or c == 0x7F) {
+            return .{ .path = null };
+        };
+
+        return .{ .path = pane.path };
+    }
+
+    /// Formats as ` -c <path>`, quoted, for a command line, or as
+    /// nothing at all without a path: tmux then starts the pane in its
+    /// default (`default-path`, or the session's directory), as plain
+    /// Ghostty does with nothing to inherit from.
+    ///
+    /// Quoted like a window name, and for the same reasons: tmux puts
+    /// `-c` through format expansion after unquoting it (`spawn.c`), so
+    /// a `#` in a directory name needs doubling as much as one in a
+    /// window name does.
+    const StartDirectory = struct {
+        path: ?[]const u8,
+
+        pub fn format(
+            self: StartDirectory,
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            const path = self.path orelse return;
+            try writer.writeAll(" -c ");
+            try writeQuotedName(writer, path);
+        }
+    };
 
     /// Ask tmux to rename the window a pane is in.
     ///
@@ -2342,7 +2422,7 @@ pub const Viewer = struct {
 
         // `-b` puts the new pane before the one split, which is what
         // left and up mean.
-        return self.queueUserCommand("split-window {s} -t %{d}\n", .{
+        return self.queueUserCommand("split-window {s} -t %{d}{f}\n", .{
             switch (split.direction) {
                 .right => "-h",
                 .left => "-h -b",
@@ -2350,6 +2430,9 @@ pub const Viewer = struct {
                 .up => "-v -b",
             },
             split.pane_id,
+            self.startDirectory(
+                if (split.inherit_working_directory) split.pane_id else null,
+            ),
         }) catch {
             log.warn("failed to queue split for pane id={}", .{split.pane_id});
             return &.{};
@@ -4012,6 +4095,11 @@ pub const Viewer = struct {
             .path => {
                 // tmux could not find out, which it says with nothing.
                 if (value.len == 0) return;
+                if (!std.mem.eql(u8, pane.path, value)) {
+                    const copy = try self.alloc.dupe(u8, value);
+                    if (pane.path.len > 0) self.alloc.free(pane.path);
+                    pane.path = copy;
+                }
                 if (pane.terminal.getPwd()) |pwd| {
                     if (std.mem.eql(u8, pwd, value)) return;
                 }
@@ -10699,7 +10787,7 @@ test "a read-only client watches but does not touch the session" {
 
     // Asking tmux for something says why nothing happened, every time.
     for ([_]Viewer.Input{
-        .new_window,
+        .{ .new_window = .{} },
         .{ .split = .{ .pane_id = 0, .direction = .right } },
         .{ .kill_pane = .{ .pane_id = 0 } },
         .{ .kill_windows = .{ .pane_id = 0, .scope = .this } },
@@ -10827,6 +10915,82 @@ test "a split names the side the new pane goes" {
             .{ .input = .{ .tmux = .{ .block_end = "" } } },
         });
     }
+}
+
+test "new windows and splits start where the pane they came from is" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+
+    const answered: TestStep = .{ .input = .{ .tmux = .{ .block_end = "" } } };
+    const split: Viewer.Input = .{ .split = .{
+        .pane_id = 0,
+        .direction = .right,
+        .inherit_working_directory = true,
+    } };
+    const new_window: Viewer.Input = .{ .new_window = .{ .inherit_from = 0 } };
+
+    // Until tmux has said where the pane is, tmux's default it is.
+    try testViewer(&viewer, &.{
+        .{ .input = split, .commands = &.{"split-window -h -t %0\n"} },
+        answered,
+        .{ .input = new_window, .commands = &.{"new-window\n"} },
+        answered,
+    });
+
+    // Quoted, and with `#` doubled, since tmux expands `-c` as a format.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-path", 0, 0, "/home/me/it's #1"), .commands = &.{} },
+        .{
+            .input = split,
+            .commands = &.{"split-window -h -t %0 -c '/home/me/it'\\''s ##1'\n"},
+        },
+        answered,
+        .{
+            .input = new_window,
+            .commands = &.{"new-window -c '/home/me/it'\\''s ##1'\n"},
+        },
+        answered,
+    });
+
+    // The pane's own OSC 7 is for its display. What tmux starts a pane
+    // in is tmux's path, not a URL.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "\x1b]7;file://host/elsewhere\x07",
+        } } } },
+        .{
+            .input = split,
+            .commands = &.{"split-window -h -t %0 -c '/home/me/it'\\''s ##1'\n"},
+        },
+        answered,
+    });
+
+    // Not inheriting, or from a pane we do not know, leaves it to tmux.
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .split = .{ .pane_id = 0, .direction = .down } },
+            .commands = &.{"split-window -v -t %0\n"},
+        },
+        answered,
+        .{ .input = .{ .new_window = .{} }, .commands = &.{"new-window\n"} },
+        answered,
+        .{
+            .input = .{ .new_window = .{ .inherit_from = 42 } },
+            .commands = &.{"new-window\n"},
+        },
+        answered,
+    });
+
+    // A path that could not be sent as it is is not sent at all.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-path", 0, 0, "/tmp/a\x01b"), .commands = &.{} },
+        .{ .input = split, .commands = &.{"split-window -h -t %0\n"} },
+        answered,
+    });
 }
 
 /// A `%subscription-changed` for one of our subscriptions, in session 1.

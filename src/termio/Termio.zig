@@ -778,20 +778,22 @@ fn tmuxHostDetach(ctx: *anyopaque) void {
     self.tmuxHostInput(.detach);
 }
 
-fn tmuxHostNewWindow(ctx: *anyopaque) void {
+fn tmuxHostNewWindow(ctx: *anyopaque, inherit_from: ?usize) void {
     const self: *Termio = @ptrCast(@alignCast(ctx));
-    self.tmuxHostInput(.new_window);
+    self.tmuxHostInput(.{ .new_window = .{ .inherit_from = inherit_from } });
 }
 
 fn tmuxHostSplit(
     ctx: *anyopaque,
     pane_id: usize,
     direction: terminalpkg.tmux.Viewer.Input.Split.Direction,
+    inherit_working_directory: bool,
 ) void {
     const self: *Termio = @ptrCast(@alignCast(ctx));
     self.tmuxHostInput(.{ .split = .{
         .pane_id = pane_id,
         .direction = direction,
+        .inherit_working_directory = inherit_working_directory,
     } });
 }
 
