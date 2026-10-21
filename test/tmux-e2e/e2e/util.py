@@ -42,9 +42,10 @@ def wait_until(
 ) -> T:
     """Poll `predicate` until it returns a truthy value and return that value.
 
-    Exceptions raised by the predicate (other than HarnessError) count as
-    "not yet" so that transient states (e.g. a terminal disappearing between
-    listing it and reading its properties) don't abort the wait. On timeout a
+    Exceptions raised by the predicate (other than HarnessError and Skip,
+    which no amount of waiting changes) count as "not yet" so that transient
+    states (e.g. a terminal disappearing between listing it and reading its
+    properties) don't abort the wait. On timeout a
     CheckFailed is raised, including the last exception and, if given, a
     description of the current state to make failures self-explanatory.
     """
@@ -56,7 +57,7 @@ def wait_until(
             if value:
                 return value
             last_exc = None
-        except HarnessError:
+        except (HarnessError, Skip):
             raise
         except Exception as exc:  # noqa: BLE001 - see docstring
             last_exc = exc

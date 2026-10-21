@@ -222,10 +222,16 @@ class GhosttyApp:
         self.terminate()
 
     def relaunch(self, extra_config: str = "", timeout: float = 30.0) -> None:
-        """Quit and start again, with `extra_config` added to the config."""
+        """Quit and start again, with `extra_config` added to the config.
+
+        The window the app opens at launch is closed again, so a scenario
+        carries on without windows, as it started: that window would
+        otherwise count as a tmux tab, being no gateway.
+        """
         self.quit()
         self.write_config(extra_config)
         self.launch(timeout=timeout)
+        self.close_all_windows()
 
     @property
     def pid(self) -> int:
