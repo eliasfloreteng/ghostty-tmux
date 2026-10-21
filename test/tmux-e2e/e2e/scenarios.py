@@ -951,7 +951,6 @@ def no_restore_after_relaunch(ctx: Context) -> None:
     """With window-save-state=always, tmux tabs don't come back; the gateway returns as a shell."""
     ctx.app.relaunch("window-save-state = always\n")
     try:
-        ctx.app.close_all_windows(timeout=ctx.timeout)
         two_window_layout(ctx)
         ctx.app.quit()
         ctx.app.launch()
@@ -1101,7 +1100,6 @@ def pane_grapheme_widths(ctx: Context) -> None:
     # grid is tmux's, so it must not.
     ctx.app.relaunch("grapheme-width-method = legacy\n")
     try:
-        ctx.app.close_all_windows(timeout=ctx.timeout)
         ctx.attach()
         term = ctx.tab_for_window("main").terminals[0].id
         pane = f"{SESSION}:main"
@@ -1166,7 +1164,6 @@ def pane_osc52_clipboard(ctx: Context) -> None:
         # Which is Ghostty's to refuse.
         ctx.app.relaunch("clipboard-write = deny\n")
         ctx.gateway = ""
-        ctx.app.close_all_windows(timeout=ctx.timeout)
         ctx.tmux.kill_server()
         ctx.attach()
         pbcopy("osc52-before")
@@ -1538,8 +1535,10 @@ def tmux_bell_marks_tab(ctx: Context) -> None:
 @scenario
 def tmux_activity_marks_tab(ctx: Context) -> None:
     """With monitor-activity on, output in a background window marks its tab."""
-    ctx.tmux.add_config("set -g monitor-activity on\n")
     two_window_layout(ctx)
+    # Only now: on from the start, tmux flags the background window for
+    # its shell's first prompt, and its tab is rightly marked on attach.
+    ctx.tmux.run("set", "-g", "monitor-activity", "on")
     pane = ctx.tmux.window(SESSION, "beta").panes[0].id
     ctx.tmux.run("send-keys", "-t", pane, "echo busy", "Enter")
     expect_marks(ctx, "beta", {"activity"}, "the activity mark on tab 'beta'")
@@ -1597,30 +1596,36 @@ def tmux_pane_working_directory(ctx: Context) -> None:
 def hidden_pane_catches_up(ctx: Context) -> None:
     """With tmux-hidden-output-off-after, a busy background pane is current again once shown."""
     ctx.app.relaunch("tmux-hidden-output-off-after = 1\n")
-    ctx.attach({"alpha": 1, "beta": 1})
-    pane = ctx.tmux.window(SESSION, "beta").panes[0].id
-    ctx.tmux.run("send-keys", "-t", pane, "i=0; while :; do i=$((i+1)); echo tick-$i; sleep 0.1; done", "Enter")
+    try:
+        ctx.attach({"alpha": 1, "beta": 1})
+        pane = ctx.tmux.window(SESSION, "beta").panes[0].id
+        ctx.tmux.run("send-keys", "-t", pane, "i=0; while :; do i=$((i+1)); echo tick-$i; sleep 0.1; done", "Enter")
 
-    # Long enough for the hidden pane to be turned off and to miss output.
-    time.sleep(4)
-    select_tab_named(ctx, "beta")
-    term = ctx.tab_for_window("beta").terminals[0].id
+        # Long enough for the hidden pane to be turned off and to miss output.
+        time.sleep(4)
+        select_tab_named(ctx, "beta")
+        term = ctx.tab_for_window("beta").terminals[0].id
 
-    def last_tick(text: str) -> int:
-        ticks = re.findall(r"tick-(\d+)", text)
-        return int(ticks[-1]) if ticks else -1
+        def last_tick(text: str) -> int:
+            ticks = re.findall(r"tick-(\d+)", text)
+            return int(ticks[-1]) if ticks else -1
 
-    def caught_up() -> bool:
-        gui = last_tick(ctx.app.read_screen(term))
-        return gui > 0 and last_tick(ctx.tmux.capture(pane)) - gui <= 10
+        def caught_up() -> bool:
+            gui = last_tick(ctx.app.read_screen(term))
+            return gui > 0 and last_tick(ctx.tmux.capture(pane)) - gui <= 10
 
-    wait_until(
-        caught_up,
-        timeout=ctx.timeout,
-        desc="the pane, shown again, to show what tmux has",
-        describe_state=lambda: f"gui {last_tick(ctx.app.read_screen(term))} tmux {last_tick(ctx.tmux.capture(pane))}",
-    )
-    ctx.tmux.run("send-keys", "-t", pane, "C-c")
+        wait_until(
+            caught_up,
+            timeout=ctx.timeout,
+            desc="the pane, shown again, to show what tmux has",
+            describe_state=lambda: f"gui {last_tick(ctx.app.read_screen(term))} tmux {last_tick(ctx.tmux.capture(pane))}",
+        )
+        ctx.tmux.run("send-keys", "-t", pane, "C-c")
+    finally:
+        ctx.gateway = ""
+        ctx.app.relaunch()
+
+
 # -- rearranging panes and tabs ------------------------------------------------
 
 
@@ -1750,7 +1755,6 @@ def gui_status_bar(ctx: Context) -> None:
     """`tmux-status-bar = true` shows tmux's status line (screenshot; verify manually)."""
     ctx.app.relaunch("tmux-status-bar = true\n")
     try:
-        ctx.app.close_all_windows(timeout=ctx.timeout)
         ctx.tmux.add_config("set -g status-right 'e2e-status-right'\n")
         ctx.attach()
         # tmux checks subscriptions about once a second.
@@ -1827,7 +1831,8 @@ def dashboard_hidden_window_survives_reattach(ctx: Context) -> None:
     ctx.open_gateway()
     ctx.create_session({"alpha": 1, "beta": 1})
     ctx.tmux.run("set-option", "-w", "-t", f"{SESSION}:beta", "@ghostty-hidden", "1")
-    ctx.attach_session()
+    # Not waiting for a tab per tmux window: there is to be none for 'beta'.
+    ctx.attach_session(wait_gui=False)
     wait_until(
         lambda: sorted(t.name for t in ctx.tmux_tabs()) == ["alpha"],
         timeout=ctx.timeout,

@@ -110,8 +110,14 @@ class BaseTerminalController: NSWindowController,
         didSet { applyTitleToWindow() }
     }
 
-    /// The last computed title from the focused surface (without the override).
-    private var lastComputedTitle: String = "👻"
+    /// The last title and bell state published by the focused surface.
+    ///
+    /// The bell is kept as published rather than read off the surface when
+    /// the title is applied: `@Published` publishes before the property
+    /// changes, so reading it from the sink gets the old value, and a bell
+    /// cleared by focusing the surface would stay on a title override.
+    private var lastSurfaceTitle: String = "👻"
+    private var lastSurfaceBell: Bool = false
 
     /// The time that undo/redo operations that contain running ptys are valid for.
     var undoExpiration: Duration {
@@ -959,12 +965,11 @@ class BaseTerminalController: NSWindowController,
             // If we have a surface, we want to listen for title changes.
             titleSurface.$title
                 .combineLatest(titleSurface.$bell)
-                .map { [weak self] in self?.computeTitle(title: $0, bell: $1) ?? "" }
-                .sink { [weak self] in self?.titleDidChange(to: $0) }
+                .sink { [weak self] in self?.titleDidChange(to: $0, bell: $1) }
                 .store(in: &focusedSurfaceCancellables)
         } else {
             // There is no surface to listen to titles for.
-            titleDidChange(to: "👻")
+            titleDidChange(to: "👻", bell: false)
         }
     }
 
@@ -977,22 +982,17 @@ class BaseTerminalController: NSWindowController,
         return result
     }
 
-    private func titleDidChange(to: String) {
-        lastComputedTitle = to
+    private func titleDidChange(to title: String, bell: Bool) {
+        lastSurfaceTitle = title
+        lastSurfaceBell = bell
         applyTitleToWindow()
     }
 
     private func applyTitleToWindow() {
         guard let window else { return }
-
-        if let titleOverride {
-            window.title = computeTitle(
-                title: titleOverride,
-                bell: focusedSurface?.bell ?? false)
-            return
-        }
-
-        window.title = lastComputedTitle
+        window.title = computeTitle(
+            title: titleOverride ?? lastSurfaceTitle,
+            bell: lastSurfaceBell)
     }
 
     func pwdDidChange(to: URL?) {
