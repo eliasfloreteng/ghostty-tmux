@@ -95,6 +95,16 @@ test "a command that wrapped is read back whole" {
     );
 }
 
+test "a prompt marked without a command mark is read back" {
+    // A shell with no preexec hook (POSIX sh) can only mark its prompt,
+    // from `PS1`: nothing says where the input ends but the newline.
+    const command = (try testRead(
+        "\x1b]133;A\x07$ \x1b]133;B\x07tmux -CC attach\r\n",
+    )).?;
+    defer testing.allocator.free(command);
+    try testing.expectEqualStrings("tmux -CC attach", command);
+}
+
 test "nothing is read without shell integration" {
     try testing.expectEqual(null, try testRead("% tmux -CC attach\r\n"));
 }

@@ -471,7 +471,21 @@ def connection_lost_reattach(ctx: Context) -> None:
     `%exit`, and the gateway's shell prints its prompt into the DCS that
     never ended. Needs the gateway shell's Ghostty shell integration, which
     is what tells the app which command started the session.
+
+    The test shell has none (`shell-integration = none`, and /bin/sh is
+    not a shell Ghostty integrates with), so its prompt is given the OSC
+    133 marks integration would print. They matter twice: the input after
+    the prompt mark is the command offered again, and only an escape
+    sequence ends the DCS. A bare `gateway$ ` is text, which control mode
+    drops, so without the marks the app never hears the connection went.
+    SOH and STX around each mark keep readline from counting it in the
+    prompt's width, as `\\[` and `\\]` would.
     """
+    ctx.open_gateway()
+    ctx.app.type_line(
+        ctx.gateway,
+        r"PS1=$(printf '\001\033]133;A\007\002gateway$ \001\033]133;B\007\002')",
+    )
     two_window_layout(ctx)
     enter_session(ctx)
     out = ctx.tmux.run("list-clients", "-F", "#{client_pid}\t#{client_control_mode}")
