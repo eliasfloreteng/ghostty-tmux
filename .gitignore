@@ -32,3 +32,6 @@ glad.zip
 vgcore.*
 
 /sprite_face_test*
+
+# Personal Claude Code instructions
+CLAUDE.local.md
