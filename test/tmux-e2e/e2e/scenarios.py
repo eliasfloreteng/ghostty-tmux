@@ -303,12 +303,65 @@ def gui_zoom(ctx: Context) -> None:
         desc=f"tmux window 'beta' zoomed on {pane_id}",
         describe_state=ctx.describe,
     )
+    check_zoomed_size(ctx, term_id, pane_id)
     ctx.app.perform(term_id, "toggle_split_zoom")
     wait_until(
         lambda: not ctx.tmux.window(SESSION, "beta").zoomed,
         timeout=ctx.timeout,
         desc="tmux window 'beta' to unzoom",
         describe_state=ctx.describe,
+    )
+
+
+def check_zoomed_size(ctx: Context, term_id: str, pane_id: str) -> None:
+    """The zoomed terminal is as tall as tmux made the zoomed pane.
+
+    tmux keeps the unzoomed layout as the window's layout, but really
+    resizes the zoomed pane to the whole window. A line drawn at the
+    pane's last row has to land that many rows below one drawn at its
+    first: a terminal still at the unzoomed size clamps it short. The
+    markers are put together by the shell, so the command line echoing
+    them cannot be mistaken for them.
+    """
+    window = ctx.tmux.window(SESSION, "beta")
+    pane = next(p for p in window.panes if p.id == pane_id)
+    check(
+        pane.height == window.height,
+        f"tmux made zoomed pane {pane_id} {pane.width}x{pane.height} in a {window.width}x{window.height} window",
+    )
+    ctx.app.type_line(
+        term_id,
+        'a=TO b=BO; h=$(stty size | cut -d" " -f1); clear; printf "${a}P\\n\\033[${h};1H${b}T"',
+    )
+    wait_until(
+        lambda: ctx.tmux.capture(pane_id).rstrip("\n").split("\n")[-1].startswith("BOT"),
+        timeout=ctx.timeout,
+        desc=f"markers drawn in tmux pane {pane_id}",
+        describe_state=lambda: ctx.tmux.capture(pane_id)[-300:],
+    )
+
+    def rows_apart() -> int | None:
+        lines = ctx.app.read_screen(term_id).split("\n")
+        top = [i for i, line in enumerate(lines) if line.startswith("TOP")]
+        bottom = [i for i, line in enumerate(lines) if line.startswith("BOT")]
+        return bottom[-1] - top[-1] if top and bottom else None
+
+    wait_until(
+        lambda: rows_apart() == pane.height - 1,
+        timeout=ctx.timeout,
+        desc=f"zoomed terminal to be {pane.height} rows tall",
+        describe_state=lambda: f"markers {rows_apart()} rows apart, want {pane.height - 1}",
+    )
+
+    # And it stays zoomed: the GUI reporting the zoomed terminal's size
+    # must not unzoom it (`resize-pane` does) or grow the window.
+    ctx.wait_synced()
+    time.sleep(1)
+    after = ctx.tmux.window(SESSION, "beta")
+    check(after.zoomed, "the window unzoomed on its own")
+    check(
+        (after.width, after.height) == (window.width, window.height),
+        f"the window went from {window.width}x{window.height} to {after.width}x{after.height}",
     )
 
 
