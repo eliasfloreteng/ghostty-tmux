@@ -132,7 +132,8 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
 - `connection_lost_reattach`: a control client killed with SIGKILL (no
   `%exit`, as when ssh dies) closes the tabs and offers to reattach;
   accepting runs the attach command again in the gateway and the session
-  comes back. Needs the gateway shell's Ghostty shell integration.
+  comes back. The gateway's prompt is given the OSC 133 marks Ghostty's
+  shell integration would print; the offer needs Accessibility.
 - `switch_client`: the tabs become the other session's, the gateway is
   retitled and stays behind.
 - `resize_window`: resizing the GUI changes the tmux window size.
