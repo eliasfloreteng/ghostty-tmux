@@ -1905,6 +1905,109 @@ test "live: zooming a pane round-trips through tmux" {
     try testing.expect(!session.exited);
 }
 
+test "live: a zoomed pane is as big as tmux makes it, and sizes its window" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .down } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const window_id = session.viewer.windows.items[0].id;
+
+    try session.input(.{ .zoom_pane = .{ .pane_id = 1 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items[0].zoomed_pane_id != null and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // tmux made the zoomed pane the whole window, and writes its output
+    // for that size, while the layout it keeps still has it half that.
+    // Ours is the size tmux's is; so is the pane behind it.
+    try expectPaneSizeAsTmux(&session, 0);
+    try expectPaneSizeAsTmux(&session, 1);
+    try testing.expectEqualStrings(
+        try session.windowSize(window_id),
+        try paneSize(&session, 1),
+    );
+
+    // The GUI window grows while zoomed. Its zoomed surface is all
+    // there is of it, so the window becomes that size, and stays
+    // zoomed: not that size plus the pane behind it, and not unzoomed
+    // by a `resize-pane`.
+    try session.input(.{ .resize = .{ .pane_id = 1, .cols = 100, .rows = 30 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            const pane = v.viewer.panes.get(1) orelse return false;
+            return v.viewer.command_queue.empty() and
+                pane.terminal.cols == 100;
+        }
+    }.pred);
+    try testing.expectEqualStrings("100x30", try session.windowSize(window_id));
+    try testing.expectEqual(1, session.viewer.windows.items[0].zoomed_pane_id.?);
+    {
+        const zoomed = try session.ask(&.{
+            "display-message", "-p", "#{window_zoomed_flag}",
+        });
+        defer alloc.free(zoomed);
+        try testing.expectEqualStrings("1", std.mem.trim(u8, zoomed, " \r\n"));
+    }
+    try expectPaneSizeAsTmux(&session, 0);
+    try expectPaneSizeAsTmux(&session, 1);
+
+    // Unzoomed, the pane goes back to its share of the layout.
+    try session.input(.{ .zoom_pane = .{ .pane_id = 1 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items[0].zoomed_pane_id == null and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+    try expectPaneSizeAsTmux(&session, 0);
+    try expectPaneSizeAsTmux(&session, 1);
+    try testing.expect(session.viewer.panes.get(1).?.terminal.rows < 30);
+
+    try testing.expect(!session.exited);
+}
+
+/// A pane's size as tmux has it, `WxH`, in the session's scratch.
+fn paneSize(session: *Session, pane_id: usize) ![]const u8 {
+    const target = try std.fmt.allocPrint(session.alloc, "%{d}", .{pane_id});
+    defer session.alloc.free(target);
+
+    const out = try session.ask(&.{
+        "display-message",              "-p", "-t", target,
+        "#{pane_width}x#{pane_height}",
+    });
+    defer session.alloc.free(out);
+
+    const trimmed = std.mem.trim(u8, out, " \r\n");
+    @memcpy(session.scratch[0..trimmed.len], trimmed);
+    return session.scratch[0..trimmed.len];
+}
+
+fn expectPaneSizeAsTmux(session: *Session, pane_id: usize) !void {
+    const pane = session.viewer.panes.get(pane_id) orelse return error.MissingPane;
+    var buf: [32]u8 = undefined;
+    const ours = try std.fmt.bufPrint(
+        &buf,
+        "{d}x{d}",
+        .{ pane.terminal.cols, pane.terminal.rows },
+    );
+    try testing.expectEqualStrings(try paneSize(session, pane_id), ours);
+}
+
 test "live: tmux changing window tells us, and settles" {
     if (!enabled()) return error.SkipZigTest;
 

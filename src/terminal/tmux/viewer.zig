@@ -880,6 +880,20 @@ pub const Viewer = struct {
         layout_arena: ArenaAllocator.State,
         layout: Layout,
 
+        /// What tmux shows of the window while a pane is zoomed: the
+        /// zoomed pane alone, at the size of the whole window. Null
+        /// while nothing is zoomed. In `layout_arena`.
+        ///
+        /// A zoomed window's `layout` is still the unzoomed one, which
+        /// tmux keeps to go back to, and the other panes really are
+        /// still the size it says: tmux leaves them alone. The zoomed
+        /// pane is not. tmux resizes it to fill the window and writes
+        /// its output for that size, so its size comes from here, and
+        /// so does the window's when the GUI asks for one: the zoomed
+        /// pane's surface is then the only one on screen. See
+        /// `shownLayout`.
+        zoomed_layout: ?Layout = null,
+
         /// The last size we asked tmux to make this window. Like a pane's
         /// request this is what we asked for, not what tmux settled on, so
         /// that a clamped request is not re-sent forever. See
@@ -892,6 +906,14 @@ pub const Viewer = struct {
         pub fn deinit(self: *Window, alloc: Allocator) void {
             alloc.free(self.name);
             self.layout_arena.promote(alloc).deinit();
+        }
+
+        /// The layout on screen: the zoomed pane alone while one is,
+        /// otherwise the whole of it. This is what the window's size is
+        /// composed from, and what the panes on display ask to be sized
+        /// within.
+        pub fn shownLayout(self: *const Window) Layout {
+            return self.zoomed_layout orelse self.layout;
         }
     };
 
@@ -1569,6 +1591,17 @@ pub const Viewer = struct {
             return &.{};
         }).value_ptr.*;
 
+        const maybe_window: ?*Window = self.windowForPane(r.pane_id);
+
+        // A pane hidden behind a zoomed one has no say in anything: tmux
+        // is not showing it, and the window is sized from the zoomed
+        // pane alone. Whatever its surface makes of being hidden is not
+        // a size to ask for, and kept, it would mix into the window
+        // composed from the layout once the zoom ends.
+        if (maybe_window) |w| {
+            if (!layoutContainsPane(w.shownLayout(), r.pane_id)) return &.{};
+        }
+
         // A report of exactly the size the last layout took away from
         // this pane, before any report computed under that layout, is a
         // stale echo: it was computed from the tree the layout replaced
@@ -1594,7 +1627,8 @@ pub const Viewer = struct {
         // window waiting on a pane with nothing left to say.
         pane.last_resize_request = .{ .cols = r.cols, .rows = r.rows };
 
-        const window: *Window = self.windowForPane(r.pane_id) orelse return &.{};
+        const window: *Window = maybe_window orelse return &.{};
+        const shown = window.shownLayout();
 
         // Panes are relaid out together but report one at a time, and a
         // window's size is composed from all of them. Filling in the
@@ -1619,11 +1653,17 @@ pub const Viewer = struct {
         // relayout (B in, C still in flight) does not add up and waits.
         // And a report of the size a pane already has asks for nothing,
         // so it waits for company rather than going out alone.
-        if (!layoutFullyRequested(&self.panes, window.layout)) {
-            const composed = composeLayoutSize(&self.panes, window.layout);
+        //
+        // All of this is over the panes on screen. While a pane is
+        // zoomed that is the zoomed pane alone, which is the window:
+        // composing the unzoomed layout around its full-window size
+        // would ask tmux for a window as much bigger as the panes
+        // hidden behind it.
+        if (!layoutFullyRequested(&self.panes, shown)) {
+            const composed = composeLayoutSize(&self.panes, shown);
             if (composed.cols != window.width or
                 composed.rows != window.height or
-                !layoutRequestsChange(&self.panes, window.layout)) return &.{};
+                !layoutRequestsChange(&self.panes, shown)) return &.{};
         }
 
         return self.queueResize(window) catch |err| {
@@ -1691,7 +1731,16 @@ pub const Viewer = struct {
             }
         }
 
-        try self.appendPaneResizes(window.layout, &commands, lone_pane_covered);
+        // A zoomed pane is sized with its window and never on its own:
+        // tmux unzooms a window before resizing any pane in it, so a
+        // `resize-pane` here would undo the zoom the GUI is showing.
+        if (window.zoomed_layout != null) lone_pane_covered = true;
+
+        try self.appendPaneResizes(
+            window.shownLayout(),
+            &commands,
+            lone_pane_covered,
+        );
 
         if (commands.items.len == 0) return &.{};
 
@@ -1778,8 +1827,11 @@ pub const Viewer = struct {
         self: *Viewer,
         window: *Window,
     ) Allocator.Error!?WindowResize {
-        const want = composeLayoutSize(&self.panes, window.layout);
-        const only = window.layout.content == .pane;
+        // While a pane is zoomed it is the only one on screen, and so
+        // the only one the window is sized from. See `shownLayout`.
+        const shown = window.shownLayout();
+        const want = composeLayoutSize(&self.panes, shown);
+        const only = shown.content == .pane;
 
         if (window.last_size_request) |last| {
             if (last.cols == want.cols and last.rows == want.rows) {
@@ -1835,7 +1887,9 @@ pub const Viewer = struct {
         };
     }
 
-    /// The pane a window is zoomed to, from tmux's own account of it.
+    /// What tmux shows of a zoomed window, from its own account of it, or
+    /// null if the window is not zoomed. The zoomed pane is the one in
+    /// it: see `firstPaneId`.
     ///
     /// `flags` is tmux's window flags string, where 'Z' means zoomed.
     /// Only 'Z' is read: tmux formats these against the window's first
@@ -1850,11 +1904,11 @@ pub const Viewer = struct {
     /// A visible layout we cannot parse means unzoomed, not fatal: this
     /// decides how a window is drawn, and drawing it unzoomed is a great
     /// deal better than ending the session over it.
-    pub fn zoomedPane(
+    pub fn zoomedLayout(
         alloc: Allocator,
         flags: []const u8,
         visible_layout: []const u8,
-    ) ?usize {
+    ) ?Layout {
         if (std.mem.indexOfScalar(u8, flags, 'Z') == null) return null;
 
         const layout = Layout.parseWithChecksum(alloc, visible_layout) catch {
@@ -1865,7 +1919,9 @@ pub const Viewer = struct {
             return null;
         };
 
-        return firstPaneId(layout);
+        // A layout with no pane in it has nothing to be zoomed to.
+        if (firstPaneId(layout) == null) return null;
+        return layout;
     }
 
     fn layoutContainsPane(node: Layout, pane_id: usize) bool {
@@ -3857,16 +3913,20 @@ pub const Viewer = struct {
             defer window.layout_arena = arena.state;
             _ = arena.reset(.retain_capacity);
 
-            // The zoomed pane comes out of the *visible* layout, which is
-            // only ever read for this. syncLayouts below still diffs the
-            // real layout: a zoomed window's visible layout lists one
-            // pane, and treating that as the set of panes that exist
-            // would destroy every other pane in the window.
-            window.zoomed_pane_id = zoomedPane(
+            // The zoomed pane and its size come out of the *visible*
+            // layout. syncLayouts below still diffs the real layout: a
+            // zoomed window's visible layout lists one pane, and
+            // treating that as the set of panes that exist would
+            // destroy every other pane in the window.
+            window.zoomed_layout = zoomedLayout(
                 arena.allocator(),
                 flags,
                 visible_layout_str,
             );
+            window.zoomed_pane_id = if (window.zoomed_layout) |l|
+                firstPaneId(l)
+            else
+                null;
 
             break :layout Layout.parseWithChecksum(
                 arena.allocator(),
@@ -4534,13 +4594,28 @@ pub const Viewer = struct {
             }
             panes.deinit(self.alloc);
         }
-        for (windows) |window| try initLayout(
-            self.io,
-            self.alloc,
-            &self.panes,
-            &panes,
-            window.layout,
-        );
+        for (windows) |window| {
+            // The zoomed pane first, at the size tmux shows it at: a
+            // pane takes its size from the first node naming it, so the
+            // real layout after this sizes only the panes behind it,
+            // which tmux leaves at their unzoomed sizes. See
+            // `Window.zoomed_layout`.
+            if (window.zoomed_layout) |zoomed| try initLayout(
+                self.io,
+                self.alloc,
+                &self.panes,
+                &panes,
+                zoomed,
+            );
+
+            try initLayout(
+                self.io,
+                self.alloc,
+                &self.panes,
+                &panes,
+                window.layout,
+            );
+        }
 
         // Build up the list of removed panes.
         var removed: std.ArrayList(usize) = removed: {
@@ -5291,6 +5366,12 @@ pub const Viewer = struct {
                 return err;
             };
 
+            const zoomed: ?Layout = if (data.window_zoomed_flag) zoomedLayout(
+                window_alloc,
+                "Z",
+                data.window_visible_layout,
+            ) else null;
+
             // Which window tmux is on, learned here rather than waited
             // for: `%session-window-changed` only fires on a change, so
             // without this the first focus would send a `select-window`
@@ -5311,11 +5392,8 @@ pub const Viewer = struct {
                     .silence = data.window_silence_flag,
                 },
                 .hidden = data.@"@ghostty-hidden",
-                .zoomed_pane_id = if (data.window_zoomed_flag) zoomedPane(
-                    window_alloc,
-                    "Z",
-                    data.window_visible_layout,
-                ) else null,
+                .zoomed_layout = zoomed,
+                .zoomed_pane_id = if (zoomed) |l| firstPaneId(l) else null,
                 .width = data.window_width,
                 .height = data.window_height,
                 .layout_arena = arena.state,
@@ -9741,8 +9819,173 @@ test "a window already zoomed when we attach arrives zoomed" {
                         v.windows.items[0].zoomed_pane_id.?,
                     );
                     try testing.expectEqual(2, v.panes.count());
+
+                    // The zoomed pane is created at the size tmux has
+                    // it, the whole window, and read at that size; the
+                    // pane behind it at the size the layout keeps.
+                    try expectPaneSize(v, 1, 83, 44);
+                    try expectPaneSize(v, 0, 83, 20);
                 }
             }).check,
+        },
+    });
+}
+
+fn expectNotPane0(_: *Viewer, command: []const u8) !void {
+    try testing.expect(std.mem.indexOf(u8, command, "%0") == null);
+}
+
+fn expectPaneSize(v: *Viewer, id: usize, cols: usize, rows: usize) !void {
+    const pane = v.panes.get(id) orelse return error.MissingPane;
+    try testing.expectEqual(cols, pane.terminal.cols);
+    try testing.expectEqual(rows, pane.terminal.rows);
+}
+
+test "zooming a pane resizes it to the whole window and unzooming back" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 23);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try viewer.attachPane(1, mirror.sink());
+
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // tmux zooms pane 1. Its layout is still the unzoomed one, but
+        // tmux really did make the pane the whole window, 83x44, and
+        // writes its output for that size. Only what is on display is
+        // read again, and only for the pane that changed.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = two_panes_vertical,
+                .visible_layout = zoomed_to_pane_1,
+                .raw_flags = "*Z",
+            } } },
+            .contains_command = "capture-pane -p -e -C -N -a -t %1\n",
+            .check_command = expectNotPane0,
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try expectPaneSize(v, 1, 83, 44);
+
+                    // tmux leaves the panes behind it alone.
+                    try expectPaneSize(v, 0, 83, 20);
+                }
+            }).check,
+        },
+    });
+
+    // The surface mirroring the pane is resized with it.
+    try testing.expectEqual(83, mirror.terminal.cols);
+    try testing.expectEqual(44, mirror.terminal.rows);
+
+    try testViewer(&viewer, &.{
+        // The pane is read again at its new size: no saved grid, since
+        // it is on the primary screen, a blank display, and its state.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Unzoomed, the pane goes back to its share of the layout.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = two_panes_vertical,
+                .visible_layout = two_panes_vertical,
+                .raw_flags = "*",
+            } } },
+            .contains_command = "capture-pane -p -e -C -N -a -t %1\n",
+            .check_command = expectNotPane0,
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(
+                        null,
+                        v.windows.items[0].zoomed_layout,
+                    );
+                    try expectPaneSize(v, 1, 83, 23);
+                    try expectPaneSize(v, 0, 83, 20);
+                }
+            }).check,
+        },
+    });
+
+    try testing.expectEqual(83, mirror.terminal.cols);
+    try testing.expectEqual(23, mirror.terminal.rows);
+}
+
+test "a zoomed window is sized from the zoomed pane alone" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Both panes ask for the size they have, so tmux is told the
+        // window's size.
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 83, .rows = 20 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 83, .rows = 23 } },
+            .contains_command = "refresh-client -C @0:83x44\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Pane 0 asks for its size again, alone. That asks for nothing,
+        // so it is kept, waiting for company.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 83, .rows = 20 } },
+            .commands = &.{},
+        },
+
+        .{ .input = .{ .tmux = .{ .layout_change = .{
+            .window_id = 0,
+            .layout = two_panes_vertical,
+            .visible_layout = zoomed_to_pane_1,
+            .raw_flags = "*Z",
+        } } } },
+        // The pane is read again at its new size: no saved grid, since
+        // it is on the primary screen, a blank display, and its state.
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // The pane's surface, zoomed, reports the whole window: the
+        // size tmux already made it. With pane 0's request that
+        // completes the layout, which composes 83x(20 + 1 + 44) -- a
+        // window tmux would grow to, and grow the zoomed pane with it.
+        // But the zoomed pane is the window, at the size it already
+        // is, so nothing goes out.
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 83, .rows = 44 } },
+            .commands = &.{},
+        },
+
+        // Whatever the hidden pane's surface makes of being hidden is
+        // not a size to ask for, now or once the zoom ends.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 10, .rows = 5 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    const pane = v.panes.get(0) orelse return error.MissingPane;
+                    try testing.expectEqual(20, pane.last_resize_request.?.rows);
+                }
+            }).check,
+        },
+
+        // The GUI window grows while zoomed. The zoomed pane is the
+        // window, so the window is asked to be its size, and nothing
+        // else: a lone pane follows its window.
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 90, .rows = 50 } },
+            .commands = &.{"refresh-client -C @0:90x50\n"},
         },
     });
 }
@@ -9755,18 +9998,18 @@ test "only the Z flag means zoomed" {
     // nothing reliable about this client and must not be read.
     try testing.expectEqual(
         null,
-        Viewer.zoomedPane(alloc, "*-", zoomed_to_pane_1),
+        Viewer.zoomedLayout(alloc, "*-", zoomed_to_pane_1),
     );
-    try testing.expectEqual(
-        1,
-        Viewer.zoomedPane(alloc, "*Z", zoomed_to_pane_1).?,
-    );
+    const zoomed = Viewer.zoomedLayout(alloc, "*Z", zoomed_to_pane_1).?;
+    try testing.expectEqual(1, zoomed.content.pane);
+    try testing.expectEqual(83, zoomed.width);
+    try testing.expectEqual(44, zoomed.height);
 
     // A visible layout we cannot parse is drawn unzoomed rather than
     // ending the session.
     try testing.expectEqual(
         null,
-        Viewer.zoomedPane(alloc, "Z", "not a layout"),
+        Viewer.zoomedLayout(alloc, "Z", "not a layout"),
     );
 }
 
