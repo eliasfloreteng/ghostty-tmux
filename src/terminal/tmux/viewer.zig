@@ -264,6 +264,18 @@ pub const Viewer = struct {
     /// See `Options.follow_window_order`.
     follow_window_order: bool = false,
 
+    /// See `Options.attach_layout`.
+    attach_layout: AttachLayout = .tmux,
+
+    /// Whether the session's windows have been listed yet. Those listed
+    /// first are the ones attaching found, which `attach_layout` lays out;
+    /// any that open later are left as they come.
+    windows_listed: bool = false,
+
+    /// Whether the layouts saved in the session's windows have been read,
+    /// or need not be. See `Window.arrange_pending`.
+    saved_layouts_known: bool = true,
+
     /// See `Options.status_line`.
     status_line: bool = false,
 
@@ -813,6 +825,23 @@ pub const Viewer = struct {
         }
     };
 
+    /// How the splits of a window found on attach are laid out.
+    ///
+    /// tmux spreads a change in a window's size over its panes by its own
+    /// rules, which do not keep their proportions, so a window another
+    /// client of a different size has had comes back here uneven.
+    pub const AttachLayout = enum {
+        /// As tmux has it.
+        tmux,
+
+        /// As we last had it, in proportion, when the panes are still
+        /// the same panes split the same way; otherwise equally.
+        restore,
+
+        /// Equally, as `equalize_splits` does.
+        equalize,
+    };
+
     pub const Window = struct {
         id: usize,
 
@@ -907,8 +936,31 @@ pub const Viewer = struct {
         /// took the window over. See `reclaimWindowSize`.
         size_taken: bool = false,
 
+        /// Whether this window, found on attach, is still to be laid out
+        /// as `Viewer.attach_layout` says. That happens once, when we
+        /// first size it: the layout is then made for the size we asked
+        /// for, in the same breath, so tmux has no chance to spread the
+        /// change of size its own way. See `arrangeCommand`.
+        arrange_pending: bool = false,
+
+        /// The layout we last saw this window at our size, as saved in
+        /// the window (`@ghostty-layout`), the last time it was read.
+        /// Only until it is restored. Owned.
+        ///
+        /// A user option on the window, like `@ghostty-hidden`, so it is
+        /// there for the next attach, from this machine or another.
+        /// Saved as the layout changes while we size the window, and not
+        /// while another client does: the layout another client has
+        /// squeezed or stretched is not the one the user left here.
+        saved_layout: ?[]const u8 = null,
+
+        /// A hash of the layout we last saved, so the same one is not
+        /// saved again.
+        saved_hash: ?u64 = null,
+
         pub fn deinit(self: *Window, alloc: Allocator) void {
             alloc.free(self.name);
+            if (self.saved_layout) |v| alloc.free(v);
             self.layout_arena.promote(alloc).deinit();
         }
 
@@ -1256,6 +1308,11 @@ pub const Viewer = struct {
         /// have to answer the extra command.
         follow_window_order: bool = false,
 
+        /// How to lay out the splits of the windows found on attach. See
+        /// `AttachLayout`. Off by default, like `follow_window_order`,
+        /// for scripted tests of the viewer.
+        attach_layout: AttachLayout = .tmux,
+
         /// Mirror tmux's status line: `status-left`, the window list and
         /// `status-right`, as tmux formats them, delivered as `status`
         /// actions whenever any of them changes. Subscriptions too, so
@@ -1366,6 +1423,8 @@ pub const Viewer = struct {
             .pause_after = opts.pause_after,
             .hidden_output_off_after = opts.hidden_output_off_after,
             .follow_window_order = opts.follow_window_order,
+            .attach_layout = opts.attach_layout,
+            .saved_layouts_known = opts.attach_layout != .restore,
             .status_line = opts.status_line,
             .lazy_history = opts.lazy_history,
             .history_limit = opts.history_limit,
@@ -1763,6 +1822,15 @@ pub const Viewer = struct {
         // tmux unzooms a window before resizing any pane in it, so a
         // `resize-pane` here would undo the zoom the GUI is showing.
         if (window.zoomed_layout != null) lone_pane_covered = true;
+
+        // A window found on attach is laid out whole, at the size just
+        // asked for, which sizes every pane in it. Their own requests
+        // were made against the layout it replaces.
+        if (try self.arrangeCommand(window)) |c| {
+            errdefer c.deinit(self.alloc);
+            try commands.append(self.alloc, c);
+            lone_pane_covered = true;
+        }
 
         try self.appendPaneResizes(
             window.shownLayout(),
@@ -3344,6 +3412,19 @@ pub const Viewer = struct {
         return .{ .user = try builder.toOwnedSlice() };
     }
 
+    /// Like `userCommand`, for a command nobody asked for: see
+    /// `Command.ours`.
+    fn ourCommand(
+        self: *Viewer,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) Allocator.Error!Command {
+        var builder: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer builder.deinit();
+        builder.writer.print(fmt, args) catch return error.OutOfMemory;
+        return .{ .ours = try builder.toOwnedSlice() };
+    }
+
     /// Queue commands and return the actions that send them. Ownership
     /// of `commands` passes to the queue whether this succeeds or not.
     fn queueUserCommands(
@@ -3410,6 +3491,119 @@ pub const Viewer = struct {
             );
             return &.{};
         };
+    }
+
+    /// The `select-layout` laying out a window found on attach as
+    /// `attach_layout` says, once its size and its saved layout are both
+    /// known, or null if there is nothing (more) to do.
+    ///
+    /// Made for the size we last asked for, which is the size tmux is
+    /// about to have the window at: a layout of another size would be
+    /// resized by tmux, its own way, which is what this is to avoid.
+    fn arrangeCommand(self: *Viewer, window: *Window) Allocator.Error!?Command {
+        if (!window.arrange_pending or !self.saved_layouts_known) return null;
+        const want = window.last_size_request orelse return null;
+
+        window.arrange_pending = false;
+        const saved_str = window.saved_layout;
+        window.saved_layout = null;
+        defer if (saved_str) |v| self.alloc.free(v);
+
+        // A zoom is tmux's to keep, and what is behind it is not shown.
+        if (window.zoomed_layout != null) return null;
+        if (window.layout.content == .pane) return null;
+
+        var arena: ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const restored: ?Layout = restored: {
+            if (self.attach_layout != .restore) break :restored null;
+            const str = saved_str orelse break :restored null;
+            const saved = Layout.parseWithChecksum(alloc, str) catch break :restored null;
+            if (!saved.sameShape(window.layout)) break :restored null;
+            break :restored try saved.arrange(alloc, want.cols, want.rows, .proportional);
+        };
+        const arranged = restored orelse
+            try window.layout.arrange(alloc, want.cols, want.rows, .equal) orelse
+            return null;
+
+        return try self.ourCommand("select-layout -t @{d} '{s}'\n", .{
+            window.id,
+            try arranged.writeWithChecksum(alloc),
+        });
+    }
+
+    /// Lay out the windows found on attach that are waiting only for
+    /// their saved layouts, now that those are known. Windows whose size
+    /// we have not asked for yet are laid out when we do.
+    fn arrangeWindows(self: *Viewer) Allocator.Error!void {
+        for (self.windows.items) |*window| {
+            const command = try self.arrangeCommand(window) orelse continue;
+            errdefer command.deinit(self.alloc);
+            try self.queueCommands(&.{command});
+        }
+    }
+
+    /// Save `layout_str`, the window's layout as tmux has just sent it,
+    /// in the window, if it is a layout at the size we asked for.
+    /// See `Window.saved_layout`.
+    fn saveLayout(
+        self: *Viewer,
+        window: *Window,
+        layout_str: []const u8,
+    ) Allocator.Error!void {
+        if (self.attach_layout != .restore) return;
+
+        // Not before it is ours: the layout attaching found is the one
+        // being put right.
+        if (window.arrange_pending) return;
+        if (window.zoomed_layout != null) return;
+        const want = window.last_size_request orelse return;
+        if (window.layout.width != want.cols or
+            window.layout.height != want.rows) return;
+
+        const hash = std.hash.Wyhash.hash(0, layout_str);
+        if (window.saved_hash == hash) return;
+
+        // A layout is digits, `x`, commas and brackets: nothing quoting
+        // could trip over.
+        for (layout_str) |c| switch (c) {
+            '0'...'9', 'a'...'f', 'x', ',', '{', '}', '[', ']' => {},
+            else => return,
+        };
+
+        const command = try self.ourCommand(
+            "set-option -w -t @{d} @ghostty-layout '{s}'\n",
+            .{ window.id, layout_str },
+        );
+        errdefer command.deinit(self.alloc);
+        try self.queueCommands(&.{command});
+        window.saved_hash = hash;
+    }
+
+    fn receivedSavedLayouts(self: *Viewer, content: []const u8) Allocator.Error!void {
+        self.saved_layouts_known = true;
+
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            const sep = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const layout = std.mem.trim(u8, line[sep + 1 ..], " ");
+            if (layout.len == 0) continue;
+            const window_id = output.Variable.parse(
+                .window_id,
+                line[0..sep],
+            ) catch continue;
+            for (self.windows.items) |*window| {
+                if (window.id != window_id or !window.arrange_pending) continue;
+                if (window.saved_layout) |v| self.alloc.free(v);
+                window.saved_layout = try self.alloc.dupe(u8, layout);
+                window.saved_hash = std.hash.Wyhash.hash(0, layout);
+            }
+        }
+
+        try self.arrangeWindows();
     }
 
     /// Ask again for the size we last asked for a pane's window, if
@@ -4080,6 +4274,7 @@ pub const Viewer = struct {
         // Sync up our panes
         try self.syncLayouts(self.windows.items);
         try self.applyPendingNames();
+        try self.saveLayout(window, layout_str);
 
         // The panes a zoom hid are on screen again, and none of them
         // reported while hidden (see `nextResize`), so nothing stale of
@@ -5070,6 +5265,7 @@ pub const Viewer = struct {
             .pause_after = self.pause_after,
             .hidden_output_off_after = self.hidden_output_off_after,
             .follow_window_order = self.follow_window_order,
+            .attach_layout = self.attach_layout,
             .status_line = self.status_line,
             .lazy_history = self.lazy_history,
             .reattach_command = self.reattach_command,
@@ -5377,6 +5573,14 @@ pub const Viewer = struct {
                 try self.receivedWindowAlerts(arena_alloc, actions, content);
             },
 
+            .ours => |v| if (is_err) log.warn(
+                "tmux refused {s}: {s}",
+                .{ std.mem.trim(u8, v, " \n"), std.mem.trim(u8, content, " \t\r\n") },
+            ),
+
+            // A failure leaves the windows as tmux has them.
+            .saved_layouts => try self.receivedSavedLayouts(if (is_err) "" else content),
+
             .pane_titles => if (!is_err) {
                 try self.receivedPaneNames(.title, content);
             },
@@ -5632,7 +5836,6 @@ pub const Viewer = struct {
                 data.window_visible_layout,
             ) else null;
 
-
             const name = try self.alloc.dupe(u8, data.window_name);
             errdefer self.alloc.free(name);
 
@@ -5676,6 +5879,16 @@ pub const Viewer = struct {
                     if (old.id == w.id) w.active_pane_id = old.active_pane_id;
                 }
             }
+
+            // Laid out on attach, as `attach_layout` says: the windows
+            // in this first list, and only once.
+            w.arrange_pending = !self.windows_listed and self.attach_layout != .tmux;
+            for (self.windows.items) |*old| if (old.id == w.id) {
+                w.arrange_pending = old.arrange_pending;
+                w.saved_hash = old.saved_hash;
+                w.saved_layout = old.saved_layout;
+                old.saved_layout = null;
+            };
         }
 
         // While ours is still the old list, to compare against.
@@ -5689,6 +5902,11 @@ pub const Viewer = struct {
         try actions.append(arena_alloc, .{ .windows = self.windows.items });
         try self.applyPendingNames();
         try self.tellReadOnly(arena_alloc, actions);
+
+        if (!self.windows_listed) {
+            self.windows_listed = true;
+            if (!self.saved_layouts_known) try self.queueCommands(&.{.saved_layouts});
+        }
     }
 
     fn receivedPaneState(
@@ -6458,6 +6676,9 @@ const Command = union(enum) {
     /// See `Viewer.requestAlerts`.
     window_alerts,
 
+    /// The layout saved in every window. See `Viewer.Window.saved_layout`.
+    saved_layouts,
+
     /// Every pane's title, one per line after its id. Subscribing tells
     /// us about changes, and this is what a pane was already called: see
     /// `Viewer.syncLayouts`.
@@ -6493,6 +6714,11 @@ const Command = union(enum) {
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
+
+    /// A command of our own that nobody asked for, written out in full,
+    /// newline and all. Owned. Unlike `user`, a failure is ours to log,
+    /// not the user's to hear about.
+    ours: []const u8,
 
     /// A command line the user typed, and the marker that follows it.
     /// Answered by any number of replies. See `Viewer.nextCommandLine`.
@@ -6550,6 +6776,7 @@ const Command = union(enum) {
             .pause_after,
             .subscribe,
             .window_alerts,
+            .saved_layouts,
             .pane_titles,
             .pane_paths,
             .pane_output_on,
@@ -6560,7 +6787,7 @@ const Command = union(enum) {
             .select_window,
             .select_pane,
             => {},
-            .user, .paste_buffer => |v| alloc.free(v),
+            .user, .ours, .paste_buffer => |v| alloc.free(v),
             .prompt => |v| v.destroy(alloc),
         };
     }
@@ -6690,6 +6917,10 @@ const Command = union(enum) {
                 "list-windows -F '#{window_id} " ++ Format.alerts ++ "'\n",
             ),
 
+            .saved_layouts => try writer.writeAll(
+                "list-windows -F '#{window_id} #{@ghostty-layout}'\n",
+            ),
+
             // The id first and the rest of the line after it, because a
             // title or a path can hold any character a format delimiter
             // could be. `-s` for every pane in the session, as for
@@ -6765,7 +6996,7 @@ const Command = union(enum) {
                 },
             ),
 
-            .user => |v| try writer.writeAll(v),
+            .user, .ours => |v| try writer.writeAll(v),
             .select_window => |id| try writer.print("select-window -t @{d}\n", .{id}),
             .select_pane => |v| try writer.print("select-pane -t %{d}\n", .{v.pane_id}),
 
@@ -13889,4 +14120,112 @@ test "history that drifted from tmux's is read again, once" {
         .{ .input = testHistoryWanted(3, false), .commands = older_command },
     }));
     try testing.expect(!viewer.panes.get(0).?.older_off);
+}
+
+test "attach restores the saved layout at the size asked for" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{ .attach_layout = .restore });
+    defer viewer.deinit();
+
+    // Found even, saved at 3:1 at another size.
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_horizontal));
+    try testViewer(&viewer, &.{
+        // The pane state, then the saved layouts, asked for last.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "@0 0ad6,81x24,0,0{60x24,0,0,0,20x24,61,0,1}" } },
+            .commands = &.{},
+        },
+
+        // The panes report as the GUI laid them out from what it found.
+        // The window is asked for, and laid out whole at that size:
+        // 82 columns of panes in 3:1, the remainder to the smaller.
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 41, .rows = 44 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 41, .rows = 44 } },
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "select-layout -t @0 '25fb,83x44,0,0{61x44,0,0,0,21x44,62,0,1}'\n",
+            },
+        },
+    });
+
+    // Once only: answered, the layout is the one to save from now on.
+    for (0..2) |_| try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+    try testViewer(&viewer, &.{.{
+        .input = .{ .tmux = .{ .layout_change = .{
+            .window_id = 0,
+            .layout = "25fb,83x44,0,0{61x44,0,0,0,21x44,62,0,1}",
+            .visible_layout = "25fb,83x44,0,0{61x44,0,0,0,21x44,62,0,1}",
+            .raw_flags = "*",
+        } } },
+        .contains_command = "set-option -w -t @0 @ghostty-layout '25fb,83x44,0,0{61x44,0,0,0,21x44,62,0,1}'\n",
+    }});
+    try testing.expect(!viewer.windows.items[0].arrange_pending);
+}
+
+test "attach equalizes a window whose panes changed since it was saved" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{ .attach_layout = .restore });
+    defer viewer.deinit();
+
+    // Found side by side, unevenly; saved one above the other.
+    try testViewer(&viewer, testTwoPaneSteps("085b,83x44,0,0{20x44,0,0,0,62x44,21,0,1}"));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "@0 " ++ two_panes_vertical } } },
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 20, .rows = 44 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 62, .rows = 44 } },
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "select-layout -t @0 '1c1b,83x44,0,0{41x44,0,0,0,41x44,42,0,1}'\n",
+            },
+        },
+    });
+}
+
+test "attach lays out a window sized before its saved layout arrived" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{ .attach_layout = .restore });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_horizontal));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // The panes report over a slow link, ahead of the saved layout:
+        // the window and its panes are sized as ever, and its layout
+        // waits.
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 41, .rows = 44 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 41, .rows = 44 } },
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "resize-pane -t %0 -x 41 -y 44\n",
+                "resize-pane -t %1 -x 41 -y 44\n",
+            },
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "@0 0ad6,81x24,0,0{60x24,0,0,0,20x24,61,0,1}" } },
+            .commands = &.{
+                "select-layout -t @0 '25fb,83x44,0,0{61x44,0,0,0,21x44,62,0,1}'\n",
+            },
+        },
+    });
+}
+
+test "attach leaves the layout alone by default" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps("085b,83x44,0,0{20x44,0,0,0,62x44,21,0,1}"));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 20, .rows = 44 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 62, .rows = 44 } },
+            .commands = &.{
+                "refresh-client -C @0:83x44\n",
+                "resize-pane -t %0 -x 20 -y 44\n",
+                "resize-pane -t %1 -x 62 -y 44\n",
+            },
+        },
+    });
 }

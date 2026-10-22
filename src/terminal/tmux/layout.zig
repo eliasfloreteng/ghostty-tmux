@@ -222,6 +222,174 @@ pub const Layout = struct {
             .content = content,
         };
     }
+
+    /// Whether two layouts split the same panes the same way: the same
+    /// tree of splits, in the same directions, with the same panes in the
+    /// same places. Sizes are not compared.
+    pub fn sameShape(a: Layout, b: Layout) bool {
+        return switch (a.content) {
+            .pane => |id| switch (b.content) {
+                .pane => |other| id == other,
+                else => false,
+            },
+            .horizontal => |children| switch (b.content) {
+                .horizontal => |others| sameChildren(children, others),
+                else => false,
+            },
+            .vertical => |children| switch (b.content) {
+                .vertical => |others| sameChildren(children, others),
+                else => false,
+            },
+        };
+    }
+
+    fn sameChildren(a: []const Layout, b: []const Layout) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (!sameShape(x, y)) return false;
+        return true;
+    }
+
+    /// How `arrange` shares a split between its children.
+    pub const Share = enum {
+        /// In proportion to the sizes the children have in the layout.
+        proportional,
+
+        /// Equally, as Ghostty's equalize_splits does: tmux keeps splits
+        /// in one direction as one node, so every child is one share.
+        equal,
+    };
+
+    /// This layout's splits at another size, `width` by `height`, with
+    /// each split shared between its children as `share` says. Every
+    /// pane keeps its place; only the sizes change. Null if the size has
+    /// too little room for every pane and the dividers between them.
+    pub fn arrange(
+        self: Layout,
+        alloc: Allocator,
+        width: usize,
+        height: usize,
+        share: Share,
+    ) Allocator.Error!?Layout {
+        return try self.arrangeAt(alloc, 0, 0, width, height, share);
+    }
+
+    fn arrangeAt(
+        self: Layout,
+        alloc: Allocator,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        share: Share,
+    ) Allocator.Error!?Layout {
+        if (width == 0 or height == 0) return null;
+        const children: []const Layout, const across: bool = switch (self.content) {
+            .pane => |id| return .{
+                .width = width,
+                .height = height,
+                .x = x,
+                .y = y,
+                .content = .{ .pane = id },
+            },
+            .horizontal => |v| .{ v, true },
+            .vertical => |v| .{ v, false },
+        };
+
+        // A one-cell divider between each pair of children.
+        const total = if (across) width else height;
+        if (total + 1 < children.len * 2) return null;
+        const room = total - (children.len - 1);
+
+        // Each child's share of the room, rounded down.
+        var weight_sum: usize = 0;
+        for (children) |child| weight_sum += weight(child, across, share);
+        if (weight_sum == 0) return null;
+
+        const nodes = try alloc.alloc(Layout, children.len);
+        var given: usize = 0;
+        var sizes = try alloc.alloc(usize, children.len);
+        defer alloc.free(sizes);
+        for (children, 0..) |child, i| {
+            sizes[i] = @max(1, room * weight(child, across, share) / weight_sum);
+            given += sizes[i];
+        }
+
+        // Rounding down left some room over, or the minimum of one cell
+        // took more than there was: the smallest children get what is
+        // left over, and the largest give back what is owed.
+        while (given != room) {
+            var pick: usize = 0;
+            for (sizes, 0..) |size, i| {
+                if (given < room) {
+                    if (size < sizes[pick]) pick = i;
+                } else if (size > sizes[pick]) pick = i;
+            }
+            if (given < room) {
+                sizes[pick] += 1;
+                given += 1;
+            } else {
+                if (sizes[pick] <= 1) return null;
+                sizes[pick] -= 1;
+                given -= 1;
+            }
+        }
+
+        var offset: usize = 0;
+        for (children, sizes, 0..) |child, size, i| {
+            nodes[i] = (if (across)
+                try child.arrangeAt(alloc, x + offset, y, size, height, share)
+            else
+                try child.arrangeAt(alloc, x, y + offset, width, size, share)) orelse
+                return null;
+            offset += size + 1;
+        }
+
+        return .{
+            .width = width,
+            .height = height,
+            .x = x,
+            .y = y,
+            .content = if (across) .{ .horizontal = nodes } else .{ .vertical = nodes },
+        };
+    }
+
+    fn weight(self: Layout, across: bool, share: Share) usize {
+        return switch (share) {
+            .equal => 1,
+            .proportional => if (across) self.width else self.height,
+        };
+    }
+
+    /// Write the layout as tmux writes it, checksum first, which is what
+    /// `select-layout` takes.
+    pub fn writeWithChecksum(
+        self: Layout,
+        alloc: Allocator,
+    ) Allocator.Error![]u8 {
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        self.write(&body.writer) catch return error.OutOfMemory;
+        const str = body.written();
+        return try std.fmt.allocPrint(alloc, "{s},{s}", .{
+            &Checksum.calculate(str).asString(),
+            str,
+        });
+    }
+
+    fn write(self: Layout, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("{d}x{d},{d},{d}", .{ self.width, self.height, self.x, self.y });
+        const children: []const Layout, const open: u8, const close: u8 = switch (self.content) {
+            .pane => |id| return writer.print(",{d}", .{id}),
+            .horizontal => |v| .{ v, '{', '}' },
+            .vertical => |v| .{ v, '[', ']' },
+        };
+        try writer.writeByte(open);
+        for (children, 0..) |child, i| {
+            if (i > 0) try writer.writeByte(',');
+            try child.write(writer);
+        }
+        try writer.writeByte(close);
+    }
 };
 
 pub const Checksum = enum(u16) {
@@ -635,4 +803,66 @@ test "checksum known tmux layout bb62" {
     // The checksum "bb62" corresponds to the layout "159x48,0,0{79x48,0,0,79x48,80,0}"
     const checksum = Checksum.calculate("159x48,0,0{79x48,0,0,79x48,80,0}");
     try testing.expectEqualStrings("bb62", &checksum.asString());
+}
+
+test "write a layout as tmux does" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const str = "f8f9,80x24,0,0{40x24,0,0,1,40x24,40,0,2}";
+    const layout: Layout = try .parseWithChecksum(alloc, str);
+    try testing.expectEqualStrings(str, try layout.writeWithChecksum(alloc));
+}
+
+test "same shape ignores sizes, not panes or directions" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const a: Layout = try .parse(alloc, "80x24,0,0{40x24,0,0,1,39x24,41,0,2}");
+    const b: Layout = try .parse(alloc, "100x30,0,0{20x30,0,0,1,79x30,21,0,2}");
+    const swapped: Layout = try .parse(alloc, "80x24,0,0{40x24,0,0,2,39x24,41,0,1}");
+    const turned: Layout = try .parse(alloc, "80x24,0,0[80x12,0,0,1,80x11,0,13,2]");
+    const more: Layout = try .parse(alloc, "80x24,0,0{40x24,0,0,1,19x24,41,0,2,19x24,61,0,3}");
+    try testing.expect(a.sameShape(b));
+    try testing.expect(!a.sameShape(swapped));
+    try testing.expect(!a.sameShape(turned));
+    try testing.expect(!a.sameShape(more));
+}
+
+test "arrange keeps proportions at a new size" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // 3:1 across, and an even split down the right.
+    const saved: Layout = try .parse(
+        alloc,
+        "81x24,0,0{60x24,0,0,1,20x24,61,0[20x12,61,0,2,20x11,61,13,3]}",
+    );
+    const at = (try saved.arrange(alloc, 161, 48, .proportional)).?;
+    try testing.expectEqualStrings(
+        "161x48,0,0{120x48,0,0,1,40x48,121,0[40x24,121,0,2,40x23,121,25,3]}",
+        (try at.writeWithChecksum(alloc))[5..],
+    );
+}
+
+test "arrange equally" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const uneven: Layout = try .parse(
+        alloc,
+        "80x24,0,0{10x24,0,0,1,50x24,11,0,2,18x24,62,0,3}",
+    );
+    const at = (try uneven.arrange(alloc, 80, 24, .equal)).?;
+    try testing.expectEqualStrings(
+        "80x24,0,0{26x24,0,0,1,26x24,27,0,2,26x24,54,0,3}",
+        (try at.writeWithChecksum(alloc))[5..],
+    );
+
+    // No room for three panes and two dividers.
+    try testing.expect(try uneven.arrange(alloc, 4, 24, .equal) == null);
 }

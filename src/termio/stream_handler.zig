@@ -59,6 +59,9 @@ pub const StreamHandler = struct {
     /// output, before its output is turned off, or 0 never to. Read when
     /// a control mode session starts.
     tmux_hidden_output_off_after: u32 = 0,
+    /// How to lay out the windows found on attach. Read when a control
+    /// mode session starts.
+    tmux_attach_layout: configpkg.Config.TmuxAttachLayout = .restore,
     /// Whether to mirror tmux's status line. Read when a control mode
     /// session starts.
     tmux_status_bar: bool = false,
@@ -325,6 +328,7 @@ pub const StreamHandler = struct {
         self.tmux_paste_buffer_clipboard = config.tmux_paste_buffer_clipboard;
         self.tmux_client_flags = config.tmux_client_flags;
         self.tmux_hidden_output_off_after = config.tmux_hidden_output_off_after;
+        self.tmux_attach_layout = config.tmux_attach_layout;
         self.tmux_status_bar = config.tmux_status_bar;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
@@ -711,6 +715,11 @@ pub const StreamHandler = struct {
                                 .no_detach_on_destroy = self.tmux_client_flags.@"no-detach-on-destroy",
                             },
                             .hidden_output_off_after = self.tmux_hidden_output_off_after,
+                            .attach_layout = switch (self.tmux_attach_layout) {
+                                .restore => .restore,
+                                .equalize => .equalize,
+                                .tmux => .tmux,
+                            },
                             .follow_window_order = true,
                             .status_line = self.tmux_status_bar,
                             .lazy_history = true,

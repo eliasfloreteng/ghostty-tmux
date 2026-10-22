@@ -229,6 +229,7 @@ pub const DerivedConfig = struct {
     tmux_paste_buffer_clipboard: bool,
     tmux_client_flags: configpkg.Config.TmuxClientFlags,
     tmux_hidden_output_off_after: u32,
+    tmux_attach_layout: configpkg.Config.TmuxAttachLayout,
     tmux_status_bar: bool,
 
     pub fn init(
@@ -273,6 +274,7 @@ pub const DerivedConfig = struct {
             .tmux_paste_buffer_clipboard = config.@"tmux-paste-buffer-clipboard",
             .tmux_client_flags = config.@"tmux-client-flags",
             .tmux_hidden_output_off_after = config.@"tmux-hidden-output-off-after",
+            .tmux_attach_layout = config.@"tmux-attach-layout",
             .tmux_status_bar = config.@"tmux-status-bar",
             .conditional_state = config._conditional_state,
 
@@ -376,6 +378,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         // before the config is next reloaded.
         .tmux_pause_after = opts.config.tmux_pause_after,
         .tmux_hidden_output_off_after = opts.config.tmux_hidden_output_off_after,
+        .tmux_attach_layout = opts.config.tmux_attach_layout,
         .tmux_status_bar = opts.config.tmux_status_bar,
         .tmux_history_limit = opts.config.tmux_history_limit,
         .tmux_paste_buffer_clipboard = opts.config.tmux_paste_buffer_clipboard,

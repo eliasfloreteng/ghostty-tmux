@@ -2627,6 +2627,29 @@ keybind: Keybinds = .{},
 ///
 /// Set to 0 to disable, which is the default. Requires tmux 3.2 or newer.
 @"tmux-hidden-output-off-after": u32 = 0,
+
+/// How to lay out the splits of a tmux window when attaching to a tmux
+/// control mode session (`tmux -CC`) that already has it.
+///
+/// tmux spreads a change in a window's size over its panes its own way,
+/// which does not keep their proportions. So a window that another client
+/// of a different size has had, or that Ghostty opens at another size than
+/// before, can come back with its splits uneven.
+///
+///   * `restore` - As they were the last time Ghostty showed the window,
+///     in proportion. Ghostty keeps that in the window itself, as the
+///     user option `@ghostty-layout`, so it is there however the session
+///     is attached next. A window whose panes have changed since (split,
+///     closed or moved from another client), or that Ghostty has never
+///     shown, is laid out as with `equalize`.
+///
+///   * `equalize` - Equally, as `equalize_splits` does.
+///
+///   * `tmux` - As tmux has them.
+///
+/// Only the windows found on attach are laid out, once each; a zoomed
+/// window is left as it is. Requires tmux 3.2 or newer for `restore`.
+@"tmux-attach-layout": TmuxAttachLayout = .restore,
 /// Show tmux's status line in the windows of a tmux control mode session
 /// (`tmux -CC`): a bar along the bottom of each window with `status-left`,
 /// the window list and `status-right`, formatted by tmux as its own
@@ -9035,6 +9058,13 @@ pub const ShellIntegrationFeatures = packed struct {
 pub const TmuxWindowPlacement = enum {
     tabs,
     windows,
+};
+
+/// See tmux-attach-layout
+pub const TmuxAttachLayout = enum {
+    restore,
+    equalize,
+    tmux,
 };
 
 /// See tmux-client-flags

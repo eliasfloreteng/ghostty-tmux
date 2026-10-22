@@ -1284,6 +1284,75 @@ def attach_while_vim_open(ctx: Context) -> None:
     ctx.tmux.run("send-keys", "-t", pane, "Escape", ":qa!", "Enter")
 
 
+def _pane_widths(ctx: Context, name: str) -> list[int]:
+    return [p.width for p in ctx.tmux.window(SESSION, name).panes]
+
+
+@scenario
+def attach_equalizes_splits(ctx: Context) -> None:
+    """Attaching to a window left with uneven splits, and no layout of ours saved, evens them out."""
+    ctx.open_gateway()
+    ctx.create_session({"main": 3})
+    target = f"{SESSION}:main"
+    ctx.tmux.run("select-layout", "-t", target, "even-horizontal")
+    ctx.tmux.run("resize-pane", "-t", ctx.tmux.window(SESSION, "main").panes[0].id, "-x", "10")
+    check(max(_pane_widths(ctx, "main")) - min(_pane_widths(ctx, "main")) > 10, "the splits did not start uneven")
+
+    ctx.attach_session()
+    wait_until(
+        lambda: max(w := _pane_widths(ctx, "main")) - min(w) <= 1,
+        timeout=ctx.timeout,
+        desc="the splits to be even",
+        describe_state=lambda: f"pane widths {_pane_widths(ctx, 'main')}",
+    )
+    ctx.wait_synced()
+
+
+@scenario
+def attach_restores_splits(ctx: Context) -> None:
+    """Splits left uneven in Ghostty come back in proportion after another client resized the window."""
+    ctx.attach({"main": 2})
+    target = f"{SESSION}:main"
+    ctx.tmux.run("select-layout", "-t", target, "even-horizontal")
+    ctx.wait_synced()
+    total = sum(_pane_widths(ctx, "main")) + 1
+    ctx.tmux.run("resize-pane", "-t", ctx.tmux.window(SESSION, "main").panes[0].id, "-x", str(total // 4))
+    ctx.wait_synced()
+    wanted = _pane_widths(ctx, "main")[0] / total
+    window = ctx.tmux.window(SESSION, "main").id
+    wait_until(
+        lambda: ctx.tmux.run("show-options", "-wqv", "-t", window, "@ghostty-layout").strip()
+        == ctx.tmux.run("display", "-p", "-t", window, "#{window_layout}").strip(),
+        timeout=ctx.timeout,
+        desc="the layout to be saved in the window",
+    )
+
+    for client in ctx.tmux.control_clients():
+        ctx.tmux.run("detach-client", "-t", client)
+    expect_gateway_back(ctx, "detach-client")
+
+    # Another client, half as wide, has the window: tmux takes the
+    # columns from the panes its own way. Then that client is gone.
+    ctx.tmux.run("resize-window", "-t", target, "-x", str(total // 2))
+    ctx.tmux.run("set-option", "-wu", "-t", target, "window-size")
+    squeezed = _pane_widths(ctx, "main")
+    log(f"pane widths after another client: {squeezed}")
+
+    ctx.attach_session()
+
+    def ratio() -> float:
+        w = _pane_widths(ctx, "main")
+        return w[0] / (sum(w) + 1)
+
+    wait_until(
+        lambda: abs(ratio() - wanted) * (sum(_pane_widths(ctx, "main")) + 1) <= 1.5,
+        timeout=ctx.timeout,
+        desc=f"the left split back at {wanted:.2f} of the window",
+        describe_state=lambda: f"pane widths {_pane_widths(ctx, 'main')}, ratio {ratio():.2f}",
+    )
+    ctx.wait_synced()
+
+
 @scenario
 def attach_with_history(ctx: Context) -> None:
     """Attaching to panes with long history makes the history scrollable in the GUI."""
