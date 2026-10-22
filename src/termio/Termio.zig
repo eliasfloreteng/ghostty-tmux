@@ -851,9 +851,16 @@ fn tmuxHostDetach(ctx: *anyopaque) void {
     self.tmuxHostInput(.detach);
 }
 
-fn tmuxHostNewWindow(ctx: *anyopaque, inherit_from: ?usize) void {
+fn tmuxHostNewWindow(
+    ctx: *anyopaque,
+    pane_id: usize,
+    inherit_working_directory: bool,
+) void {
     const self: *Termio = @ptrCast(@alignCast(ctx));
-    self.tmuxHostInput(.{ .new_window = .{ .inherit_from = inherit_from } });
+    self.tmuxHostInput(.{ .new_window = .{
+        .pane_id = pane_id,
+        .inherit_working_directory = inherit_working_directory,
+    } });
 }
 
 fn tmuxHostSplit(

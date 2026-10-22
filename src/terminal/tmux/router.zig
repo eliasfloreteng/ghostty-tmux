@@ -101,10 +101,14 @@ pub const Router = struct {
             /// The pane's display was closed by the user.
             kill: *const fn (ctx: *anyopaque, pane_id: usize) void,
 
-            /// The GUI asked for a new tab, which for a tmux surface
-            /// means a new tmux window, starting in the working
-            /// directory of `inherit_from` if there is one.
-            newWindow: *const fn (ctx: *anyopaque, inherit_from: ?usize) void,
+            /// The GUI asked for a new tab from a pane, which for a tmux
+            /// surface means a new tmux window after that pane's, and
+            /// whether it starts in the pane's working directory.
+            newWindow: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                inherit_working_directory: bool,
+            ) void,
 
             /// The GUI asked to split a pane, and whether the new one
             /// starts in its working directory.
@@ -573,14 +577,24 @@ pub const Router = struct {
         self.host.vtable.resize(self.host.ctx, pane_id, cols, rows);
     }
 
-    /// Ask the session for a new window. Not tied to a pane: a new tab
-    /// belongs to the session, and the pane the user happened to be in
-    /// does not narrow it. That pane, as `inherit_from`, only says
-    /// where the window's shell starts; null leaves that to tmux.
-    pub fn newWindow(self: *Router, inherit_from: ?usize) void {
+    /// Ask the session for a new window. Not tied to a pane being open:
+    /// a new tab belongs to the session, and the pane the user asked
+    /// from only says where it goes (after that pane's window) and,
+    /// with `inherit_working_directory`, where its shell starts. The
+    /// viewer falls back to tmux's defaults for a pane it no longer
+    /// knows.
+    pub fn newWindow(
+        self: *Router,
+        pane_id: usize,
+        inherit_working_directory: bool,
+    ) void {
         if (!self.hostAcquire()) return;
         defer self.hostRelease();
-        self.host.vtable.newWindow(self.host.ctx, inherit_from);
+        self.host.vtable.newWindow(
+            self.host.ctx,
+            pane_id,
+            inherit_working_directory,
+        );
     }
 
     /// Ask the session to rename this pane's window.
@@ -852,8 +866,11 @@ const TestHost = struct {
         rows: usize,
     }) = .empty,
     kills: std.ArrayList(usize) = .empty,
-    /// Each new window's `inherit_from`.
-    new_windows: std.ArrayList(?usize) = .empty,
+    /// Each new window's pane and whether it inherits its directory.
+    new_windows: std.ArrayList(struct {
+        pane_id: usize,
+        inherit_working_directory: bool,
+    }) = .empty,
     detaches: usize = 0,
     selected_panes: std.ArrayList(usize) = .empty,
     zoomed_panes: std.ArrayList(usize) = .empty,
@@ -1007,9 +1024,16 @@ const TestHost = struct {
         }) catch @panic("oom");
     }
 
-    fn newWindow(ctx: *anyopaque, inherit_from: ?usize) void {
+    fn newWindow(
+        ctx: *anyopaque,
+        pane_id: usize,
+        inherit_working_directory: bool,
+    ) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
-        self.new_windows.append(self.alloc, inherit_from) catch @panic("oom");
+        self.new_windows.append(self.alloc, .{
+            .pane_id = pane_id,
+            .inherit_working_directory = inherit_working_directory,
+        }) catch @panic("oom");
     }
 
     fn detach(ctx: *anyopaque) void {
@@ -1476,12 +1500,15 @@ test "new windows and splits say where they start" {
 
     const five = try tr.router.createChannel(5);
 
-    tr.router.newWindow(5);
-    tr.router.newWindow(null);
+    tr.router.newWindow(5, true);
+    tr.router.newWindow(5, false);
     tr.router.splitPane(5, .right, true);
     tr.router.splitPane(5, .down, false);
 
-    try testing.expectEqualSlices(?usize, &.{ 5, null }, tr.host.new_windows.items);
+    try testing.expectEqual(2, tr.host.new_windows.items.len);
+    try testing.expectEqual(5, tr.host.new_windows.items[0].pane_id);
+    try testing.expect(tr.host.new_windows.items[0].inherit_working_directory);
+    try testing.expect(!tr.host.new_windows.items[1].inherit_working_directory);
     try testing.expectEqual(2, tr.host.splits.items.len);
     try testing.expect(tr.host.splits.items[0].inherit_working_directory);
     try testing.expect(!tr.host.splits.items[1].inherit_working_directory);
@@ -1491,7 +1518,7 @@ test "new windows and splits say where they start" {
     // default directory if it no longer knows the pane. A split of a
     // closed pane has nothing to split.
     five.close();
-    tr.router.newWindow(5);
+    tr.router.newWindow(5, true);
     tr.router.splitPane(5, .right, true);
     try testing.expectEqual(3, tr.host.new_windows.items.len);
     try testing.expectEqual(2, tr.host.splits.items.len);

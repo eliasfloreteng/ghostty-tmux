@@ -2453,9 +2453,7 @@ fn tmuxNewWindow(self: *Surface) bool {
 
     const pane = self.tmuxPane() orelse return false;
     defer pane.router.unref();
-    pane.router.newWindow(
-        if (self.config.tab_inherit_working_directory) pane.id else null,
-    );
+    pane.router.newWindow(pane.id, self.config.tab_inherit_working_directory);
     return true;
 }
 

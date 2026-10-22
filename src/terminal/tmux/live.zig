@@ -1555,6 +1555,62 @@ test "live: a new tab is a new tmux window" {
     try testing.expect(!session.exited);
 }
 
+test "live: a new tab goes right after the window it was asked from" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    // Windows 0, 1 and 3: a gap, as closing a window leaves one while
+    // `renumber-windows` is off. A plain `new-window` would fill it.
+    for ([_][]const u8{ "1", "2", "3" }) |idx| {
+        const out = try session.ask(&.{ "new-window", "-d", "-t", idx, "sleep 60" });
+        alloc.free(out);
+    }
+    {
+        const out = try session.ask(&.{ "kill-window", "-t", "2" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 3 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // Asked from window 0's pane, which is %0.
+    try session.input(.{ .new_window = .{ .pane_id = 0 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 4 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // The new window is the newest id; tmux put it at index 1.
+    const out = try session.ask(&.{
+        "list-windows", "-F", "#{window_index} #{window_id}",
+    });
+    defer alloc.free(out);
+    var newest: usize = 0;
+    var newest_index: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        const index = fields.next().?;
+        const id = try std.fmt.parseInt(usize, fields.next().?[1..], 10);
+        if (id >= newest) {
+            newest = id;
+            newest_index = index;
+        }
+    }
+    try testing.expectEqualStrings("1", newest_index);
+    try testing.expect(!session.exited);
+}
+
 test "live: a new split and a new tab start where their pane is" {
     if (!enabled()) return error.SkipZigTest;
 
@@ -1601,7 +1657,10 @@ test "live: a new split and a new tab start where their pane is" {
         .direction = .right,
         .inherit_working_directory = true,
     } });
-    try session.input(.{ .new_window = .{ .inherit_from = 0 } });
+    try session.input(.{ .new_window = .{
+        .pane_id = 0,
+        .inherit_working_directory = true,
+    } });
     try session.waitFor(struct {
         fn pred(v: *Session) bool {
             return v.viewer.panes.count() == 3 and

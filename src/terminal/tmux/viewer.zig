@@ -653,10 +653,14 @@ pub const Viewer = struct {
         };
 
         pub const NewWindow = struct {
-            /// The pane whose working directory the new window starts
-            /// in, as a new tab does in plain Ghostty, or null to leave
-            /// it to tmux. See `startDirectory`.
-            inherit_from: ?usize = null,
+            /// The pane the user asked from, if any. The new window goes
+            /// right after this pane's window, as a new tab does in plain
+            /// Ghostty.
+            pane_id: ?usize = null,
+
+            /// Whether the new window starts in `pane_id`'s working
+            /// directory rather than tmux's default. See `startDirectory`.
+            inherit_working_directory: bool = false,
         };
 
         pub const KillWindows = struct {
@@ -2096,15 +2100,31 @@ pub const Viewer = struct {
 
     /// Ask tmux for a new window.
     ///
-    /// No target: tmux puts it in the client's session, which is the one
-    /// we are attached to. The `%window-add` that follows is what makes
-    /// it appear here, so nothing needs to be remembered in between.
+    /// `-a` puts it right after the window the user asked from, moving
+    /// later windows along if they are in the way. Without it tmux takes
+    /// the lowest free index, which is the end only while the indexes
+    /// have no gaps: in a session where a window was closed and
+    /// `renumber-windows` is off, every new tab would land in that gap.
+    ///
+    /// Targeted at the pane's window rather than tmux's current one,
+    /// which can be behind the user (a `select-window` still on its way)
+    /// or somewhere else entirely (another client moved it). With no
+    /// window to go by, tmux's current one is the best guess left.
+    ///
+    /// The `%window-add` that follows is what makes it appear here, so
+    /// nothing needs to be remembered in between.
     fn nextNewWindow(self: *Viewer, req: Input.NewWindow) []const Action {
         if (self.state != .command_queue) return &.{};
 
-        return self.queueUserCommand("new-window{f}\n", .{
-            self.startDirectory(req.inherit_from),
-        }) catch {
+        const window = if (req.pane_id) |id| self.windowForPane(id) else null;
+        const directory = self.startDirectory(
+            if (req.inherit_working_directory) req.pane_id else null,
+        );
+        const queued = if (window) |w|
+            self.queueUserCommand("new-window -a -t @{d}{f}\n", .{ w.id, directory })
+        else
+            self.queueUserCommand("new-window -a{f}\n", .{directory});
+        return queued catch {
             log.warn("failed to queue new-window", .{});
             return &.{};
         };
@@ -11752,13 +11772,16 @@ test "new windows and splits start where the pane they came from is" {
         .direction = .right,
         .inherit_working_directory = true,
     } };
-    const new_window: Viewer.Input = .{ .new_window = .{ .inherit_from = 0 } };
+    const new_window: Viewer.Input = .{ .new_window = .{
+        .pane_id = 0,
+        .inherit_working_directory = true,
+    } };
 
     // Until tmux has said where the pane is, tmux's default it is.
     try testViewer(&viewer, &.{
         .{ .input = split, .commands = &.{"split-window -h -t %0\n"} },
         answered,
-        .{ .input = new_window, .commands = &.{"new-window\n"} },
+        .{ .input = new_window, .commands = &.{"new-window -a -t @0\n"} },
         answered,
     });
 
@@ -11772,7 +11795,7 @@ test "new windows and splits start where the pane they came from is" {
         answered,
         .{
             .input = new_window,
-            .commands = &.{"new-window -c '/home/me/it'\\''s ##1'\n"},
+            .commands = &.{"new-window -a -t @0 -c '/home/me/it'\\''s ##1'\n"},
         },
         answered,
     });
@@ -11798,11 +11821,19 @@ test "new windows and splits start where the pane they came from is" {
             .commands = &.{"split-window -v -t %0\n"},
         },
         answered,
-        .{ .input = .{ .new_window = .{} }, .commands = &.{"new-window\n"} },
+        .{
+            .input = .{ .new_window = .{ .pane_id = 0 } },
+            .commands = &.{"new-window -a -t @0\n"},
+        },
+        answered,
+        .{ .input = .{ .new_window = .{} }, .commands = &.{"new-window -a\n"} },
         answered,
         .{
-            .input = .{ .new_window = .{ .inherit_from = 42 } },
-            .commands = &.{"new-window\n"},
+            .input = .{ .new_window = .{
+                .pane_id = 42,
+                .inherit_working_directory = true,
+            } },
+            .commands = &.{"new-window -a\n"},
         },
         answered,
     });
