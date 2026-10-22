@@ -337,24 +337,10 @@ pub const Viewer = struct {
     /// that nothing a command prints can be taken for it.
     command_marker: [command_marker_prefix.len + 16]u8,
 
-    /// The window tmux says is current, as of the last notification.
-    /// Null until tmux tells us, which it only does on a change.
+    /// The window tmux is on once the selects we have sent have run:
+    /// what tmux last said, moved by each `select-window` of ours as it
+    /// is sent. Null until tmux tells us. See `sessionWindowChanged`.
     current_window_id: ?usize = null,
-
-    /// The pane we last told tmux the user was in. See `nextSelectPane`
-    /// for why a repeat is dropped rather than sent.
-    last_selected_pane: ?usize = null,
-
-    /// Panes we have sent `select-pane` for whose `%window-pane-changed`
-    /// has not arrived yet, oldest first. A notification for one of these
-    /// is tmux confirming what the user did here, not news. See
-    /// `windowPaneChanged`.
-    ///
-    /// Bounded: a select tmux does not answer (the pane was already
-    /// active after all) would otherwise sit here forever, and the oldest
-    /// entries are the ones least likely to still be coming.
-    selects_unanswered: [8]usize = undefined,
-    selects_unanswered_len: usize = 0,
 
     /// The arena used for the prior action allocated state. This contains
     /// the contents for the actions as well as the actions slice itself.
@@ -1407,9 +1393,6 @@ pub const Viewer = struct {
                 break :command_marker name;
             },
             .current_window_id = null,
-            .last_selected_pane = null,
-            .selects_unanswered = undefined,
-            .selects_unanswered_len = 0,
             .action_arena = .{},
             .action_single = undefined,
             .action_exit = undefined,
@@ -2144,42 +2127,57 @@ pub const Viewer = struct {
         };
     }
 
-    /// tmux moved to another window.
+    /// tmux says which window the session is on.
     ///
-    /// Recorded *and* passed on, which is the whole of the inbound
-    /// direction. The recording is what stops the loop: `nextSelectPane`
-    /// only emits `select-window` when the window it wants differs from
-    /// this, so the notification answering our own command cannot
-    /// produce another one.
+    /// tmux's notifications say what *is*, not what changed: one is
+    /// written when tmux gets round to it, after the replies to the
+    /// commands that caused it, and carries the session's window at that
+    /// moment. A quick A-then-B from us is answered with B twice, never
+    /// with A. So this is not matched against what we asked for; it is
+    /// compared with where our own selects will have left tmux
+    /// (`current_window_id`, which `queueSelect` moves as it sends them):
     ///
-    /// That is the lesson from iTerm2, whose `TmuxController` documents
-    /// the exact livelock this avoids: not echoing a command back in
-    /// response to a notification is what makes the system settle.
+    ///   - While a `select-window` of ours is unanswered, this may be
+    ///     from before it ran, and it is ignored. Ours either moves tmux,
+    ///     which tmux reports again once it has, or finds it already
+    ///     there, which is where we have it.
+    ///   - Otherwise it is from after all of ours. Where we have it
+    ///     already, it says nothing new. Anywhere else, something other
+    ///     than us moved tmux -- another client, a script, a binding --
+    ///     and the GUI follows.
+    ///
+    /// Nothing here sends a command, so the GUI following cannot start a
+    /// loop: its focus lands where `current_window_id` already is, and
+    /// `nextSelectPane` finds nothing to send for it. That is the lesson
+    /// from iTerm2, whose `TmuxController` documents the livelock that
+    /// echoing a command back at a notification causes.
     fn sessionWindowChanged(
         self: *Viewer,
         actions: *std.ArrayList(Action),
+        session_id: usize,
         window_id: usize,
     ) !void {
-        self.current_window_id = window_id;
+        // tmux tells every control client about every session. Another
+        // session's window, even one linked into ours, is not ours to
+        // move to.
+        if (self.session_id != session_id) return;
+        if (self.windowSelectUnanswered()) return;
 
         // A window we have never heard of is not one the GUI can focus.
         // The layout that introduces it will arrive on its own, carrying
-        // this same current-window flag with it.
-        for (self.windows.items) |w| {
-            if (w.id == window_id) break;
+        // this same current-window flag with it. Recorded even so: it is
+        // where tmux is, so a focus here in the meantime is a move.
+        const window: *Window = for (self.windows.items) |*w| {
+            if (w.id == window_id) break w;
         } else {
             log.info("current window id={} unknown, not focusing", .{window_id});
+            self.current_window_id = window_id;
             return;
-        }
+        };
 
-        for (self.windows.items) |*w| {
-            w.active = w.id == window_id;
+        if (self.current_window_id == window_id and window.active) return;
 
-            // tmux clears a window's alerts as the session moves to it
-            // (`winlink_clear_flags`), and this notification is that
-            // move, so there is nothing to wait for.
-            if (w.active) w.alerts = .{};
-        }
+        self.setCurrentWindow(window_id);
 
         // Re-send the window list rather than inventing an action for
         // one field. The GUI already diffs this on every change, and
@@ -2189,31 +2187,31 @@ pub const Viewer = struct {
         try actions.append(arena.allocator(), .{ .windows = self.windows.items });
     }
 
-    /// tmux moved a window's active pane.
+    /// Make `window_id` the session's current window, flags and all.
+    fn setCurrentWindow(self: *Viewer, window_id: usize) void {
+        self.current_window_id = window_id;
+        for (self.windows.items) |*w| {
+            w.active = w.id == window_id;
+
+            // tmux clears a window's alerts as the session moves to it
+            // (`winlink_clear_flags`), so there is nothing to wait for.
+            if (w.active) w.alerts = .{};
+        }
+    }
+
+    /// tmux says which pane is active in a window.
     ///
-    /// This is the answer to our own `select-pane` as often as it is news,
-    /// and echoing a command back at a notification is how this turns
-    /// into a loop. It cannot here: the GUI following it focuses a pane,
-    /// a focused pane asks to be selected, and `nextSelectPane` drops
-    /// that because `last_selected_pane` is already this pane.
-    ///
-    /// The answer to our own select is also not re-sent to the GUI, which
-    /// put the focus there itself. That matters when the user moves
-    /// quickly: a select of A then of B is answered with A then B, and
-    /// passing A on would pull the focus back from B for a moment.
+    /// The same rule as `sessionWindowChanged`, per window: ignored
+    /// while a `select-pane` of ours in that window is unanswered,
+    /// nothing new where we have it already, and otherwise news the GUI
+    /// follows. A pane closing, a split (the new pane is made active),
+    /// another client or a binding typed in a pane all move it.
     fn windowPaneChanged(
         self: *Viewer,
         actions: *std.ArrayList(Action),
         window_id: usize,
         pane_id: usize,
     ) !void {
-        const ours = self.answeredSelect(pane_id);
-
-        // tmux's word on where it is now, ours or not: a select of this
-        // pane would be redundant. Not when a later select of ours is
-        // still unanswered, though, since tmux is about to move again.
-        if (self.selects_unanswered_len == 0) self.last_selected_pane = pane_id;
-
         const window: *Window = for (self.windows.items) |*w| {
             if (w.id == window_id) break w;
         } else {
@@ -2222,15 +2220,36 @@ pub const Viewer = struct {
             return;
         };
 
+        if (self.paneSelectUnanswered(window_id)) return;
         if (window.active_pane_id == pane_id) return;
         window.active_pane_id = pane_id;
-        if (ours) return;
 
         // Re-send the window list, as for the current window: which pane
         // is active is a fact about the set the GUI already diffs.
         var arena = self.action_arena.promote(self.alloc);
         defer self.action_arena = arena.state;
         try actions.append(arena.allocator(), .{ .windows = self.windows.items });
+    }
+
+    /// Whether a `select-window` of ours is still waiting for its reply.
+    /// Every command is sent as soon as it is queued, so queued is sent.
+    fn windowSelectUnanswered(self: *const Viewer) bool {
+        var it = self.command_queue.iterator(.forward);
+        while (it.next()) |command| {
+            if (command.* == .select_window) return true;
+        }
+        return false;
+    }
+
+    /// Whether a `select-pane` of ours in `window_id` is still waiting
+    /// for its reply.
+    fn paneSelectUnanswered(self: *const Viewer, window_id: usize) bool {
+        var it = self.command_queue.iterator(.forward);
+        while (it.next()) |command| switch (command.*) {
+            .select_pane => |s| if (s.window_id == window_id) return true,
+            else => {},
+        };
+        return false;
     }
 
     /// Write a window name as a single tmux command argument.
@@ -2510,11 +2529,14 @@ pub const Viewer = struct {
     /// focus changes, and the alternative is that tmux's idea of "the
     /// active pane" has nothing to do with where the user is typing.
     ///
-    /// Deduplicated, and that is not an optimisation. Focus can flap
-    /// several times in a drag or a window switch, and tmux runs our
-    /// commands strictly in order, so everything the user does after
-    /// that runs behind each repeat -- including the `send-keys` carrying
-    /// their keystrokes.
+    /// Only what tmux does not have already is sent, judged by where our
+    /// selects so far will have left it (see `sessionWindowChanged`).
+    /// That is not an optimisation. Focus can flap several times in a
+    /// drag or a window switch, and tmux runs our commands strictly in
+    /// order, so everything the user does after that runs behind each
+    /// repeat -- including the `send-keys` carrying their keystrokes. It
+    /// is also what makes the GUI following tmux settle: focus landing
+    /// on the pane tmux just reported sends nothing.
     fn nextSelectPane(self: *Viewer, req: Input.SelectPane) []const Action {
         if (self.state != .command_queue) return &.{};
         if (!self.panes.contains(req.pane_id)) {
@@ -2522,106 +2544,73 @@ pub const Viewer = struct {
             return &.{};
         }
 
-        if (self.last_selected_pane) |last| {
-            if (last == req.pane_id) return &.{};
-        }
-        self.last_selected_pane = req.pane_id;
-
-        const actions = self.queueSelect(req.pane_id) catch {
+        return self.queueSelect(req.pane_id) catch {
             log.warn("failed to queue select-pane", .{});
             return &.{};
         };
-
-        // With an active pane of our own, a select moves only ours, and
-        // tmux says nothing about it: no answer is coming, and waiting
-        // for one would mistake the next move of the window's shared
-        // active pane for it.
-        if (self.client_flags.active_pane) return actions;
-
-        // Remembered once it is on its way, so the answer is known for
-        // what it is.
-        if (self.selects_unanswered_len == self.selects_unanswered.len) {
-            std.mem.copyForwards(
-                usize,
-                self.selects_unanswered[0 .. self.selects_unanswered.len - 1],
-                self.selects_unanswered[1..],
-            );
-            self.selects_unanswered_len -= 1;
-        }
-        self.selects_unanswered[self.selects_unanswered_len] = req.pane_id;
-        self.selects_unanswered_len += 1;
-
-        return actions;
-    }
-
-    /// Whether a change of active pane to `pane_id` is the answer to a
-    /// `select-pane` we sent, forgetting it and everything sent before it.
-    ///
-    /// tmux answers selects in the order they were sent, so by the time
-    /// this one is answered every earlier one has been too, or never will
-    /// be.
-    fn answeredSelect(self: *Viewer, pane_id: usize) bool {
-        const pending = self.selects_unanswered[0..self.selects_unanswered_len];
-        const idx = std.mem.indexOfScalar(usize, pending, pane_id) orelse
-            return false;
-        const rest = pending.len - idx - 1;
-        std.mem.copyForwards(usize, self.selects_unanswered[0..rest], pending[idx + 1 ..]);
-        self.selects_unanswered_len = rest;
-        return true;
     }
 
     /// `select-pane`, preceded by `select-window` when the pane the user
-    /// moved into is not in the window tmux is currently on.
+    /// moved into is not in the window tmux is on, each only if needed.
     ///
     /// `select-pane` only moves the active pane *within its own window*
-    /// (tmux `cmd-select-pane.c`), so without this, focusing a pane in
-    /// another window would leave tmux on the window it was already on
+    /// (tmux `cmd-select-pane.c`), so without the window, focusing a pane
+    /// in another window would leave tmux on the window it was already on
     /// and quietly disagree with the screen.
     ///
-    /// The window command is skipped when tmux is already there. That is
-    /// the outbound half of the loop suppression: if we sent it anyway,
-    /// tmux would answer with `%session-window-changed`, which we would
-    /// pass to the GUI as "go to this window" -- for a window it is
-    /// already showing, every time focus moved.
+    /// What they ask for is taken as done the moment they are sent: the
+    /// current window and the window's active pane are moved here, so
+    /// every window list the GUI is sent while they are on their way
+    /// already says where the user went. Left at what tmux last said, an
+    /// unrelated update in that time (a rename, an alert, a layout) would
+    /// send the GUI back to where the user came from, and its focus
+    /// following that would select it in tmux again, undoing the switch.
     fn queueSelect(
         self: *Viewer,
         pane_id: usize,
     ) Allocator.Error![]const Action {
-        const window = self.windowForPane(pane_id);
-        const need_window = if (window) |w| need: {
-            const current = self.current_window_id orelse break :need true;
-            break :need current != w.id;
-        } else false;
+        const window = self.windowForPane(pane_id) orelse {
+            log.info("select of pane id={} in no window, dropping", .{pane_id});
+            return &.{};
+        };
 
-        if (!need_window) return self.queueUserCommand(
-            "select-pane -t %{d}\n",
-            .{pane_id},
-        );
+        const need_window = self.current_window_id != window.id or
+            !window.active;
+        const need_pane = window.active_pane_id != pane_id;
 
         var commands: [2]Command = undefined;
         var count: usize = 0;
-        errdefer for (commands[0..count]) |c| c.deinit(self.alloc);
 
         // The window first: selecting a pane in a window tmux is not on
         // is the same clamping problem as sizing a pane inside a window
         // that is too small.
-        commands[count] = try self.userCommand(
-            "select-window -t @{d}\n",
-            .{window.?.id},
-        );
-        count += 1;
+        if (need_window) {
+            commands[count] = .{ .select_window = window.id };
+            count += 1;
+            self.setCurrentWindow(window.id);
+        }
 
-        commands[count] = try self.userCommand(
-            "select-pane -t %{d}\n",
-            .{pane_id},
-        );
-        count += 1;
+        if (need_pane) {
+            commands[count] = .{ .select_pane = .{
+                .window_id = window.id,
+                .pane_id = pane_id,
+            } };
+            count += 1;
+            window.active_pane_id = pane_id;
 
-        // Taking it on trust that tmux honours this, so a notification
-        // that merely confirms it does not come back as a fresh
-        // instruction to the GUI.
-        self.current_window_id = window.?.id;
+            // `select-pane` without `-Z` unzooms its window (tmux's
+            // `window_push_zoom`), and the GUI, moving to a pane the zoom
+            // hides, unzooms too. Its panes report their unzoomed sizes
+            // from here on; weighed against the zoom tmux is about to
+            // drop, the one that was zoomed would size the whole window
+            // down to its share of it.
+            if (window.zoomed_pane_id) |zoomed| if (zoomed != pane_id) {
+                window.zoomed_layout = null;
+                window.zoomed_pane_id = null;
+            };
+        }
 
+        if (count == 0) return &.{};
         return self.queueUserCommands(commands[0..count]);
     }
 
@@ -3921,6 +3910,7 @@ pub const Viewer = struct {
             // the one on screen.
             .session_window_changed => |info| self.sessionWindowChanged(
                 &actions,
+                info.session_id,
                 info.window_id,
             ) catch {
                 log.warn("failed to handle window change", .{});
@@ -4032,6 +4022,8 @@ pub const Viewer = struct {
             return;
         };
 
+        const was_zoomed = window.zoomed_pane_id;
+
         // Clear our prior window arena and setup our layout
         window.layout = layout: {
             var arena = window.layout_arena.promote(self.alloc);
@@ -4088,6 +4080,26 @@ pub const Viewer = struct {
         // Sync up our panes
         try self.syncLayouts(self.windows.items);
         try self.applyPendingNames();
+
+        // The panes a zoom hid are on screen again, and none of them
+        // reported while hidden (see `nextResize`), so nothing stale of
+        // theirs is in flight. A hold from a resize tmux gave them while
+        // they were hidden would swallow their first honest report.
+        if (was_zoomed) |zoomed| if (window.zoomed_pane_id != zoomed) {
+            self.clearStaleSizes(window.layout, zoomed);
+        };
+    }
+
+    /// Clear `Pane.stale_size` for every pane in `node` but `except`.
+    fn clearStaleSizes(self: *Viewer, node: Layout, except: usize) void {
+        switch (node.content) {
+            .pane => |id| if (id != except) {
+                if (self.panes.get(id)) |pane| pane.stale_size = null;
+            },
+            .horizontal, .vertical => |children| for (children) |child| {
+                self.clearStaleSizes(child, except);
+            },
+        }
     }
 
     /// When a window is added to the session, we need to refresh our window
@@ -4978,13 +4990,6 @@ pub const Viewer = struct {
                 .pane_titles,
                 .pane_paths,
             });
-
-            // A pane appearing or disappearing moves tmux's active pane,
-            // and we are not told where it went until inbound sync
-            // lands. Forget what we last selected rather than dedupe
-            // against something no longer true and leave the user
-            // focused here while tmux thinks they are elsewhere.
-            if (added or removed.items.len > 0) self.last_selected_pane = null;
         }
 
         // No more errors after this point. We're about to replace all
@@ -5290,6 +5295,14 @@ pub const Viewer = struct {
             // Nothing to read: the flag is set or it is not, and tmux
             // says so by erroring the block, which is handled above.
             .pause_after => {},
+
+            // Their answer is that they are no longer unanswered. A
+            // failure (the pane closed on its way) is put right by the
+            // notifications and layouts that closing brings.
+            .select_window, .select_pane => if (is_err) log.info(
+                "tmux refused {t}: {s}",
+                .{ command, std.mem.trim(u8, content, " \t\r\n") },
+            ),
 
             // An answer about a session we have left. Nothing still cares.
             .orphan => log.debug(
@@ -5619,11 +5632,6 @@ pub const Viewer = struct {
                 data.window_visible_layout,
             ) else null;
 
-            // Which window tmux is on, learned here rather than waited
-            // for: `%session-window-changed` only fires on a change, so
-            // without this the first focus would send a `select-window`
-            // for a window tmux is very likely already on.
-            if (data.window_active) self.current_window_id = data.window_id;
 
             const name = try self.alloc.dupe(u8, data.window_name);
             errdefer self.alloc.free(name);
@@ -5646,6 +5654,28 @@ pub const Viewer = struct {
                 .layout_arena = arena.state,
                 .layout = layout,
             });
+        }
+
+        // Which window tmux is on and each window's active pane, learned
+        // here rather than waited for: tmux only notifies a change, so
+        // without this the first focus would select what tmux very
+        // likely has already. Unless a select of ours is on its way,
+        // which this reply may be from before: then where it will leave
+        // tmux stands, as it does against a notification (see
+        // `sessionWindowChanged`).
+        const window_select = self.windowSelectUnanswered();
+        for (windows.items) |*w| {
+            if (window_select) {
+                w.active = self.current_window_id == w.id;
+            } else if (w.active) {
+                self.current_window_id = w.id;
+            }
+
+            if (self.paneSelectUnanswered(w.id)) {
+                for (self.windows.items) |old| {
+                    if (old.id == w.id) w.active_pane_id = old.active_pane_id;
+                }
+            }
         }
 
         // While ours is still the old list, to compare against.
@@ -6452,6 +6482,14 @@ const Command = union(enum) {
     /// `Viewer.pasteBufferChanged`.
     paste_buffer: []const u8,
 
+    /// Move the session to a window, for the user moving to it here.
+    /// A command of its own, not `user`, so that whether one is still
+    /// unanswered can be told: see `Viewer.sessionWindowChanged`.
+    select_window: usize,
+
+    /// Make a pane its window's active pane. See `select_window`.
+    select_pane: SelectPane,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -6471,6 +6509,11 @@ const Command = union(enum) {
 
     /// How many lines of history the reads from scratch take, or null
     /// for all of them. See `formatCommand`.
+    pub const SelectPane = struct {
+        window_id: usize,
+        pane_id: usize,
+    };
+
     pub const HistoryLines = struct {
         /// `pane_history`: the newest chunk, if history is read on
         /// demand. See `Viewer.historyReadLines`.
@@ -6514,6 +6557,8 @@ const Command = union(enum) {
             .orphan,
             .client_flags,
             .list_sessions,
+            .select_window,
+            .select_pane,
             => {},
             .user, .paste_buffer => |v| alloc.free(v),
             .prompt => |v| v.destroy(alloc),
@@ -6721,6 +6766,8 @@ const Command = union(enum) {
             ),
 
             .user => |v| try writer.writeAll(v),
+            .select_window => |id| try writer.print("select-window -t @{d}\n", .{id}),
+            .select_pane => |v| try writer.print("select-pane -t %{d}\n", .{v.pane_id}),
 
             .prompt => |v| try writer.print(
                 "{s}\ndisplay-message -p '{s}'\n",
@@ -9346,26 +9393,17 @@ test "focus sync converges instead of looping" {
             }).check,
         },
 
-        // Inbound: tmux moved to a window on someone else's say-so. The
-        // GUI is told, and still nothing is sent back.
+        // Inbound: tmux says it is on the window it is already on.
+        // Nothing is new, and nothing is sent back.
         .{
             .input = .{ .tmux = .{ .session_window_changed = .{
-                .session_id = 0,
+                .session_id = 1,
                 .window_id = 0,
             } } },
+            .commands = &.{},
             .check = (struct {
-                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    var found = false;
-                    for (actions) |action| {
-                        try testing.expect(action != .command);
-                        if (action == .windows) found = true;
-                    }
-
-                    // The GUI is told, through the window set it already
-                    // reads, which window to bring forward.
-                    try testing.expect(found);
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.windows.items[0].active);
-                    try testing.expect(v.command_queue.empty());
                     try testing.expectEqual(0, v.current_window_id.?);
                 }
             }).check,
@@ -9385,7 +9423,7 @@ test "a window we do not know is not focused" {
         // GUI to focus a window it does not have is worse than waiting.
         .{
             .input = .{ .tmux = .{ .session_window_changed = .{
-                .session_id = 0,
+                .session_id = 1,
                 .window_id = 7,
             } } },
             .check = (struct {
@@ -9415,42 +9453,37 @@ test "a pane we do not have is not selected" {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     for (actions) |action| try testing.expect(action != .command);
                     try testing.expect(v.command_queue.empty());
-                    try testing.expectEqual(null, v.last_selected_pane);
                 }
             }).check,
         },
     });
 }
 
-test "a layout change forgets which pane we selected" {
+test "a pane tmux moved away from is selected again" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
-    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
     try testViewer(&viewer, &.{
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
-            .input = .{ .select_pane = .{ .pane_id = 0 } },
-            .contains_command = "select-pane -t %0\n",
+            .input = .{ .select_pane = .{ .pane_id = 1 } },
+            .commands = &.{"select-pane -t %1\n"},
         },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
 
-        // A split moves tmux's active pane to the new one, and nothing
-        // tells us so until inbound sync lands. Deduping against a pane
-        // tmux no longer considers active would leave the user focused
-        // here while tmux thinks they are in the new pane.
+        // Already where tmux is: nothing to send.
+        .{ .input = .{ .select_pane = .{ .pane_id = 1 } }, .commands = &.{} },
+
+        // A pane closing, or a split, moves tmux's active pane, and it
+        // says so. Focus going back to pane 1 is then a move to send.
+        .{ .input = .{ .tmux = .{ .window_pane_changed = .{
+            .window_id = 0,
+            .pane_id = 0,
+        } } } },
         .{
-            .input = .{ .tmux = .{ .layout_change = .{
-                .window_id = 0,
-                .layout = two_panes_vertical,
-                .visible_layout = two_panes_vertical,
-                .raw_flags = "*",
-            } } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(null, v.last_selected_pane);
-                }
-            }).check,
+            .input = .{ .select_pane = .{ .pane_id = 1 } },
+            .commands = &.{"select-pane -t %1\n"},
         },
     });
 }
@@ -9458,6 +9491,37 @@ test "a layout change forgets which pane we selected" {
 /// The two-pane vertical layout collapsed to just pane 1, which is what
 /// tmux reports as the visible layout while pane 1 is zoomed.
 const zoomed_to_pane_1 = "b7de,83x44,0,0,1";
+
+test "moving to another pane of a zoomed window expects the zoom to go" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .layout_change = .{
+            .window_id = 0,
+            .layout = two_panes_vertical,
+            .visible_layout = zoomed_to_pane_1,
+            .raw_flags = "*Z",
+        } } } },
+        .{ .input = .{ .tmux = .{ .window_pane_changed = .{
+            .window_id = 0,
+            .pane_id = 1,
+        } } } },
+    });
+    try testing.expectEqual(1, viewer.windows.items[0].zoomed_pane_id.?);
+
+    // tmux unzooms on a `select-pane` without `-Z`, and the GUI did
+    // already. The panes' reports from here on are of the unzoomed
+    // layout, and must be weighed against it.
+    try testViewer(&viewer, &.{.{
+        .input = .{ .select_pane = .{ .pane_id = 0 } },
+        .commands = &.{"select-pane -t %0\n"},
+    }});
+    try testing.expectEqual(null, viewer.windows.items[0].zoomed_pane_id);
+    try testing.expectEqual(null, viewer.windows.items[0].zoomed_layout);
+}
 
 /// Startup for three windows, deliberately at sparse tmux indexes: ids
 /// @0, @5 and @9, in that order. Real sessions look like this as soon as
@@ -11751,7 +11815,7 @@ test "the echo of our own select is not passed back" {
     try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
     _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
 
-    // The user moves to A then quickly to B. tmux answers both in turn.
+    // The user moves to pane 1 then quickly back to pane 0.
     try testViewer(&viewer, &.{
         .{
             .input = .{ .select_pane = .{ .pane_id = 1 } },
@@ -11761,38 +11825,64 @@ test "the echo of our own select is not passed back" {
             .input = .{ .select_pane = .{ .pane_id = 0 } },
             .commands = &.{"select-pane -t %0\n"},
         },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
     });
+    try testing.expectEqual(0, viewer.windows.items[0].active_pane_id.?);
 
-    // The first answer is stale by the time it arrives. Passing it on
-    // would pull the focus back to pane 1 for a moment while the user is
-    // already in pane 0. Neither is passed on: the GUI put the focus
-    // there itself.
+    // Whatever tmux says while they are on their way may be from before
+    // they ran. Passing it on would pull the focus to where the user was
+    // a moment ago, and the GUI following it would select it again.
     try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .window_pane_changed = .{
         .window_id = 0,
         .pane_id = 1,
     } } }).len);
-    try testing.expectEqual(1, viewer.windows.items[0].active_pane_id.?);
+    try testing.expectEqual(0, viewer.windows.items[0].active_pane_id.?);
 
-    // Still on its way to pane 0, so a select of pane 1 now is not
-    // redundant.
-    try testing.expectEqual(0, viewer.last_selected_pane.?);
-
+    // Answered. What tmux says now is where they left it, which the GUI
+    // already shows.
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
     try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .window_pane_changed = .{
         .window_id = 0,
         .pane_id = 0,
     } } }).len);
-    try testing.expectEqual(0, viewer.windows.items[0].active_pane_id.?);
-    try testing.expectEqual(0, viewer.selects_unanswered_len);
 
-    // Once our selects are answered, a change is news again.
+    // And a change after that is news.
     try testViewer(&viewer, &.{.{
         .input = .{ .tmux = .{ .window_pane_changed = .{
             .window_id = 0,
             .pane_id = 1,
         } } },
         .contains_tags = &.{.windows},
+    }});
+}
+
+test "a window list while our select is on its way keeps where the user went" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+
+    // Asked for before the select, answered after it was sent: it says
+    // pane 0, from before the select ran.
+    _ = viewer.next(.{ .tmux = .{ .window_add = .{ .id = 0 } } });
+    try testViewer(&viewer, &.{.{
+        .input = .{ .select_pane = .{ .pane_id = 1 } },
+        .commands = &.{"select-pane -t %1\n"},
+    }});
+    try testViewer(&viewer, &.{.{
+        .input = .{ .tmux = .{
+            .block_end = "$0 @0 1 83 44 " ++ two_panes_vertical ++
+                " 0 " ++ two_panes_vertical ++ " 0 0 0 0 %0",
+        } },
+        .check = (struct {
+            fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                try testing.expectEqual(1, v.windows.items[0].active_pane_id.?);
+                for (actions) |action| if (action == .windows) {
+                    try testing.expectEqual(1, action.windows[0].active_pane_id.?);
+                };
+            }
+        }).check,
     }});
 }
 
@@ -13167,7 +13257,7 @@ test "client flags are asked for once the version allows it" {
     });
 }
 
-test "with an active pane of our own, a select awaits no answer" {
+test "with an active pane of our own, a select is still where we are" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{
         .client_flags = .{ .active_pane = true },
     });
@@ -13181,10 +13271,12 @@ test "with an active pane of our own, a select awaits no answer" {
             .contains_command = "select-pane -t %1\n",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, v.selects_unanswered_len);
+                    try testing.expectEqual(1, v.windows.items[0].active_pane_id.?);
                 }
             }).check,
         },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .select_pane = .{ .pane_id = 1 } }, .commands = &.{} },
     });
 }
 

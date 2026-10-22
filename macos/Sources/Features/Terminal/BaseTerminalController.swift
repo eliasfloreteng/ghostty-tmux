@@ -786,7 +786,12 @@ class BaseTerminalController: NSWindowController,
         }
 
         if surfaceTree.zoomed != nil {
-            if derivedConfig.splitPreserveZoom.contains(.navigation) {
+            // A tmux pane's zoom is tmux's, and moving to another pane
+            // unzooms it there (`select-pane` without `-Z`). Keeping the
+            // zoom here would show a zoom tmux drops, until its layout
+            // put this right.
+            if derivedConfig.splitPreserveZoom.contains(.navigation),
+               target.tmuxPaneId == nil {
                 surfaceTree = SplitTree(
                     root: surfaceTree.root,
                     zoomed: surfaceTree.root?.node(view: nextSurface))

@@ -153,6 +153,7 @@ class TmuxWindowManager {
 
         let host = ObjectIdentifier(hostView)
         hosts[host] = .init(value: hostView)
+        let previousActive = snapshots[host]?.windows.first(where: { $0.active })?.id
         snapshots[host] = action
 
         // Before anything that needs the host to still be alive: a
@@ -316,7 +317,7 @@ class TmuxWindowManager {
         prune(liveWindows: liveWindows, livePanes: livePanes, host: host)
         windowOrder[host] = action.windows.map(\.id)
         arrangeTabs(host: host)
-        selectActiveWindow(action.windows, host: host)
+        selectActiveWindow(action.windows, host: host, previousActive: previousActive)
         setHostedSession(hostView, action.sessionName)
 
         // The session is still going, so whatever closed was not it.
@@ -889,11 +890,20 @@ class TmuxWindowManager {
     ///
     /// Selecting a tab that is already selected is not free: AppKit
     /// still runs the tab switch, so the check matters.
+    ///
+    /// Only when tmux's window is not the one the last snapshot named,
+    /// as `followActivePane` does for panes. A snapshot is sent for many
+    /// reasons -- a rename, an alert, a layout -- and one that went out
+    /// just before the core heard of a tab the user picked still names
+    /// the window they left. Acting on it would take them back there,
+    /// and focus following would tell tmux so, undoing the switch.
     private func selectActiveWindow(
         _ windows: [Ghostty.Action.TmuxWindows.Window],
-        host: ObjectIdentifier
+        host: ObjectIdentifier,
+        previousActive: Int?
     ) {
         guard let active = windows.first(where: { $0.active }) else { return }
+        guard active.id != previousActive else { return }
         guard let controller = self.windows[Key(host: host, id: active.id)]?.controller,
               let window = controller.window else { return }
 
@@ -1042,11 +1052,17 @@ class TmuxWindowManager {
         guard let entry = windows.values.first(where: { $0.controller?.window === window }),
               entry.pendingFocus != nil else { return }
 
-        // A click in the window is the user choosing where to be, and it
-        // is what made the window key. tmux hears about that choice as
-        // soon as the click lands, so it wins over what tmux said before.
+        // A click in the window's content is the user choosing where to
+        // be, and it is what made the window key. tmux hears about that
+        // choice as soon as the click lands, so it wins over what tmux
+        // said before. A click on a tab is not one: it lands in the tab
+        // bar, of the window that was selected before, and chooses only
+        // the tab, so the pane waiting for it gets focus as it would
+        // from the keyboard.
         if let event = NSApp.currentEvent,
-           [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type) {
+           [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type),
+           event.window === window,
+           window.contentLayoutRect.contains(event.locationInWindow) {
             entry.pendingFocus = nil
             return
         }
