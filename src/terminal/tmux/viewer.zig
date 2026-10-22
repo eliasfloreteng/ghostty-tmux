@@ -916,6 +916,11 @@ pub const Viewer = struct {
             rows: usize,
         } = null,
 
+        /// Whether tmux last laid this window out at a size other than
+        /// `last_size_request`: another client attached to the session
+        /// took the window over. See `reclaimWindowSize`.
+        size_taken: bool = false,
+
         pub fn deinit(self: *Window, alloc: Allocator) void {
             alloc.free(self.name);
             self.layout_arena.promote(alloc).deinit();
@@ -1695,10 +1700,14 @@ pub const Viewer = struct {
         // composing the unzoomed layout around its full-window size
         // would ask tmux for a window as much bigger as the panes
         // hidden behind it.
+        //
+        // The window's size is the shown layout's, which is what tmux
+        // last laid it out at; `Window.width` is only as of the last
+        // `list-windows`.
         if (!layoutFullyRequested(&self.panes, shown)) {
             const composed = composeLayoutSize(&self.panes, shown);
-            if (composed.cols != window.width or
-                composed.rows != window.height or
+            if (composed.cols != shown.width or
+                composed.rows != shown.height or
                 !layoutRequestsChange(&self.panes, shown)) return &.{};
         }
 
@@ -3403,12 +3412,51 @@ pub const Viewer = struct {
         // would interpret as "send the key this command is bound to".
         if (w.data.len == 0) return &.{};
 
+        self.reclaimWindowSize(w.pane_id);
+
         return self.queueWrite(w) catch {
             log.warn(
                 "failed to queue write for pane id={}, dropping",
                 .{w.pane_id},
             );
             return &.{};
+        };
+    }
+
+    /// Ask again for the size we last asked for a pane's window, if
+    /// another client has taken the window over since. Queued, not sent:
+    /// the input that called for it sends it, ahead of itself.
+    ///
+    /// With another client attached, tmux sizes a window for one of them
+    /// (`window-size`, `latest` by default: the client that last typed
+    /// into it). Our `send-keys` do not count as typing, so once the
+    /// other client has typed, the window stays at its size, and our
+    /// panes at a size their surfaces never asked for, until the native
+    /// window happens to be resized. Asking again, as the user types
+    /// here, is what typing in a normal client does: the window follows
+    /// whoever is using it. Once per takeover, so a window tmux keeps at
+    /// another size on purpose (`window-size smallest`) costs one
+    /// command, not one per keystroke.
+    fn reclaimWindowSize(self: *Viewer, pane_id: usize) void {
+        // Older servers are sized with `resize-window`, which pins the
+        // size for every client; nothing can take it over.
+        if (!self.tmuxVersionAtLeast(3, 4)) return;
+
+        const window = self.windowForPane(pane_id) orelse return;
+        if (!window.size_taken) return;
+        const want = window.last_size_request orelse return;
+        window.size_taken = false;
+
+        const command = self.userCommand(
+            "refresh-client -C @{d}:{d}x{d}\n",
+            .{ window.id, want.cols, want.rows },
+        ) catch {
+            log.warn("failed to queue reclaiming window id={}", .{window.id});
+            return;
+        };
+        self.queueCommands(&.{command}) catch {
+            command.deinit(self.alloc);
+            log.warn("failed to queue reclaiming window id={}", .{window.id});
         };
     }
 
@@ -3495,6 +3543,8 @@ pub const Viewer = struct {
         }
 
         if (p.data.len == 0) return &.{};
+
+        self.reclaimWindowSize(p.pane_id);
 
         return self.queuePaste(p) catch {
             log.warn(
@@ -4014,6 +4064,17 @@ pub const Viewer = struct {
                 return err;
             };
         };
+
+        // Its size is its layout's: `list-windows` is not asked again
+        // for a resize, so left alone this would be the attach's.
+        window.width = window.layout.width;
+        window.height = window.layout.height;
+
+        if (window.last_size_request) |want| {
+            const shown = window.shownLayout();
+            window.size_taken = shown.width != want.cols or
+                shown.height != want.rows;
+        }
 
         // Reset our arena so we can build up actions.
         var arena = self.action_arena.promote(self.alloc);
@@ -10258,6 +10319,56 @@ test "pause mode is asked for once the version allows it" {
                 }
             }).check,
         },
+    });
+}
+
+test "typing takes a window back from another client that resized it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+
+    const answered: TestStep = .{ .input = .{ .tmux = .{ .block_end = "" } } };
+    const typed: Viewer.Input = .{ .write = .{ .pane_id = 0, .data = "a" } };
+    const ours: Viewer.Input = .{ .tmux = .{ .layout_change = .{
+        .window_id = 0,
+        .layout = "a87d,100x30,0,0,0",
+        .visible_layout = "a87d,100x30,0,0,0",
+        .raw_flags = "*",
+    } } };
+    const theirs: Viewer.Input = .{ .tmux = .{ .layout_change = .{
+        .window_id = 0,
+        .layout = "a25d,80x20,0,0,0",
+        .visible_layout = "a25d,80x20,0,0,0",
+        .raw_flags = "*",
+    } } };
+
+    try testViewer(&viewer, &.{
+        answered,
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 100, .rows = 30 } },
+            .commands = &.{"refresh-client -C @0:100x30\n"},
+        },
+        answered,
+
+        // tmux did as asked: typing is only typing.
+        .{ .input = ours },
+        .{ .input = typed, .commands = &.{"send-keys"} },
+        answered,
+
+        // Another client typed, and the window is its size now. The next
+        // key typed here asks for ours again, ahead of itself.
+        .{ .input = theirs },
+        .{
+            .input = typed,
+            .commands = &.{ "refresh-client -C @0:100x30\n", "send-keys" },
+        },
+        answered,
+        answered,
+
+        // Once: tmux keeping it at another size is not asked again per key.
+        .{ .input = typed, .commands = &.{"send-keys"} },
+        answered,
     });
 }
 
