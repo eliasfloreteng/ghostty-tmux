@@ -1434,7 +1434,7 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .set_title = buf });
     }
 
-    inline fn setMouseShape(
+    pub inline fn setMouseShape(
         self: *StreamHandler,
         shape: terminal.MouseShape,
     ) !void {

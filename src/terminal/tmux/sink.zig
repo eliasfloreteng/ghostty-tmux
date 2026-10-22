@@ -727,6 +727,29 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) !void {
     t.modes.set(.mouse_format_utf8, data.mouse_utf8_flag);
     t.modes.set(.mouse_format_sgr, data.mouse_sgr_flag);
 
+    // The flags are what mouse handling reads; the modes above only
+    // record what was asked for. A program's DECSET sets both through the
+    // stream handler, but a pane's state arrives as plain facts, so both
+    // are written here. Left alone, a program that turned on mouse
+    // tracking before we attached would get none of its mouse reports,
+    // and the wheel would scroll it with arrow keys instead. tmux keeps
+    // one tracking mode and one format at a time, so at most one of each
+    // is set, and all of them clear means none.
+    t.flags.mouse_event = if (data.mouse_all_flag)
+        .any
+    else if (data.mouse_button_flag)
+        .button
+    else if (data.mouse_standard_flag)
+        .normal
+    else
+        .none;
+    t.flags.mouse_format = if (data.mouse_sgr_flag)
+        .sgr
+    else if (data.mouse_utf8_flag)
+        .utf8
+    else
+        .x10;
+
     // Focus and bracketed paste
     t.modes.set(.focus_event, data.focus_flag);
     t.modes.set(.bracketed_paste, data.bracketed_paste);
@@ -869,6 +892,36 @@ test "pane state restores modifyOtherKeys as tmux reports it" {
     data.pane_key_mode = "VT10x";
     try applyPaneState(&t, data);
     try testing.expect(!t.flags.modify_other_keys_2);
+}
+
+test "pane state restores mouse reporting as tmux reports it" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var data: PaneStateData = std.mem.zeroes(PaneStateData);
+    data.cursor_shape = "";
+    data.cursor_colour = "";
+    data.pane_tabs = "";
+    data.pane_key_mode = "";
+
+    data.mouse_all_flag = true;
+    data.mouse_sgr_flag = true;
+    try applyPaneState(&t, data);
+    try testing.expectEqual(.any, t.flags.mouse_event);
+    try testing.expectEqual(.sgr, t.flags.mouse_format);
+
+    data.mouse_all_flag = false;
+    data.mouse_standard_flag = true;
+    try applyPaneState(&t, data);
+    try testing.expectEqual(.normal, t.flags.mouse_event);
+
+    // Turned off while we were not looking: nothing left reporting.
+    data.mouse_standard_flag = false;
+    data.mouse_sgr_flag = false;
+    try applyPaneState(&t, data);
+    try testing.expectEqual(.none, t.flags.mouse_event);
+    try testing.expectEqual(.x10, t.flags.mouse_format);
 }
 
 test "erase_all clears the scrollback as well as the display" {

@@ -513,6 +513,22 @@ pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
 
             .pane_status => |v| status = v,
 
+            // The pointer follows mouse reporting turning on or off, as
+            // it does for a program's DECSET. Only then: a shape the
+            // program chose itself (OSC 22) is not ours to reset.
+            .pane_state => {
+                const reporting = self.terminal.flags.mouse_event != .none;
+                terminalpkg.tmux.sink.applyOp(
+                    self.alloc,
+                    &self.terminal,
+                    op,
+                ) catch |err| log.warn("tmux pane state failed err={}", .{err});
+                const now = self.terminal.flags.mouse_event != .none;
+                if (now != reporting) self.terminal_stream.handler.setMouseShape(
+                    if (now) .default else .text,
+                ) catch |err| log.warn("tmux mouse shape failed err={}", .{err});
+            },
+
             .history_complete => complete = true,
 
             .older_history => |v| terminalpkg.tmux.sink.applyOp(
