@@ -190,6 +190,11 @@ pub const Viewer = struct {
     /// see `sinkpkg.Op.pwd`.
     server_host: []const u8 = "",
 
+    /// The tmux server's home directory, from `#{HOME}` alongside the
+    /// version. Owned; empty until then, and on a server that cannot say.
+    /// See `paneTitle`.
+    server_home: []const u8 = "",
+
     /// The last client size we reported to tmux, so we don't re-send an
     /// unchanged one. See `nextClientSize`.
     last_client_size: ?struct {
@@ -1092,6 +1097,19 @@ pub const Viewer = struct {
         /// needs the plain path tmux understands. See `startDirectory`.
         path: []const u8 = "",
 
+        /// The pane's foreground command and title as tmux last reported
+        /// them, `#{pane_current_command}` and `#{pane_title}`. Owned;
+        /// empty until tmux has said, which `named` tells apart from tmux
+        /// saying nothing. What the pane is titled with is made from
+        /// these: see `Viewer.paneTitle`.
+        command: []const u8 = "",
+        tmux_title: []const u8 = "",
+        named: bool = false,
+
+        /// Whether `tmux_title` was set by the program running now, as
+        /// opposed to one that has since exited, or tmux's default.
+        title_current: bool = false,
+
         /// Whether a read of older history is in flight for this pane.
         /// One at a time: the next one starts where this one ends, which
         /// only the display knows once it has this one. See
@@ -1168,6 +1186,10 @@ pub const Viewer = struct {
             self.status = .live;
             self.reread = false;
             self.path = "";
+            self.command = "";
+            self.tmux_title = "";
+            self.named = false;
+            self.title_current = false;
             self.older_reading = false;
             self.older_wanted = null;
             self.history_reads = 0;
@@ -1182,6 +1204,8 @@ pub const Viewer = struct {
         pub fn destroy(self: *Pane, alloc: Allocator) void {
             if (self.sink) |s| s.close();
             if (self.path.len > 0) alloc.free(self.path);
+            if (self.command.len > 0) alloc.free(self.command);
+            if (self.tmux_title.len > 0) alloc.free(self.tmux_title);
             if (self.read_history) |v| alloc.free(v);
             if (self.read_saved) |v| alloc.free(v);
             self.stream.deinit();
@@ -1402,6 +1426,9 @@ pub const Viewer = struct {
         }
         if (self.server_host.len > 0) {
             self.alloc.free(self.server_host);
+        }
+        if (self.server_home.len > 0) {
+            self.alloc.free(self.server_home);
         }
         self.clearPendingNames();
         self.pending_names.deinit(self.alloc);
@@ -4244,7 +4271,7 @@ pub const Viewer = struct {
     }
 
     /// Pass a pane's title or working directory on to whatever shows it,
-    /// if it is news.
+    /// if it is news. A title comes as `Format.pane_title` has it.
     ///
     /// Compared against the pane's own terminal, which keeps both. A
     /// title the program set itself has already reached it as an OSC 2,
@@ -4266,19 +4293,44 @@ pub const Viewer = struct {
 
         switch (kind) {
             .title => {
-                if (pane.terminal.getTitle()) |title| {
-                    if (std.mem.eql(u8, title, value)) return;
-                }
-                try self.paneOps(pane, &.{.{ .title = value }});
+                // A command name is a file name, so it has no `/`.
+                const sep = std.mem.indexOfScalar(u8, value, '/') orelse 0;
+                const command = value[0..sep];
+                const title = if (sep < value.len and value[sep] == '/')
+                    value[sep + 1 ..]
+                else
+                    value;
+
+                const first = !pane.named;
+                const command_changed = !std.mem.eql(u8, pane.command, command);
+                const title_changed = first or !std.mem.eql(u8, pane.tmux_title, title);
+                try replaceOwned(self.alloc, &pane.command, command);
+                try replaceOwned(self.alloc, &pane.tmux_title, title);
+                pane.named = true;
+
+                // tmux checks both about once a second, so a program that
+                // titles itself as it starts is often reported along with
+                // it. When it is the shell that started, it is the other
+                // way about: the title is the last thing the program that
+                // exited did.
+                const set = title.len > 0 and
+                    !std.mem.eql(u8, title, self.server_host);
+                pane.title_current = set and if (command_changed and title_changed)
+                    first or !isShell(command)
+                else if (title_changed)
+                    true
+                else
+                    pane.title_current and !command_changed;
+
+                try self.paneTitle(pane);
             },
 
             .path => {
                 // tmux could not find out, which it says with nothing.
                 if (value.len == 0) return;
                 if (!std.mem.eql(u8, pane.path, value)) {
-                    const copy = try self.alloc.dupe(u8, value);
-                    if (pane.path.len > 0) self.alloc.free(pane.path);
-                    pane.path = copy;
+                    try replaceOwned(self.alloc, &pane.path, value);
+                    try self.paneTitle(pane);
                 }
                 if (pane.terminal.getPwd()) |pwd| {
                     if (std.mem.eql(u8, pwd, value)) return;
@@ -4289,6 +4341,83 @@ pub const Viewer = struct {
                 } }});
             },
         }
+    }
+
+    /// Title a pane the way a shell with Ghostty's shell integration
+    /// titles a terminal, since a shell under tmux has none: with the
+    /// title the running program set, if it set one; at a shell prompt,
+    /// with the working directory; otherwise with the command running.
+    fn paneTitle(self: *Viewer, pane: *Pane) !void {
+        if (!pane.named) return;
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const title = if (pane.title_current)
+            pane.tmux_title
+        else if (pane.path.len > 0 and (pane.command.len == 0 or isShell(pane.command)))
+            shortPath(&buf, pane.path, self.server_home)
+        else
+            pane.command;
+        if (title.len == 0) return;
+
+        if (pane.terminal.getTitle()) |current| {
+            if (std.mem.eql(u8, current, title)) return;
+        }
+        try self.paneOps(pane, &.{.{ .title = title }});
+    }
+
+    /// Whether a command is a shell, sitting at its prompt rather than
+    /// running something. Login shells are named with a leading `-`.
+    fn isShell(command: []const u8) bool {
+        const shells = [_][]const u8{
+            "sh",   "bash", "zsh",   "fish", "dash",  "ksh",    "mksh",
+            "tcsh", "csh",  "nu",    "pwsh", "xonsh", "elvish", "ash",
+            "yash", "oksh", "loksh",
+        };
+        const name = std.mem.trimStart(u8, command, "-");
+        for (shells) |shell| {
+            if (std.mem.eql(u8, name, shell)) return true;
+        }
+        return false;
+    }
+
+    /// A working directory as Ghostty's zsh integration titles it, zsh's
+    /// `%(4~|…/%3~|%~)`: the home directory as `~`, and only the last
+    /// three parts of anything deeper than that.
+    fn shortPath(
+        buf: []u8,
+        path: []const u8,
+        home: []const u8,
+    ) []const u8 {
+        const tilde = home.len > 1 and std.mem.startsWith(u8, path, home) and
+            (path.len == home.len or path[home.len] == '/');
+        const rest = if (tilde) path[home.len..] else path;
+
+        var parts: usize = @intFromBool(tilde);
+        var it = std.mem.tokenizeScalar(u8, rest, '/');
+        while (it.next()) |_| parts += 1;
+
+        if (parts < 4) {
+            if (!tilde) return path;
+            return std.fmt.bufPrint(buf, "~{s}", .{rest}) catch path;
+        }
+
+        // The start of the last three parts.
+        var start = std.mem.trimEnd(u8, rest, "/").len;
+        for (0..3) |_| {
+            start = std.mem.lastIndexOfScalar(u8, rest[0..start], '/') orelse 0;
+        }
+        return std.fmt.bufPrint(buf, "…{s}", .{rest[start..]}) catch path;
+    }
+
+    /// Replace an owned string, empty meaning nothing owned.
+    fn replaceOwned(
+        alloc: Allocator,
+        slot: *[]const u8,
+        value: []const u8,
+    ) Allocator.Error!void {
+        const copy: []const u8 = if (value.len > 0) try alloc.dupe(u8, value) else "";
+        if (slot.len > 0) alloc.free(slot.*);
+        slot.* = copy;
     }
 
     /// Whatever shows a pane came into sight, or went out of it.
@@ -4915,6 +5044,9 @@ pub const Viewer = struct {
         if (self.server_host.len > 0) {
             replacement.server_host = try replacement.alloc.dupe(u8, self.server_host);
         }
+        if (self.server_home.len > 0) {
+            replacement.server_home = try replacement.alloc.dupe(u8, self.server_home);
+        }
 
         // Before the swap, so the empty window list going out first
         // already names the session it is the start of.
@@ -5185,6 +5317,12 @@ pub const Viewer = struct {
         const host = try self.alloc.dupe(u8, data.host);
         if (self.server_host.len > 0) self.alloc.free(self.server_host);
         self.server_host = host;
+
+        if (data.HOME.len > 0) {
+            const home = try self.alloc.dupe(u8, data.HOME);
+            if (self.server_home.len > 0) self.alloc.free(self.server_home);
+            self.server_home = home;
+        }
 
         // Now that the version is known, and only now: an unreadable
         // version is let in (see `tmuxTooOld`), and a server that turns
@@ -6382,7 +6520,7 @@ const Command = union(enum) {
             // could be. `-s` for every pane in the session, as for
             // `pane_state`.
             .pane_titles => try writer.writeAll(
-                "list-panes -s -F '#{pane_id} #{pane_title}'\n",
+                "list-panes -s -F '#{pane_id} " ++ Format.pane_title ++ "'\n",
             ),
 
             .pane_paths => try writer.writeAll(
@@ -6505,7 +6643,7 @@ const Subscription = enum {
     fn formatString(self: Subscription) []const u8 {
         return switch (self) {
             .alerts => Format.alerts,
-            .title => "#{pane_title}",
+            .title => Format.pane_title,
             .path => "#{pane_current_path}",
             .window_order => "#{W:#{window_id} }",
 
@@ -6659,7 +6797,8 @@ const Format = struct {
 
     const tmux_version: Format = .{
         .delim = ' ',
-        .vars = &.{ .version, .client_readonly, .host },
+        // Last: a path can contain spaces.
+        .vars = &.{ .version, .client_readonly, .host, .HOME },
     };
 
     const list_sessions: Format = .{
@@ -6672,6 +6811,11 @@ const Format = struct {
             .session_name,
         },
     };
+
+    /// A pane's foreground command and title, as `Viewer.paneName` reads
+    /// them: the command is a file name, so it cannot hold the `/`, and
+    /// the title is the rest.
+    const pane_title = "#{pane_current_command}/#{pane_title}";
 
     /// A window's alerts, as `Viewer.Alerts.parse` reads them: no
     /// delimiter, since every flag is one character.
@@ -7031,7 +7175,7 @@ test "initial flow" {
                 "capture-pane -p -e -C -N -q -t %1",
                 "refresh-client -B 'ghostty-alerts:@*:#{window_bell_flag}" ++
                     "#{window_activity_flag}#{window_silence_flag}' " ++
-                    "-B 'ghostty-title:%*:#{pane_title}' " ++
+                    "-B 'ghostty-title:%*:#{pane_current_command}/#{pane_title}' " ++
                     "-B 'ghostty-path:%*:#{pane_current_path}'\n",
                 "list-panes -s -F",
             },
@@ -11823,7 +11967,7 @@ test "pane titles and working directories reach the pane's display" {
     try viewer.attachPane(0, mirror.sink());
 
     try testViewer(&viewer, &.{
-        .{ .input = testSubscription("ghostty-title", 0, 0, "vim: notes"), .commands = &.{} },
+        .{ .input = testSubscription("ghostty-title", 0, 0, "vim/vim: notes"), .commands = &.{} },
         .{ .input = testSubscription("ghostty-path", 0, 0, "/home/me/src"), .commands = &.{} },
     });
     try testing.expectEqualStrings("vim: notes", mirror.terminal.getTitle().?);
@@ -11833,12 +11977,12 @@ test "pane titles and working directories reach the pane's display" {
     // repeats it or the program said it itself first.
     const ops = mirror.ops;
     try testViewer(&viewer, &.{
-        .{ .input = testSubscription("ghostty-title", 0, 0, "vim: notes") },
+        .{ .input = testSubscription("ghostty-title", 0, 0, "vim/vim: notes") },
         .{ .input = .{ .tmux = .{ .output = .{
             .pane_id = 0,
             .data = "\x1b]2;make\x07",
         } } } },
-        .{ .input = testSubscription("ghostty-title", 0, 0, "make") },
+        .{ .input = testSubscription("ghostty-title", 0, 0, "vim/make") },
         // tmux could not tell where the pane is.
         .{ .input = testSubscription("ghostty-path", 0, 0, "") },
     });
@@ -11855,6 +11999,83 @@ test "pane titles and working directories reach the pane's display" {
     try testing.expectEqualStrings("/home/me/src", late.terminal.getPwd().?);
 }
 
+test "a pane is titled as shell integration would title it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+    viewer.server_home = try testing.allocator.dupe(u8, "/home/me");
+    try viewer.attachPane(0, mirror.sink());
+
+    // At a prompt, the working directory, whatever tmux's default title.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-path", 0, 0, "/home/me/src"), .commands = &.{} },
+        .{ .input = testSubscription("ghostty-title", 0, 0, "-zsh/host"), .commands = &.{} },
+    });
+    try testing.expectEqualStrings("~/src", mirror.terminal.getTitle().?);
+
+    // A program that titles itself as it starts, reported along with it.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-title", 0, 0, "2.1.306/✳ Fix the bug"), .commands = &.{} },
+    });
+    try testing.expectEqualStrings("✳ Fix the bug", mirror.terminal.getTitle().?);
+
+    // Back at the prompt, the title it left behind is not the shell's,
+    // even when it set it on the way out.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-title", 0, 0, "zsh/Goodbye"), .commands = &.{} },
+    });
+    try testing.expectEqualStrings("~/src", mirror.terminal.getTitle().?);
+
+    // Nor is it the next program's, which does not title itself.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-title", 0, 0, "lazygit/Goodbye"), .commands = &.{} },
+    });
+    try testing.expectEqualStrings("lazygit", mirror.terminal.getTitle().?);
+
+    // One that titles itself after starting.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-title", 0, 0, "lazygit/repo"), .commands = &.{} },
+    });
+    try testing.expectEqualStrings("repo", mirror.terminal.getTitle().?);
+
+    // The prompt follows the working directory.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-title", 0, 0, "zsh/repo"), .commands = &.{} },
+        .{ .input = testSubscription("ghostty-path", 0, 0, "/srv/a/b/c/d"), .commands = &.{} },
+    });
+    try testing.expectEqualStrings("…/b/c/d", mirror.terminal.getTitle().?);
+
+    // A title set at the prompt is the shell's own.
+    try testViewer(&viewer, &.{
+        .{ .input = testSubscription("ghostty-title", 0, 0, "zsh/my prompt"), .commands = &.{} },
+    });
+    try testing.expectEqualStrings("my prompt", mirror.terminal.getTitle().?);
+}
+
+test "shortPath" {
+    var buf: [256]u8 = undefined;
+    const cases = [_][3][]const u8{
+        .{ "/", "/home/me", "/" },
+        .{ "/usr/bin", "/home/me", "/usr/bin" },
+        .{ "/usr/local/bin", "/home/me", "/usr/local/bin" },
+        .{ "/usr/local/bin/x", "/home/me", "…/local/bin/x" },
+        .{ "/home/me", "/home/me", "~" },
+        .{ "/home/me/a/b", "/home/me", "~/a/b" },
+        .{ "/home/me/a/b/c", "/home/me", "…/a/b/c" },
+        .{ "/home/meow/a", "/home/me", "/home/meow/a" },
+        .{ "/home/me/a", "", "/home/me/a" },
+    };
+    for (cases) |case| {
+        try testing.expectEqualStrings(case[2], Viewer.shortPath(&buf, case[0], case[1]));
+    }
+}
+
 test "a name tmux reports before the pane is listed waits for it" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
@@ -11868,7 +12089,7 @@ test "a name tmux reports before the pane is listed waits for it" {
             .input = .{ .tmux = .{ .window_add = .{ .id = 5 } } },
             .commands = &.{"list-windows"},
         },
-        .{ .input = testSubscription("ghostty-title", 5, 1, "fresh"), .commands = &.{} },
+        .{ .input = testSubscription("ghostty-title", 5, 1, "vim/fresh"), .commands = &.{} },
         .{ .input = testSubscription("ghostty-path", 5, 1, "/tmp"), .commands = &.{} },
         // A pane that never shows up is forgotten with the rest.
         .{ .input = testSubscription("ghostty-title", 6, 8, "gone"), .commands = &.{} },

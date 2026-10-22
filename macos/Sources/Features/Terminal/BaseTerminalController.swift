@@ -110,6 +110,13 @@ class BaseTerminalController: NSWindowController,
         didSet { applyTitleToWindow() }
     }
 
+    /// Marks shown before the title, whether that is the override or the
+    /// surface's: tmux's alerts for a window, which belong to the window
+    /// rather than to whatever it is titled with.
+    var titleMarks: String? {
+        didSet { applyTitleToWindow() }
+    }
+
     /// The last title and bell state published by the focused surface.
     ///
     /// The bell is kept as published rather than read off the surface when
@@ -990,9 +997,10 @@ class BaseTerminalController: NSWindowController,
 
     private func applyTitleToWindow() {
         guard let window else { return }
-        window.title = computeTitle(
-            title: titleOverride ?? lastSurfaceTitle,
-            bell: lastSurfaceBell)
+        let title = [titleMarks, titleOverride ?? lastSurfaceTitle]
+            .compactMap { $0 }
+            .joined(separator: " ")
+        window.title = computeTitle(title: title, bell: lastSurfaceBell)
     }
 
     func pwdDidChange(to: URL?) {
