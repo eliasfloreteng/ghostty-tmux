@@ -211,13 +211,15 @@ pub const Op = union(enum) {
         rows: size.CellCountInt,
     },
 
-    /// The pane's title, tmux's `#{pane_title}`.
+    /// The pane's title: tmux's `#{pane_title}` while the program that
+    /// set it runs, and otherwise its working directory at a shell
+    /// prompt or the command running, as shell integration would set it.
     ///
-    /// Usually what the pane's program last set with OSC 0 or 2, which
-    /// also arrives as bytes. This covers what the bytes cannot: the
-    /// title a pane already had when we attached, and one set by tmux
-    /// itself (`select-pane -T`, or the host name tmux starts a pane
-    /// with). A consumer should treat it as an OSC 2 from the program.
+    /// A title the program set with OSC 0 or 2 also arrives as bytes.
+    /// This covers what the bytes cannot: the title a pane already had
+    /// when we attached, one set by tmux itself (`select-pane -T`), and
+    /// the ones a shell under tmux does not set. A consumer should treat
+    /// it as an OSC 2 from the program.
     title: []const u8,
 
     /// The working directory of the pane's program, tmux's

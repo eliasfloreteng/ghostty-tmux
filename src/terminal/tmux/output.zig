@@ -133,6 +133,11 @@ pub const Variable = enum {
     focus_flag,
     /// The tmux server's host name, as `gethostname` has it there.
     host,
+    /// `HOME` in the tmux server's global environment, which tmux looks
+    /// up for a name that is not one of its own. Empty on a server too
+    /// old to. A path, so any character: this must be the last variable
+    /// in a format.
+    HOME,
     /// Pane insert flag.
     insert_flag,
     /// Pane keypad cursor flag.
@@ -273,6 +278,7 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .host,
+            .HOME,
             .pane_key_mode,
             .pane_tabs,
             .version,
@@ -289,7 +295,7 @@ pub const Variable = enum {
     /// these, and only last. See `parseFormatStruct`.
     pub fn restOfLine(self: Variable) bool {
         return switch (self) {
-            .window_name, .session_name => true,
+            .window_name, .session_name, .HOME => true,
             else => false,
         };
     }
@@ -337,6 +343,7 @@ pub const Variable = enum {
             .cursor_colour,
             .cursor_shape,
             .host,
+            .HOME,
             .pane_key_mode,
             .pane_tabs,
             .version,
