@@ -1405,6 +1405,7 @@ def attach_restores_splits(ctx: Context) -> None:
     ctx.tmux.run("resize-pane", "-t", ctx.tmux.window(SESSION, "main").panes[0].id, "-x", str(total // 4))
     ctx.wait_synced()
     wanted = _pane_widths(ctx, "main")[0] / total
+    log(f"pane widths left in Ghostty: {_pane_widths(ctx, 'main')} of {total}")
     window = ctx.tmux.window(SESSION, "main").id
     wait_until(
         lambda: ctx.tmux.run("show-options", "-wqv", "-t", window, "@ghostty-layout").strip()
@@ -1412,6 +1413,7 @@ def attach_restores_splits(ctx: Context) -> None:
         timeout=ctx.timeout,
         desc="the layout to be saved in the window",
     )
+    log(f"saved layout: {ctx.tmux.run('show-options', '-wqv', '-t', window, '@ghostty-layout').strip()}")
 
     for client in ctx.tmux.control_clients():
         ctx.tmux.run("detach-client", "-t", client)
@@ -2288,3 +2290,4 @@ def pane_tui_redraws(ctx: Context) -> None:
             raise Skip("resizing windows needs the Accessibility permission")
         time.sleep(1)
         expect_same_text(ctx, term, pane, f"the TUI to look the same after resizing the window to {w}x{h}")
+

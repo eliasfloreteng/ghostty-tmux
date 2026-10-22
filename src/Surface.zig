@@ -4680,8 +4680,12 @@ pub fn mouseButtonCallback(
             if (mods.shift and !shift_capture) break :report;
 
             // A click on a link is ours: its release opens the link, so
-            // the program must not get the press either.
-            if (button == .left and self.mouse.over_link) break :report;
+            // the program must not get the press either. Only while the
+            // click's own modifiers leave links to us: the hover state can
+            // be left over from modifiers released without a key event.
+            if (button == .left and
+                self.mouse.over_link and
+                self.mouseLinksUncaptured()) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
