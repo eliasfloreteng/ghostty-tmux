@@ -133,8 +133,10 @@ sign() {
 # Loose helper executables inside frameworks (Sparkle's Autoupdate) are
 # not bundles of their own, so they go first: signing one after its
 # framework would break the framework's seal.
-find "$out/Contents/Frameworks" -type f -perm -u+x ! -name '*.dylib' \
-  ! -path '*.app/*' ! -path '*.xpc/*' -print 2>/dev/null |
+# Prune nested apps and XPC services rather than filtering on their path:
+# "$out" itself ends in .app, so a '*.app/*' pattern matches everything.
+find "$out/Contents/Frameworks" \( -name '*.app' -o -name '*.xpc' \) -prune \
+  -o -type f -perm -u+x ! -name '*.dylib' -print 2>/dev/null |
   while IFS= read -r exe; do
     # A framework's own binary (Foo.framework/Versions/A/Foo) is signed
     # with the framework.
