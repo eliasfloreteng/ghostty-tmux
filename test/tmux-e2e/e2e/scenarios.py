@@ -12,6 +12,7 @@ import os
 import re
 import signal
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -274,6 +275,91 @@ def gui_select_tab(ctx: Context) -> None:
         timeout=ctx.timeout,
         desc="tmux window 'beta' to become active",
         describe_state=ctx.describe,
+    )
+
+
+@scenario
+def gui_select_tab_quickly(ctx: Context) -> None:
+    """Tabs picked in quick succession, while tmux sends unrelated updates, end on the last one."""
+    ctx.attach({"alpha": 1, "beta": 1, "gamma": 1})
+    tabs = {name: ctx.tab_for_window(name) for name in ("alpha", "beta", "gamma")}
+
+    # Window renames make the app re-send its window list, as alerts and
+    # layouts do. One sent while a switch is on its way names the window
+    # the user left, and must not take them back there.
+    stop = threading.Event()
+
+    def churn() -> None:
+        while not stop.is_set():
+            for name in ("alpha", "beta", "gamma"):
+                ctx.tmux.run("rename-window", "-t", f"{SESSION}:{name}", name, check=False)
+
+    noise = threading.Thread(target=churn, daemon=True)
+    noise.start()
+    try:
+        for last in ("gamma", "beta", "alpha", "gamma"):
+            for name in ("beta", "alpha", "gamma", "beta", last):
+                ctx.app.select_tab(tabs[name])
+
+            def settled(last: str = last) -> bool:
+                selected = next((t for t in ctx.tmux_tabs() if t.selected), None)
+                return (
+                    selected is not None
+                    and selected.name == last
+                    and ctx.tmux.window(SESSION, last).active
+                )
+
+            wait_until(
+                settled,
+                timeout=ctx.timeout,
+                desc=f"tab and tmux window {last!r} to stay selected",
+                describe_state=ctx.describe,
+            )
+            # Still there a moment later: nothing late pulled it back.
+            time.sleep(1.0)
+            check(settled(), f"tab {last!r} pulled away after it was picked: {ctx.describe()}")
+    finally:
+        stop.set()
+        noise.join()
+
+
+@scenario
+def gui_new_tab_after_current(ctx: Context) -> None:
+    """A new tab goes right after the one it was asked from, even past a gap in tmux's indexes."""
+    ctx.attach({"alpha": 1, "beta": 1, "gamma": 1})
+
+    # renumber-windows is off, so closing beta leaves a gap that a plain
+    # `new-window` would fill instead.
+    ctx.tmux.run("kill-window", "-t", f"{SESSION}:beta")
+    ctx.wait_synced("GUI to drop the killed window")
+
+    before = {w.id for w in ctx.windows()}
+    ctx.app.perform(ctx.tab_for_window("alpha").terminals[0].id, "new_tab")
+    new = wait_until(
+        lambda: next((w for w in ctx.windows() if w.id not in before), None),
+        timeout=ctx.timeout,
+        desc="a new tmux window",
+        describe_state=ctx.describe,
+    )
+    ctx.wait_synced()
+
+    order = [w.id for w in sorted(ctx.windows(), key=lambda w: w.index)]
+    alpha = ctx.tmux.window(SESSION, "alpha").id
+    check(
+        order.index(new.id) == order.index(alpha) + 1,
+        f"new window {new.id} is not right after alpha in tmux: {ctx.describe()}",
+    )
+
+    def gui_order() -> list[str] | None:
+        tabs = sorted(ctx.tmux_tabs(), key=lambda t: t.index)
+        ids = [ctx.tab_windows.get(t.id) for t in tabs]
+        return ids if None not in ids else None
+
+    wait_until(
+        lambda: gui_order() == order,
+        timeout=ctx.timeout,
+        desc="the tabs in tmux's window order",
+        describe_state=lambda: f"tabs {gui_order()} vs tmux {order}{ctx.describe()}",
     )
 
 
