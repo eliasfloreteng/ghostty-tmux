@@ -971,6 +971,18 @@ pub const Viewer = struct {
         pub fn shownLayout(self: *const Window) Layout {
             return self.zoomed_layout orelse self.layout;
         }
+
+        /// Whether we have asked tmux for a size it has not laid this
+        /// window out at yet. Until it does, the layout we have is the
+        /// one the request replaces, so what panes add up to in it is
+        /// not the window's size. A layout at another size is tmux's
+        /// answer all the same (see `size_taken`), and ends the wait.
+        fn sizePending(self: *const Window) bool {
+            const want = self.last_size_request orelse return false;
+            if (self.size_taken) return false;
+            const shown = self.shownLayout();
+            return shown.width != want.cols or shown.height != want.rows;
+        }
     };
 
     /// The alerts tmux keeps per window and shows in its status line:
@@ -1737,6 +1749,20 @@ pub const Viewer = struct {
         // And a report of the size a pane already has asks for nothing,
         // so it waits for company rather than going out alone.
         //
+        // Adding up means fitting together, as tmux's panes always do:
+        // the children of a split the same size across it. Composed the
+        // way a window is, the largest child sets that size, and a pane
+        // narrower than its sibling disappears into it. That is a pane
+        // of a smaller GUI window reporting ahead of the rest, not a
+        // drag, and let through one by one such reports kept the window
+        // at tmux's size for good, with its panes shuffled about inside.
+        //
+        // Nor while a size we asked for is on its way. The layout we
+        // have is then the old one, and a pane reporting against the
+        // new arrangement, with the rest filled in from the old, can
+        // add up to the old size: going out, it would ask tmux for that
+        // size back.
+        //
         // All of this is over the panes on screen. While a pane is
         // zoomed that is the zoomed pane alone, which is the window:
         // composing the unzoomed layout around its full-window size
@@ -1747,9 +1773,10 @@ pub const Viewer = struct {
         // last laid it out at; `Window.width` is only as of the last
         // `list-windows`.
         if (!layoutFullyRequested(&self.panes, shown)) {
-            const composed = composeLayoutSize(&self.panes, shown);
-            if (composed.cols != shown.width or
-                composed.rows != shown.height or
+            const fitted = fitLayoutSize(&self.panes, shown) orelse return &.{};
+            if (fitted.cols != shown.width or
+                fitted.rows != shown.height or
+                window.sizePending() or
                 !layoutRequestsChange(&self.panes, shown)) return &.{};
         }
 
@@ -1937,6 +1964,10 @@ pub const Viewer = struct {
 
         window.last_size_request = .{ .cols = want.cols, .rows = want.rows };
 
+        // Whoever had the window, this asks for it back; whether tmux
+        // agrees is for the layout answering it to say.
+        window.size_taken = false;
+
         // Per-window sizes through `refresh-client -C @id:WxH` landed in
         // tmux 3.4. An older server parses that argument as a plain size,
         // fails, and answers with an error, so it gets `resize-window`
@@ -2027,6 +2058,40 @@ pub const Viewer = struct {
                 if (layoutContainsPane(child, pane_id)) break true;
             } else false,
         };
+    }
+
+    /// Like `composeLayoutSize`, but only if the sizes fit together as
+    /// tmux's do: the children of each split all the same size across
+    /// it. Null if they do not, as when some panes have reported against
+    /// an arrangement the rest have not caught up with.
+    fn fitLayoutSize(
+        panes: *const PanesMap,
+        node: Layout,
+    ) ?struct { cols: usize, rows: usize } {
+        const children: []const Layout, const across: bool = switch (node.content) {
+            .pane => {
+                const own = composeLayoutSize(panes, node);
+                return .{ .cols = own.cols, .rows = own.rows };
+            },
+            .horizontal => |v| .{ v, true },
+            .vertical => |v| .{ v, false },
+        };
+
+        // Along the split, the children and a divider between each pair.
+        var along: usize = children.len -| 1;
+        var other: ?usize = null;
+        for (children) |child| {
+            const fitted = fitLayoutSize(panes, child) orelse return null;
+            along += if (across) fitted.cols else fitted.rows;
+            const o = if (across) fitted.rows else fitted.cols;
+            if (other) |v| if (v != o) return null;
+            other = o;
+        }
+
+        return if (across)
+            .{ .cols = along, .rows = other orelse 0 }
+        else
+            .{ .cols = other orelse 0, .rows = along };
     }
 
     /// The size a layout would need to hold every pane at the size that
@@ -13684,6 +13749,93 @@ test "dragging a divider that leaves one side alone resizes the panes it moved" 
                 "refresh-client -C @0:83x44\n",
                 "resize-pane -t %1 -x 41 -y 25\n",
                 "resize-pane -t %2 -x 41 -y 18\n",
+            },
+        },
+    });
+}
+
+test "panes reporting alone are resized alone only if they fit the window tmux has laid out" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    // Pane 0 on the left; panes 1 (20 rows) and 2 (23 rows) stacked on
+    // the right.
+    const layout = "5169,83x44,0,0{41x44,0,0,0,41x44,42,0[41x20,42,0,1,41x23,42,21,2]}";
+    try testViewer(&viewer, comptime &([_]TestStep{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0 host" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end = "$0 @0 1 83 44 " ++ layout ++ " 0 " ++ layout ++ " 0 0 0 0 %0",
+        } } },
+    } ++ testPrimaryCaptureSteps("", "") ++
+        testPrimaryCaptureSteps("", "") ++
+        testPrimaryCaptureSteps("", "") ++
+        testSubscribeSteps() ++ [_]TestStep{
+        // pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    }));
+
+    try testViewer(&viewer, &.{
+        // The GUI window changes size and every pane reports.
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 50, .rows = 30 } } },
+        .{ .input = .{ .resize = .{ .pane_id = 1, .cols = 50, .rows = 14 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 2, .cols = 50, .rows = 15 } },
+            .commands = &.{
+                "refresh-client -C @0:101x30\n",
+                "resize-pane -t %0 -x 50 -y 30\n",
+                "resize-pane -t %1 -x 50 -y 14\n",
+                "resize-pane -t %2 -x 50 -y 15\n",
+            },
+        },
+    });
+    for (0..4) |_| try testViewer(&viewer, &.{.{ .input = .{ .tmux = .{ .block_end = "" } } }});
+
+    // Before tmux lays the window out at that size, panes 1 and 2
+    // report sizes that, with pane 0 at the size tmux still has it,
+    // add up to the old window. Sent, they would ask tmux for the old
+    // size back.
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 41, .rows = 25 } },
+            .commands = &.{},
+        },
+        .{
+            .input = .{ .resize = .{ .pane_id = 2, .cols = 41, .rows = 18 } },
+            .commands = &.{},
+        },
+    });
+
+    // Once it does, a pane narrower than its sibling is not a drag
+    // inside the window, however the window's size comes out: it waits
+    // for the rest of the panes.
+    const resized = "1fd9,101x30,0,0{50x30,0,0,0,50x30,51,0[50x14,51,0,1,50x15,51,15,2]}";
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .layout_change = .{
+            .window_id = 0,
+            .layout = resized,
+            .visible_layout = resized,
+            .raw_flags = "*",
+        } } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 30, .rows = 14 } },
+            .commands = &.{},
+        },
+    });
+
+    // And a divider dragged inside the window resizes the panes it
+    // moved, and the window is left as it is.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .resize = .{ .pane_id = 1, .cols = 50, .rows = 19 } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 2, .cols = 50, .rows = 10 } },
+            .commands = &.{
+                "resize-pane -t %1 -x 50 -y 19\n",
+                "resize-pane -t %2 -x 50 -y 10\n",
             },
         },
     });

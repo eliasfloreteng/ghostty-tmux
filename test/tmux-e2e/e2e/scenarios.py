@@ -1441,6 +1441,64 @@ def attach_restores_splits(ctx: Context) -> None:
     ctx.wait_synced()
 
 
+def _layout_with_checksum(body: str) -> str:
+    """A tmux layout with its checksum in front, as `select-layout` takes it."""
+    csum = 0
+    for c in body:
+        csum = ((csum >> 1) + ((csum & 1) << 15) + ord(c)) & 0xFFFF
+    return f"{csum:04x},{body}"
+
+
+@scenario
+def attach_tiny_panes_settle(ctx: Context) -> None:
+    """Attaching to a big window with a one-row pane and a narrow column settles at the GUI's size, still attached."""
+    ctx.open_gateway()
+    ctx.tmux.run("new-session", "-d", "-s", SESSION, "-n", "main", "-x", "429", "-y", "80")
+    left = ctx.tmux.window(SESSION, "main").panes[0].id
+    right = ctx.tmux.run("split-window", "-d", "-h", "-P", "-F", "#{pane_id}", "-t", left).strip()
+    below_left = ctx.tmux.run("split-window", "-d", "-v", "-P", "-F", "#{pane_id}", "-t", left).strip()
+    below_right = ctx.tmux.run("split-window", "-d", "-v", "-P", "-F", "#{pane_id}", "-t", right).strip()
+    n = [p.lstrip("%") for p in (left, below_left, right, below_right)]
+    ctx.tmux.run(
+        "select-layout",
+        "-t",
+        f"{SESSION}:main",
+        _layout_with_checksum(
+            f"429x80,0,0{{419x80,0,0[419x78,0,0,{n[0]},419x1,0,79,{n[1]}],"
+            f"9x80,420,0[9x70,420,0,{n[2]},9x9,420,71,{n[3]}]}}"
+        ),
+    )
+    window = ctx.tmux.window(SESSION, "main").id
+
+    def layout() -> str:
+        return ctx.tmux.run("display", "-p", "-t", window, "#{window_layout}").strip()
+
+    log(f"layout before attach: {layout()}")
+    ctx.attach_session(wait_gui=False)
+
+    # The panes used to report their GUI sizes one at a time, each
+    # taken for a divider dragged inside the window tmux had: the window
+    # stayed at 429 columns in a 110 column GUI with its panes jumping
+    # about, at worst until the client was dropped.
+    last = [layout(), time.monotonic()]
+
+    def settled() -> bool:
+        check(bool(ctx.tmux.control_clients()), f"the control client was dropped at layout {last[0]}")
+        now = layout()
+        if now != last[0]:
+            log(f"layout now: {now}")
+            last[:] = [now, time.monotonic()]
+        return ctx.tmux.window(SESSION, "main").width <= 120 and time.monotonic() - last[1] >= 3
+
+    wait_until(
+        settled,
+        timeout=ctx.timeout + 3,
+        desc="the window to take the GUI's size and stay put for 3s",
+        describe_state=lambda: f"layout {last[0]}",
+    )
+    ctx.wait_synced()
+
+
 @scenario
 def attach_with_history(ctx: Context) -> None:
     """Attaching to panes with long history makes the history scrollable in the GUI."""
