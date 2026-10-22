@@ -370,6 +370,10 @@ pub const Viewer = struct {
     /// reason as `action_single`.
     action_exit: [2]Action,
 
+    /// The pre-allocated actions for giving up on a session we can no
+    /// longer follow: see `abandon`.
+    action_abandon: [3]Action,
+
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
@@ -1404,6 +1408,7 @@ pub const Viewer = struct {
             .action_arena = .{},
             .action_single = undefined,
             .action_exit = undefined,
+            .action_abandon = undefined,
         };
     }
 
@@ -2618,8 +2623,16 @@ pub const Viewer = struct {
     /// and tmux answers by ending control mode. Teardown is the same
     /// path a session that goes away any other way already takes, so
     /// there is nothing to unwind here.
+    ///
+    /// Before the session is up, or after we gave up on it, there is no
+    /// queue to pair the reply with, so the command goes out as it is and
+    /// its reply goes unread: `%exit` follows it either way. That is the
+    /// way out of an attach that never finishes, which would otherwise
+    /// leave only closing the host, and with it tmux's client.
     fn nextDetach(self: *Viewer) []const Action {
-        if (self.state != .command_queue) return &.{};
+        if (self.state != .command_queue) {
+            return self.singleAction(.{ .command = "detach-client\n" });
+        }
 
         return self.queueUserCommand("detach-client\n", .{}) catch {
             log.warn("failed to queue detach-client", .{});
@@ -3677,21 +3690,36 @@ pub const Viewer = struct {
             .session_changed => |info| {
                 self.session_id = info.id;
                 self.setSessionName(info.name) catch {
-                    log.warn("failed to record the session name, becoming defunct", .{});
-                    return self.defunct();
+                    log.warn("failed to record the session name, detaching", .{});
+                    return self.abandon();
                 };
 
                 var arena = self.action_arena.promote(self.alloc);
                 defer self.action_arena = arena.state;
                 _ = arena.reset(.free_all);
 
-                return self.enterCommandQueue(
+                var actions: std.ArrayList(Action) = .empty;
+                self.enterCommandQueue(
                     arena.allocator(),
+                    &actions,
                     &.{ .tmux_version, .list_windows },
                 ) catch {
-                    log.warn("failed to queue command, becoming defunct", .{});
-                    return self.defunct();
+                    log.warn("failed to queue command, detaching", .{});
+                    return self.abandon();
                 };
+
+                // The session, before any of its windows: the GUI shows
+                // the host as attached, with its way to detach, from
+                // here on rather than once the window list is in. If
+                // that never comes, detaching is still on offer.
+                actions.append(
+                    arena.allocator(),
+                    .{ .windows = self.windows.items },
+                ) catch {
+                    log.warn("failed to announce the session, detaching", .{});
+                    return self.abandon();
+                };
+                return actions.items;
             },
 
             else => return if (notificationNotice(n)) |notice|
@@ -3746,8 +3774,8 @@ pub const Viewer = struct {
                     content,
                     tag == .block_err,
                 ) catch {
-                    log.warn("failed to process command output, becoming defunct", .{});
-                    return self.defunct();
+                    log.warn("failed to process command output, detaching", .{});
+                    return self.abandon();
                 };
             },
 
@@ -3770,8 +3798,8 @@ pub const Viewer = struct {
                     info.id,
                     info.name,
                 ) catch {
-                    log.warn("failed to handle session change, becoming defunct", .{});
-                    return self.defunct();
+                    log.warn("failed to handle session change, detaching", .{});
+                    return self.abandon();
                 };
             },
 
@@ -3786,22 +3814,22 @@ pub const Viewer = struct {
                 // Note: in the future, we can probably handle a failure
                 // here with a fallback to remove this one window, list
                 // windows again, and try again.
-                log.warn("failed to handle layout change, becoming defunct", .{});
-                return self.defunct();
+                log.warn("failed to handle layout change, detaching", .{});
+                return self.abandon();
             },
 
             // A window was added to this session.
             .window_add => |info| self.windowAdd(info.id) catch {
-                log.warn("failed to handle window add, becoming defunct", .{});
-                return self.defunct();
+                log.warn("failed to handle window add, detaching", .{});
+                return self.abandon();
             },
 
             // tmux stopped sending us a pane's output. Ask for it back
             // and re-read the pane, since what it discarded meanwhile is
             // gone for good.
             .pause => |info| self.pauseRecover(info.pane_id) catch {
-                log.warn("failed to resume a paused pane, becoming defunct", .{});
-                return self.defunct();
+                log.warn("failed to resume a paused pane, detaching", .{});
+                return self.abandon();
             },
 
             // tmux acknowledging the resume we asked for above. The
@@ -3814,8 +3842,8 @@ pub const Viewer = struct {
             // A window left this session, by being killed, by its last
             // pane exiting, or by being moved elsewhere.
             .window_close => |info| self.windowClose(info.id) catch {
-                log.warn("failed to handle window close, becoming defunct", .{});
-                return self.defunct();
+                log.warn("failed to handle window close, detaching", .{});
+                return self.abandon();
             },
 
             // A session was renamed. tmux tells every control client
@@ -3924,7 +3952,7 @@ pub const Viewer = struct {
             var arena = self.action_arena.promote(self.alloc);
             defer self.action_arena = arena.state;
             self.flushCommands(arena.allocator(), &actions) catch
-                return self.defunct();
+                return self.abandon();
         }
 
         return actions.items;
@@ -6050,17 +6078,15 @@ pub const Viewer = struct {
     fn enterCommandQueue(
         self: *Viewer,
         arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
         commands: []const Command,
-    ) Allocator.Error![]const Action {
+    ) Allocator.Error!void {
         assert(self.state != .command_queue);
         assert(commands.len > 0);
 
         try self.queueCommands(commands);
         self.state = .command_queue;
-
-        var actions: std.ArrayList(Action) = .empty;
-        try self.flushCommands(arena_alloc, &actions);
-        return actions.items;
+        try self.flushCommands(arena_alloc, actions);
     }
 
     /// How many lines of history a read from scratch takes, or null for
@@ -6222,6 +6248,29 @@ pub const Viewer = struct {
         } });
 
         return actions.items;
+    }
+
+    /// Give up on a session we can no longer follow, while tmux is still
+    /// there: a reply we could not make sense of, or memory running out.
+    ///
+    /// Leaving is the part that matters. Going defunct on our own would
+    /// leave tmux attached and the host's pty in control mode, with
+    /// nothing on screen and every key typed into the host swallowed, so
+    /// the only way out would be closing the host, which ends the client
+    /// tmux was running for and, over ssh, the connection with it. A
+    /// `detach-client` instead has tmux end control mode, the same way
+    /// as `refuseOldTmux`, and the session keeps running.
+    fn abandon(self: *Viewer) []const Action {
+        _ = self.defunct();
+        self.action_abandon = .{
+            .{ .notice = .{
+                .kind = .exit,
+                .text = "lost track of the tmux session; detached, and it is still running",
+            } },
+            .{ .command = "detach-client\n" },
+            .exit,
+        };
+        return &self.action_abandon;
     }
 
     fn defunct(self: *Viewer) []const Action {
@@ -10209,6 +10258,65 @@ test "pause mode is asked for once the version allows it" {
                 }
             }).check,
         },
+    });
+}
+
+test "the session is announced as soon as tmux names it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_tags = &.{.windows},
+            .contains_command = "display-message",
+        },
+    });
+    try testing.expectEqualStrings("test", viewer.session_name);
+}
+
+test "detaching works before the session is up" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    // Still waiting for the attach to answer: nothing to pair a reply
+    // with, so it goes out as it is.
+    try testViewer(&viewer, &.{
+        .{ .input = .detach, .commands = &.{"detach-client\n"} },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .detach, .commands = &.{"detach-client\n"} },
+    });
+}
+
+test "a reply we cannot read detaches rather than leaving tmux attached" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        // The version query answered with something that is not one.
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .commands = &.{"detach-client\n"},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(3, actions.len);
+                    try testing.expectEqual(.exit, actions[0].notice.kind);
+                    try testing.expect(actions[2] == .exit);
+                    try testing.expectEqual(.defunct, v.state);
+                }
+            }).check,
+        },
+        // And detaching again stays possible until tmux has left.
+        .{ .input = .detach, .commands = &.{"detach-client\n"} },
     });
 }
 

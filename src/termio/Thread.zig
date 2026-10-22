@@ -450,6 +450,17 @@ fn coalesceCallback(
 
     const cb = cb_ orelse return .disarm;
 
+    // Whatever was published before this fired is written first. A
+    // resize can write to the pty itself (a tmux host's client size,
+    // straight from `Termio.resize`), and anything still in the mailbox
+    // was queued before it: written after, it would reach tmux out of
+    // the order its viewer queued them in, and tmux's replies, which
+    // are paired with commands by order, would answer the wrong ones.
+    // Drained before the resize is read, so a newer one in the mailbox
+    // replaces it rather than being dropped by a timer still running.
+    cb.self.drainMailbox(cb) catch |err|
+        log.err("error draining mailbox err={}", .{err});
+
     if (cb.self.coalesce_data.resize) |v| {
         cb.self.coalesce_data.resize = null;
         cb.io.resize(&cb.data, v) catch |err| {
