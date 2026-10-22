@@ -6,7 +6,8 @@ The harness is deliberately implementation-agnostic. The contract it checks
 * the terminal in which `tmux -CC` runs is the *gateway*; every other GUI tab
   belongs to tmux,
 * one tmux window == one GUI tab, one tmux pane == one GUI terminal in it,
-* the tab name is the tmux window name,
+* a tab is titled like its active pane (see `tmux_tabs` for how tabs are
+  told apart all the same),
 * the tab's selected/focused state mirrors the active window/pane.
 
 GUI terminals are correlated with tmux panes by typing a unique marker into
@@ -18,7 +19,7 @@ from __future__ import annotations
 
 import secrets
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import ax
@@ -27,6 +28,17 @@ from .tmux import Tmux, Window
 from .util import CheckFailed, check, log, wait_until
 
 SESSION = "e2e"
+
+# What a tab shows in front of its title for tmux's window flags.
+ALERT_MARKS = {"bell": "🔔", "activity": "•", "silence": "💤"}
+
+
+def unmarked(title: str) -> str:
+    """A tab's title without the alert marks in front of it."""
+    head, _, rest = title.partition(" ")
+    if rest and head and all(c in "".join(ALERT_MARKS.values()) for c in head):
+        return rest
+    return title
 
 
 @dataclass
@@ -38,6 +50,8 @@ class Context:
     gateway: str = ""  # terminal id of the gateway terminal
     gateway_tty: str = ""
     gateway_title: str = ""  # the gateway window's title before attaching
+    # GUI tab id -> the id of the tmux window it was found to show.
+    tab_windows: dict[str, str] = field(default_factory=dict)
 
     # -- setup --------------------------------------------------------------
 
@@ -103,13 +117,48 @@ class Context:
         if self.app.alive():
             self.app.close_all_windows(timeout=self.timeout)
         self.gateway = self.gateway_tty = self.gateway_title = ""
+        self.tab_windows.clear()
 
     # -- GUI <-> tmux comparison -------------------------------------------
 
     def tmux_tabs(self, snap: Snapshot | None = None) -> list[Tab]:
-        """GUI tabs that represent tmux windows (everything but the gateway)."""
+        """GUI tabs that represent tmux windows (everything but the gateway).
+
+        Each is named after the tmux window it shows, its title kept in
+        `title`. A tab is titled like its active pane, not after its
+        window, so which window a tab shows is worked out the first time
+        it is seen and remembered by the tab's id: by the title the tmux
+        config gives a new window's pane, the window's name, or failing
+        that by being the only new tab when there is only one new window.
+        A tab not worked out yet keeps its title as its name.
+        """
         snap = snap or self.app.snapshot()
-        return [t for t in snap.tabs if all(x.id != self.gateway for x in t.terminals)]
+        tabs = [t for t in snap.tabs if all(x.id != self.gateway for x in t.terminals)]
+        try:
+            windows = {w.id: w for w in self.windows()}
+        except Exception:  # noqa: BLE001 - no server or no session
+            windows = {}
+
+        live = {t.id for t in tabs}
+        self.tab_windows = {t: w for t, w in self.tab_windows.items() if t in live and w in windows}
+        taken = set(self.tab_windows.values())
+        unknown = [t for t in tabs if t.id not in self.tab_windows]
+        for t in unknown:
+            title = unmarked(t.name)
+            found = [w for w in windows.values() if w.name == title and w.id not in taken]
+            if len(found) == 1:
+                self.tab_windows[t.id] = found[0].id
+                taken.add(found[0].id)
+        unknown = [t for t in tabs if t.id not in self.tab_windows]
+        free = [w for w in windows if w not in taken]
+        if len(unknown) == 1 and len(free) == 1:
+            self.tab_windows[unknown[0].id] = free[0]
+
+        def named(t: Tab) -> Tab:
+            window = windows.get(self.tab_windows.get(t.id, ""))
+            return replace(t, name=window.name if window else t.name, title=t.name)
+
+        return [named(t) for t in tabs]
 
     def windows(self) -> list[Window]:
         return self.tmux.windows(SESSION)

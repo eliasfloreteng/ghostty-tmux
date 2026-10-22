@@ -63,6 +63,9 @@ class Tab:
     selected: bool
     focused_terminal: str | None
     terminals: tuple[Terminal, ...]
+    # The tab's title as the GUI shows it. `Context.tmux_tabs` puts the
+    # tmux window's name in `name` and keeps the title here.
+    title: str = ""
 
 
 @dataclass(frozen=True)

@@ -121,6 +121,12 @@ Scenarios (see `e2e/scenarios.py`, or `--list`):
 - `tmux_*`: tmux-side changes show up in the GUI: `new-window`,
   `split-window`, `kill-pane`, `kill-window`, `rename-window`,
   `select-window`, `select-pane`, `resize-pane -Z`.
+- `tmux_tab_title_like_shell_integration`: a tab is titled like its
+  active pane, as shell integration would title a terminal: with the
+  title a running program set, else the command running, else the
+  working directory at the prompt. Tabs are told apart regardless: the
+  tmux config titles each new pane with its window's name, and a tab is
+  remembered as its window's once seen (see `Context.tmux_tabs`).
 - `gui_*`: GUI-side changes show up in tmux: typing, `new_tab`,
   `new_split`, closing a split or tab, selecting a tab, focusing a split,
   `toggle_split_zoom`.

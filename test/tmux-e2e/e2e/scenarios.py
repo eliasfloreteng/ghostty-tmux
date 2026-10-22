@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import ax
-from .context import SESSION, Context
+from .context import ALERT_MARKS, SESSION, Context, unmarked
 from .ghostty import AppleScriptError, pbcopy, pbpaste
 from .util import CheckFailed, Skip, check, log, wait_until
 from .windows import native_windows, resize_front_window, screenshot
@@ -129,10 +129,14 @@ def tmux_kill_window(ctx: Context) -> None:
 
 @scenario
 def tmux_rename_window(ctx: Context) -> None:
-    """`tmux rename-window` updates the tab title."""
+    """`tmux rename-window` keeps the tab, titled after its pane as before."""
     two_window_layout(ctx)
+    tab = ctx.tab_for_window("beta")
     ctx.tmux.run("rename-window", "-t", f"{SESSION}:beta", "gamma")
-    ctx.wait_synced("the tab title to follow rename-window")
+    ctx.wait_synced("the tab to stay through rename-window")
+    after = ctx.tab_for_window("gamma")
+    check(after.id == tab.id, f"rename-window replaced the tab{ctx.describe()}")
+    check(after.title == tab.title, f"the tab's title went from {tab.title!r} to {after.title!r}")
 
 
 @scenario
@@ -1474,18 +1478,13 @@ def switch_client_same_session(ctx: Context) -> None:
 
 # -- alerts, titles and working directories ------------------------------------
 
-# What a tab shows in front of the window name for tmux's window flags.
-ALERT_MARKS = {"bell": "🔔", "activity": "•", "silence": "💤"}
-
-
 def tab_marks(ctx: Context, window: str) -> str:
-    """The marks in front of the name of the tab for tmux window `window`."""
+    """The marks in front of the title of the tab for tmux window `window`."""
     for tab in ctx.tmux_tabs():
         if tab.name == window:
-            return ""
-        if tab.name.endswith(" " + window):
-            return tab.name[: -len(window) - 1]
-    raise CheckFailed(f"no tab named {window!r}{ctx.describe()}")
+            title = unmarked(tab.title)
+            return tab.title[: -len(title)].strip() if title != tab.title else ""
+    raise CheckFailed(f"no tab for window {window!r}{ctx.describe()}")
 
 
 def expect_marks(ctx: Context, window: str, want: set[str], desc: str) -> None:
@@ -1503,7 +1502,7 @@ def expect_marks(ctx: Context, window: str, want: set[str], desc: str) -> None:
 
 def select_tab_named(ctx: Context, window: str) -> None:
     """Select the tab for `window`, whatever marks it carries."""
-    tab = next(t for t in ctx.tmux_tabs() if t.name == window or t.name.endswith(" " + window))
+    tab = next(t for t in ctx.tmux_tabs() if t.name == window)
     ctx.app.select_tab(tab)
 
 
@@ -1590,6 +1589,39 @@ def tmux_pane_working_directory(ctx: Context) -> None:
         desc="the terminal's working directory to follow the pane's",
         describe_state=lambda: repr(ctx.tab_for_window("main").terminals[0].cwd),
     )
+
+
+@scenario
+def tmux_tab_title_like_shell_integration(ctx: Context) -> None:
+    """A tab is titled as shell integration would: the program's title, else the command, else the directory."""
+    ctx.attach()
+    pane = ctx.tmux.window(SESSION, "main").panes[0].id
+
+    def expect_title(want: str, desc: str) -> None:
+        wait_until(
+            lambda: unmarked(ctx.tab_for_window("main").title) == want,
+            timeout=ctx.timeout,
+            desc=f"the tab title to be {want!r} {desc}",
+            describe_state=lambda: repr(ctx.tab_for_window("main").title),
+        )
+
+    # The title the tmux config gave the pane, before anything ran in it.
+    expect_title("main", "after attaching")
+    ctx.tmux.run("send-keys", "-t", pane, "cd /usr/bin; cat", "Enter")
+    expect_title("cat", "while a program that sets no title runs")
+    ctx.tmux.run("send-keys", "-t", pane, "C-c")
+    expect_title("/usr/bin", "back at the prompt")
+
+    # One that titles itself, as Claude Code titles itself with the
+    # conversation's.
+    ctx.tmux.run("send-keys", "-t", pane, "perl -e '$|=1; print \"\\e]2;agent\\a\"; sleep 60'", "Enter")
+    expect_title("agent", "while a program that titled itself runs")
+    ctx.tmux.run("send-keys", "-t", pane, "C-c")
+    expect_title("/usr/bin", "once it has exited")
+
+    ctx.tmux.run("send-keys", "-t", pane, "cat", "Enter")
+    expect_title("cat", "for the next program, not the last one's title")
+    ctx.tmux.run("send-keys", "-t", pane, "C-c")
 
 
 @scenario
@@ -1876,11 +1908,7 @@ def option_windows_placement(ctx: Context) -> None:
     try:
         two_window_layout(ctx)
         snap = ctx.app.snapshot()
-        owners = {}
-        for w in snap.windows:
-            for t in w.tabs:
-                if t.name in ("alpha", "beta"):
-                    owners[t.name] = w.id
+        owners = {t.name: t.window_id for t in ctx.tmux_tabs(snap) if t.name in ("alpha", "beta")}
         check(len(owners) == 2, f"both tmux windows should be on screen: {snap.describe()}")
         check(owners["alpha"] != owners["beta"], f"the tmux windows share a native window: {snap.describe()}")
 

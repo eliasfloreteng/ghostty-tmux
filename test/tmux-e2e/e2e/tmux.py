@@ -15,10 +15,19 @@ from .util import HarnessError, log
 # Panes run a plain POSIX shell with a fixed prompt so screen contents are
 # predictable and the user's shell rc files don't get involved. Window names
 # are pinned (no automatic-rename) so scenarios can identify windows by name.
+#
+# A tab is titled after its active pane, which at a prompt is its working
+# directory unless something titled the pane. So a new window's pane is
+# titled with the window's name, and so is every pane split from one, for
+# the harness to tell its tab from the others the first time it sees it:
+# see `Context.tmux_tabs`.
 TMUX_CONF = """\
 set -g default-command "env -i HOME={home} PATH=/usr/bin:/bin PS1='$ ' TERM=xterm-256color /bin/sh"
 set -g automatic-rename off
 set -g allow-rename off
+set-hook -g after-new-session 'select-pane -T "#{{window_name}}"'
+set-hook -g after-new-window 'select-pane -T "#{{window_name}}"'
+set-hook -g after-split-window 'select-pane -T "#{{window_name}}"'
 set -g history-limit 2000
 set -g exit-empty on
 """
