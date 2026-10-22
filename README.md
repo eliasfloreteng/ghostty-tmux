@@ -90,6 +90,8 @@ terminal and the session opens as native Ghostty windows:
   separate windows rather than tabs, `tmux-hide-host` hides the terminal
   that ran `tmux -CC` while the session is on screen,
   `tmux-history-limit` caps the history read on attach,
+  `tmux-attach-layout` lays out the splits of windows found on attach
+  as Ghostty last showed them (or evenly, or as tmux has them),
   `tmux-paste-buffer-clipboard` copies tmux paste buffers to the
   clipboard, `tmux-client-flags` sets `active-pane` and
   `no-detach-on-destroy`, and `tmux-hidden-output-off-after` stops output
