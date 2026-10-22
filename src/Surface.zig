@@ -3462,13 +3462,9 @@ pub fn keyCallback(
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        // We only refresh links if they are not the program's. See
+        // mouseLinksUncaptured.
+        if (self.mouseLinksUncaptured()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lockUncancelable(global.io());
@@ -3481,8 +3477,9 @@ pub fn keyCallback(
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
+        } else if (!self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
+            self.mouse.over_link = false;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
@@ -4508,6 +4505,21 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
     };
 }
 
+/// Returns true if links under the mouse are ours to find and open, even
+/// when the program has asked for mouse events.
+///
+/// Shift releases the mouse from a program, unless it may capture shift.
+/// So does super: no mouse report has a bit for it, so a program could
+/// only ever read a super-click as a plain click. That keeps cmd+click on
+/// a link working in a program that tracks the mouse, such as a TUI.
+///
+/// The renderer state mutex must be held.
+fn mouseLinksUncaptured(self: *const Surface) bool {
+    if (self.io.terminal.flags.mouse_event == .none) return true;
+    if (self.mouse.mods.super) return true;
+    return self.mouse.mods.shift and !self.mouseShiftCapture(false);
+}
+
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
@@ -4666,6 +4678,10 @@ pub fn mouseButtonCallback(
             // If we have shift-pressed and we aren't allowed to capture it,
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
+
+            // A click on a link is ours: its release opens the link, so
+            // the program must not get the press either.
+            if (button == .left and self.mouse.over_link) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
@@ -5365,14 +5381,11 @@ pub fn cursorPosCallback(
     // 2. the cursor position has changed (either we have no previous state, or the state has
     //    changed)
     // AND
-    // 1. mouse reporting is off
-    // OR
-    // 2. mouse reporting is on and we are not reporting shift to the terminal
+    // links are not the program's (see mouseLinksUncaptured)
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        self.mouseLinksUncaptured())
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state

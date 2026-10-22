@@ -1397,6 +1397,85 @@ def pane_mouse_reporting(ctx: Context) -> None:
     check(ctx.tab_for_window("main").focused_terminal == term, "the click moved focus off the pane")
 
 
+# A scheme nothing handles, so opening a link asks first instead of
+# launching anything, and the question shows that the click got through.
+LINK_SCHEME = "gemini://e2e.example"
+LINK_PROMPT = "Open Link from Terminal Output?"
+
+
+def _print_links(ctx: Context, type_line: Callable[[str], None], screen: Callable[[], str]) -> None:
+    """Fill the top of a screen with an OSC 8 hyperlink, then a plain URL."""
+    osc8 = f"\\033]8;;{LINK_SCHEME}/osc8\\033\\\\osc8-link\\033]8;;\\033\\\\"
+    type_line(
+        "clear; i=0; while [ $i -lt 5 ]; do "
+        f"printf '{osc8}\\n'; i=$((i+1)); done; "
+        f"i=0; while [ $i -lt 5 ]; do echo {LINK_SCHEME}/plain; i=$((i+1)); done"
+    )
+    wait_until(
+        lambda: screen().count(f"{LINK_SCHEME}/plain") >= 5,
+        timeout=ctx.timeout,
+        desc="the links on screen",
+        describe_state=lambda: repr(screen()),
+    )
+
+
+def _click_opens(ctx: Context, term: str, y: float, modifiers: str | None) -> bool:
+    """Click at height `y` and say whether that asked to open a link."""
+    ax.dismiss_sheets(ctx.app.pid, "Cancel")
+    ctx.app.click(term, 30, y, modifiers=modifiers)
+    try:
+        wait_until(
+            lambda: any(LINK_PROMPT in t for sheet in ax.sheet_texts(ctx.app.pid) for t in sheet),
+            timeout=3,
+            desc="a prompt to open the link",
+        )
+    except CheckFailed:
+        return False
+    ax.dismiss_sheets(ctx.app.pid, "Cancel")
+    return True
+
+
+@scenario
+def pane_links_open(ctx: Context) -> None:
+    """Command-clicking a hyperlink or a URL in a pane opens it, also while a program has the mouse."""
+    ctx.attach()
+    term = ctx.tab_for_window("main").terminals[0].id
+    pane = ctx.tmux.window(SESSION, "main").panes[0].id
+    _print_links(
+        ctx,
+        lambda line: ctx.tmux.run("send-keys", "-t", pane, line, "Enter"),
+        lambda: ctx.app.read_screen(term),
+    )
+    ctx.app.focus(term)
+    check(_click_opens(ctx, term, 30, "command"), "command-clicking a hyperlink did not open it")
+    check(_click_opens(ctx, term, 110, "command"), "command-clicking a URL did not open it")
+
+    # A program tracking the mouse, as a TUI does, gets plain clicks. A
+    # command-click it could not tell from a plain one, so that stays a
+    # link's. `cat -v` echoes each mouse report that reaches it.
+    ctx.tmux.run("send-keys", "-t", pane, "printf '\\033[?1000h\\033[?1006h'; cat -v", "Enter")
+    wait_until(
+        lambda: ctx.tmux.run("display", "-p", "-t", pane, "#{mouse_standard_flag}").strip() == "1",
+        timeout=ctx.timeout,
+        desc="the program to track the mouse",
+    )
+    # The GUI learns of it from the pane's output, a moment later.
+    time.sleep(0.5)
+    check(_click_opens(ctx, term, 30, "command"), "command-clicking a hyperlink under mouse tracking did not open it")
+    check(_click_opens(ctx, term, 110, "command"), "command-clicking a URL under mouse tracking did not open it")
+    check(
+        "^[[<0;" not in ctx.tmux.capture(pane),
+        f"the program got a command-click on a link: {ctx.tmux.capture(pane)!r}",
+    )
+    check(not _click_opens(ctx, term, 110, None), "a plain click on a URL under mouse tracking opened it")
+    wait_until(
+        lambda: "^[[<0;" in ctx.tmux.capture(pane),
+        timeout=ctx.timeout,
+        desc="the program to get the plain click",
+        describe_state=lambda: repr(ctx.tmux.capture(pane)),
+    )
+
+
 @scenario
 def read_only_client(ctx: Context) -> None:
     """`switch-client -r` keeps the session on screen; typing and splits are refused with a notice."""

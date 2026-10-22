@@ -427,22 +427,43 @@ class GhosttyApp:
     def activate_window(self, window_id: str) -> None:
         self.ae.send("GhstAcWn", ae.by_id(WINDOW, window_id))
 
-    def mouse_move(self, terminal: str, x: float, y: float) -> None:
+    def mouse_move(self, terminal: str, x: float, y: float, modifiers: str | None = None) -> None:
         """Move the mouse to (x, y), in points from the terminal's top left."""
-        self.ae.send("GhstSMPs", GMpX=_real(x), GMpY=_real(y), GMpT=self._terminal(terminal))
+        self.ae.send(
+            "GhstSMPs",
+            GMpX=_real(x),
+            GMpY=_real(y),
+            GMpM=ae.text(modifiers) if modifiers else None,
+            GMpT=self._terminal(terminal),
+        )
 
-    def mouse_button(self, terminal: str, button: str = "left", press: bool = True) -> None:
+    def mouse_button(
+        self,
+        terminal: str,
+        button: str = "left",
+        press: bool = True,
+        modifiers: str | None = None,
+    ) -> None:
         self.ae.send(
             "GhstSMBt",
             ae.enum(MOUSE_BUTTONS[button]),
             GMbA=ae.enum("GIpr" if press else "GIrl"),
+            GMbM=ae.text(modifiers) if modifiers else None,
             GMbT=self._terminal(terminal),
         )
 
-    def click(self, terminal: str, x: float, y: float, button: str = "left") -> None:
-        self.mouse_move(terminal, x, y)
-        self.mouse_button(terminal, button, press=True)
-        self.mouse_button(terminal, button, press=False)
+    def click(
+        self,
+        terminal: str,
+        x: float,
+        y: float,
+        button: str = "left",
+        modifiers: str | None = None,
+    ) -> None:
+        """Click at (x, y), holding `modifiers` (e.g. "command") throughout."""
+        self.mouse_move(terminal, x, y, modifiers)
+        self.mouse_button(terminal, button, press=True, modifiers=modifiers)
+        self.mouse_button(terminal, button, press=False, modifiers=modifiers)
 
     def scroll(self, terminal: str, dy: float) -> None:
         """Send a (non-precision) mouse wheel event; positive scrolls up."""
