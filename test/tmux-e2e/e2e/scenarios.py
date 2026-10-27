@@ -91,6 +91,41 @@ def attach_existing_layout(ctx: Context) -> None:
     check(len(beta.terminals) == 3, f"tab 'beta' has {len(beta.terminals)} terminals, expected 3")
 
 
+@scenario
+def attach_with_hooks_printing(ctx: Context) -> None:
+    """Hooks printing to the control client while panes are read show up in no pane."""
+    # tmux prints a hook's output to the client it fires for, in a block
+    # like a reply's. Taken as one, every later reply is read as the
+    # answer to the command before it: a pane's state drawn as another
+    # pane's screen. The resize and the queries on attach make these
+    # fire while the panes' captures are in flight.
+    hook = "list-panes -s -F 'e2e-hook;#{pane_id};#{cursor_x};#{cursor_y}'"
+    ctx.tmux.add_config(
+        f'set-hook -g client-attached "{hook}"\n'
+        f'set-hook -g client-resized "{hook}"\n'
+        f'set-hook -g after-refresh-client "{hook}"\n'
+    )
+    two_window_layout(ctx)
+
+    terminals = [t for tab in ctx.tmux_tabs() for t in tab.terminals]
+    check(len(terminals) == 4, f"expected 4 terminals, got {len(terminals)}{ctx.describe()}")
+    for term in terminals:
+        screen = ctx.app.read_screen(term.id)
+        check("e2e-hook" not in screen, f"a hook's output is on terminal {term.id}: {screen.strip()[-300:]!r}")
+
+    # Replies still pair with what asked for them: typing reaches the pane
+    # and its output comes back.
+    term = ctx.tab_for_window("alpha").terminals[0]
+    ctx.app.type_line(term.id, "echo hooks-$((6*7))")
+    wait_until(
+        lambda: "hooks-42" in ctx.app.read_screen(term.id),
+        timeout=ctx.timeout,
+        desc="'hooks-42' on the pane after the hooks ran",
+        describe_state=lambda: repr(ctx.app.read_screen(term.id).strip()[-300:]),
+    )
+    check(ctx.tmux.control_clients(), "the control client detached")
+
+
 # -- tmux -> GUI ---------------------------------------------------------------
 
 

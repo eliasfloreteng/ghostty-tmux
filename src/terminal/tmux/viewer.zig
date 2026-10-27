@@ -3953,15 +3953,14 @@ pub const Viewer = struct {
             // is guaranteed to come after the initial command output
             // since if the initial command is `attach` tmux will run that,
             // queue the notification, then do notificatins.
+            //
+            // tmux read that command from its command line, not from us,
+            // so it comes as unsolicited. Taken either way, all the same.
             inline .block_end, .block_err => |content, tag| {
-                self.state = .startup_session;
-                return self.startupNotices(
-                    content,
-                    tag == .block_err,
-                ) catch |err| {
-                    log.warn("failed to report startup notices err={}", .{err});
-                    return &.{};
-                };
+                return self.startupBlock(content, tag == .block_err);
+            },
+            .unsolicited_block => |block| {
+                return self.startupBlock(block.data, block.err);
             },
 
             // I don't like catch-all else branches but startup is such
@@ -3972,6 +3971,18 @@ pub const Viewer = struct {
             else
                 &.{},
         }
+    }
+
+    fn startupBlock(
+        self: *Viewer,
+        content: []const u8,
+        is_err: bool,
+    ) []const Action {
+        self.state = .startup_session;
+        return self.startupNotices(content, is_err) catch |err| {
+            log.warn("failed to report startup notices err={}", .{err});
+            return &.{};
+        };
     }
 
     fn nextStartupSession(
@@ -4076,6 +4087,16 @@ pub const Viewer = struct {
                     return self.abandon();
                 };
             },
+
+            // A hook's output, not the answer to anything we asked.
+            // Taking it as one would shift every reply after it onto
+            // the command before it: a pane's state drawn into another
+            // pane as its screen, or, with nothing waiting, the session
+            // given up for an answer to a question never asked.
+            .unsolicited_block => |block| log.debug(
+                "ignoring a block for a command we did not send err={}",
+                .{block.err},
+            ),
 
             .output => |out| self.receivedOutput(
                 out.pane_id,
@@ -7890,6 +7911,80 @@ test "layout change" {
     });
 }
 
+test "blocks for commands we did not send are not taken as replies" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    // What a hook prints. This is a pane state reply, which is what
+    // ended up drawn as a pane's screen when one was taken as the reply
+    // to a capture.
+    const hook_output = "%46;2;27;1;default;none;0;1;0;18;0;1;0;0;0;1;0;0;0;1;;;0;29;8,16;Ext 2";
+
+    try testViewer(&viewer, &.{
+        // The attach itself came from tmux's command line, not from us.
+        .{ .input = .{ .tmux = .{ .unsolicited_block = .{ .data = "", .err = false } } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // A client-attached hook, before anything of ours is answered.
+        .{ .input = .{ .tmux = .{ .unsolicited_block = .{ .data = hook_output, .err = false } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0 host" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 0 0 0 %0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // A client-resized hook, with pane 0's captures in flight.
+        .{ .input = .{ .tmux = .{ .unsolicited_block = .{ .data = hook_output, .err = false } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "Hello, world!" } } },
+        .{ .input = .{ .tmux = .{ .unsolicited_block = .{ .data = "no such window", .err = true } } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // The subscription and the pane state.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                    try testing.expectEqual(0, v.commands_sent);
+
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expectEqual(.live, pane.status);
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .screen = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expectEqualStrings("Hello, world!", str);
+                }
+            }).check,
+        },
+        // With nothing waiting for a reply, one is no reason to give up
+        // on the session.
+        .{
+            .input = .{ .tmux = .{ .unsolicited_block = .{ .data = hook_output, .err = false } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(.command_queue, v.state);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .{ .exit = null } },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
 test "layout change with zero width pane becomes defunct" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
@@ -8561,54 +8656,55 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
     defer viewer.deinit();
 
     const input =
-        // Initial connection.
+        // Initial connection. tmux read the attach from its command
+        // line, so it is the one block not flagged as ours.
         "%begin 1 1 0\n" ++
         "%end 1 1 0\n" ++
         "%session-changed $42 main\n" ++
 
         // Tmux version response.
-        "%begin 2 2 0\n" ++
+        "%begin 2 2 1\n" ++
         "3.5a 0 host\n" ++
-        "%end 2 2 0\n" ++
+        "%end 2 2 1\n" ++
 
         // Window and pane layout.
-        "%begin 3 3 0\n" ++
+        "%begin 3 3 1\n" ++
         "$42 @0 1 80 24 d962,80x24,0,0,42 0 d962,80x24,0,0,42 0 0 0 0 %42\n" ++
-        "%end 3 3 0\n" ++
+        "%end 3 3 1\n" ++
 
         // History, which is always the primary screen's.
-        "%begin 4 4 0\n" ++
-        "%end 4 4 0\n" ++
+        "%begin 4 4 1\n" ++
+        "%end 4 4 1\n" ++
 
         // `capture-pane -a`, the saved grid. tmux only has one while
         // the pane is in the alternate screen, and it holds the
         // *primary* screen, put aside. Without one, tmux errors.
         (if (alternate_on)
-            "%begin 5 5 0\n" ++
+            "%begin 5 5 1\n" ++
                 "under\n" ++
-                "%end 5 5 0\n"
+                "%end 5 5 1\n"
         else
-            "%begin 5 5 0\n" ++
+            "%begin 5 5 1\n" ++
                 "no alternate screen\n" ++
-                "%error 5 5 0\n") ++
+                "%error 5 5 1\n") ++
 
         // Plain `capture-pane`, the grid on display: the alternate
         // screen if the pane is in it, the primary otherwise.
-        "%begin 6 6 0\n" ++
-        "%end 6 6 0\n" ++
+        "%begin 6 6 1\n" ++
+        "%end 6 6 1\n" ++
 
         // The subscription to alerts, titles and working directories.
-        "%begin 7 7 0\n" ++
-        "%end 7 7 0\n" ++
+        "%begin 7 7 1\n" ++
+        "%end 7 7 1\n" ++
 
         // Cursor position and terminal modes.
-        "%begin 8 8 0\n" ++
+        "%begin 8 8 1\n" ++
         "%42;0;0;1;block;default;0;" ++
         (if (alternate_on) "1;0;0;" else "0;0;0;") ++
         "0;1;0;0;0;" ++
         "0;0;0;0;0;" ++
         "0;0;0;23;8,16,24,32,40,48,56,64,72;Ext 2\n" ++
-        "%end 8 8 0\n" ++
+        "%end 8 8 1\n" ++
 
         // Live output after initialization.
         "%output %42 hello\n";

@@ -162,7 +162,11 @@ pub const Parser = struct {
                     // Important: do not clear buffer since the notification
                     // contains it.
                     self.state = .idle;
-                    switch (terminator) {
+                    if (!terminator.ours) return .{ .unsolicited_block = .{
+                        .data = output,
+                        .err = terminator.kind == .err,
+                    } };
+                    switch (terminator.kind) {
                         .end => return .{ .block_end = output },
                         .err => {
                             log.warn("tmux control mode error={s}", .{output});
@@ -244,7 +248,14 @@ pub const Parser = struct {
         return payload[0..end];
     }
 
-    const BlockTerminator = enum { end, err };
+    const BlockTerminator = struct {
+        kind: enum { end, err },
+
+        /// Whether the block answers a command this client sent, which
+        /// tmux marks by setting the lowest bit of the guard's flags.
+        /// See `Notification.unsolicited_block`.
+        ours: bool,
+    };
 
     /// Block payload is raw data, so a line only terminates a block if it
     /// exactly matches tmux's `%end`/`%error` guard-line shape.
@@ -256,7 +267,7 @@ pub const Parser = struct {
 
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
         const cmd = fields.next() orelse return null;
-        const terminator: BlockTerminator = if (std.mem.eql(u8, cmd, "%end"))
+        const kind: @FieldType(BlockTerminator, "kind") = if (std.mem.eql(u8, cmd, "%end"))
             .end
         else if (std.mem.eql(u8, cmd, "%error"))
             .err
@@ -273,10 +284,10 @@ pub const Parser = struct {
         // that is a more robust way to match.
         _ = std.fmt.parseInt(usize, time, 10) catch return null;
         _ = std.fmt.parseInt(usize, command_id, 10) catch return null;
-        _ = std.fmt.parseInt(usize, flags, 10) catch return null;
+        const flag_bits = std.fmt.parseInt(usize, flags, 10) catch return null;
         if (extra != null) return null;
 
-        return terminator;
+        return .{ .kind = kind, .ours = flag_bits & 1 != 0 };
     }
 
     /// Parse the " %<id>" that follows a pane notification's name,
@@ -971,6 +982,24 @@ pub const Notification = union(enum) {
     block_end: []const u8,
     block_err: []const u8,
 
+    /// A begin/end block that answers no command of ours: tmux ran
+    /// something else in this client's name and printed its output to
+    /// us. That is the command tmux was started with (the `attach` or
+    /// `new-session`), and any hook that fires for this client, such as
+    /// `client-attached`, `client-resized` or `after-<command>`.
+    ///
+    /// tmux tells them apart by the guard's flags, which are 1 only for
+    /// a command read from this client. Telling them apart matters
+    /// because replies are paired with commands by order alone: taking
+    /// one of these as a reply would make every later reply the answer
+    /// to the command before it.
+    unsolicited_block: struct {
+        data: []const u8,
+
+        /// Whether it ended in `%error` rather than `%end`.
+        err: bool,
+    },
+
     /// tmux stopped sending a pane's output and is discarding it until
     /// we ask for it to resume. Only happens with the pause-after client
     /// flag, which we never set -- but any other client can set it on us
@@ -1147,6 +1176,28 @@ pub const Notification = union(enum) {
         }
     }
 };
+
+test "tmux block without the client flag is unsolicited" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // A hook's output, as tmux 3.6 prints it between two replies.
+    for ("%begin 1793089286 280 0\nfrom-hook\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1793089286 280 0") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .unsolicited_block);
+    try testing.expectEqualStrings("from-hook", n.unsolicited_block.data);
+    try testing.expect(!n.unsolicited_block.err);
+
+    for ("%begin 1793089286 281 0\nbad\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%error 1793089286 281 0") |byte| try testing.expect(try c.put(byte) == null);
+    const e = (try c.put('\n')).?;
+    try testing.expect(e == .unsolicited_block);
+    try testing.expect(e.unsolicited_block.err);
+}
 
 test "tmux begin/end empty" {
     const testing = std.testing;
