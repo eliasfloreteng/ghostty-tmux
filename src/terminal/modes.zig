@@ -8,8 +8,6 @@
 //! to ensure all our various types and logic remain in sync.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const build_options = @import("terminal_options");
 const testing = std.testing;
 const ComptimeIntSet = @import("../datastruct/main.zig").ComptimeIntSet;
 
@@ -158,10 +156,9 @@ fn getPacked(values: *const ModePacked, mode: Mode) bool {
 /// A packed struct of all the settable modes. This shouldn't
 /// be used directly but rather through the ModeState struct.
 pub const ModePacked = packed_struct: {
-    const StructField = std.builtin.Type.StructField;
     var names: [entries.len][]const u8 = undefined;
-    var types = [_]type{bool} ** entries.len;
-    var attrs: [entries.len]StructField.Attributes = undefined;
+    var types: [entries.len]type = @splat(bool);
+    var attrs: [entries.len]std.lang.Type.Struct.FieldAttributes = undefined;
 
     for (entries, &names, &attrs) |entry, *name, *attr| {
         name.* = entry.name;
@@ -194,7 +191,7 @@ pub const ModeTag = packed struct(u16) {
     ansi: bool = false,
 
     pub fn fromMode(mode: Mode) ModeTag {
-        return @bitCast(@intFromEnum(mode));
+        return @bitCast(@backingInt(mode));
     }
 
     test "order" {
@@ -225,7 +222,7 @@ pub fn modeFromInt(v: u16, ansi: bool) ?Mode {
         if (entries_disabled[idx]) return null;
     }
 
-    return @enumFromInt(int);
+    return @fromBackingInt(int);
 }
 
 /// The tag of every entry, in the same order as `entries`. Looking up
@@ -304,7 +301,7 @@ pub const Report = struct {
         try writer.print("\x1B[{s}{};{}$y", .{
             if (self.tag.ansi) "" else "?",
             self.tag.value,
-            @intFromEnum(self.state),
+            @backingInt(self.state),
         });
     }
 };
@@ -411,13 +408,7 @@ const entries: []const ModeEntry = &.{
     // paste sends an unsolicited OSC 5522 targets listing with a
     // one-time password instead of pasting the text.
     // See https://sw.kovidgoyal.net/kitty/clipboard/
-    .{
-        .name = "kitty_paste_events",
-        .value = 5522,
-        // The macOS app and libghostty-vt can both serve the follow-up
-        // Kitty clipboard read that a paste event grants.
-        .disabled = build_options.artifact != .lib and builtin.os.tag != .macos,
-    },
+    .{ .name = "kitty_paste_events", .value = 5522 },
 };
 
 test {

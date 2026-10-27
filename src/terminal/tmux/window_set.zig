@@ -203,7 +203,7 @@ pub const WindowSet = struct {
         errdefer self.arena.deinit();
 
         const alloc = self.arena.allocator();
-        self.session_name = try alloc.dupeZ(u8, session_name);
+        self.session_name = try alloc.dupeSentinel(u8, session_name, 0);
         const copy = try alloc.alloc(Window, windows.len);
         for (windows, copy) |src, *dst| {
             var nodes: std.ArrayList(Node) = .empty;
@@ -217,7 +217,7 @@ pub const WindowSet = struct {
             dst.* = .{
                 .id = src.id,
                 .active = src.active,
-                .name = try alloc.dupeZ(u8, src.name),
+                .name = try alloc.dupeSentinel(u8, src.name, 0),
                 .width = src.width,
                 .height = src.height,
                 .zoomed = src.zoomed_pane_id != null,
@@ -238,7 +238,7 @@ pub const WindowSet = struct {
         const sessions_copy = try alloc.alloc(Session, sessions.len);
         for (sessions, sessions_copy) |src, *dst| dst.* = .{
             .id = src.id,
-            .name = try alloc.dupeZ(u8, src.name),
+            .name = try alloc.dupeSentinel(u8, src.name, 0),
             .windows = src.windows,
             .attached = src.attached,
         };

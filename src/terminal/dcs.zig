@@ -308,7 +308,7 @@ pub const Command = union(enum) {
 
             const valid = writer.end > prefix_len;
             try writer.writeAll("\x1b\\");
-            _ = try std.fmt.bufPrint(
+            _ = try std.mem.print(
                 response[0..prefix_len],
                 prefix_fmt,
                 .{@intFromBool(valid)},

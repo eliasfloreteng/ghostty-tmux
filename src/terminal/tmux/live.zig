@@ -68,7 +68,7 @@ const poll_ms: u64 = 20;
 /// developer having tmux on their PATH is not consent to spawn servers and
 /// block on them during `zig build test`.
 fn enabled() bool {
-    if (comptime builtin.os.tag == .windows) return false;
+    if (comptime builtin.target.os.tag == .windows) return false;
     if (comptime !build_options.tmux_control_mode) return false;
     return global.environ().getPosix("GHOSTTY_TMUX_LIVE") != null;
 }
@@ -111,7 +111,7 @@ const Session = struct {
     paste_buffer: ?[]u8 = null,
 
     /// The notices the viewer has reported, by kind.
-    notices: [std.meta.fields(Viewer.Notice.Kind).len]struct {
+    notices: [@typeInfo(Viewer.Notice.Kind).@"enum".field_names.len]struct {
         count: usize = 0,
         last: [256]u8 = undefined,
         last_len: usize = 0,
@@ -465,7 +465,7 @@ const Session = struct {
             .command => |c| try self.write(c),
             .exit => self.exited = true,
             .notice => |n| {
-                const kind = &self.notices[@intCast(@intFromEnum(n.kind))];
+                const kind = &self.notices[@intCast(@backingInt(n.kind))];
                 kind.count += 1;
                 const len = @min(n.text.len, kind.last.len);
                 @memcpy(kind.last[0..len], n.text[0..len]);
@@ -481,7 +481,7 @@ const Session = struct {
 
     /// The last notice of a kind the viewer reported, or null if none.
     fn lastNotice(self: *const Session, kind: Viewer.Notice.Kind) ?[]const u8 {
-        const k = &self.notices[@intCast(@intFromEnum(kind))];
+        const k = &self.notices[@intCast(@backingInt(kind))];
         if (k.count == 0) return null;
         return k.last[0..k.last_len];
     }
@@ -622,8 +622,8 @@ fn spawn(pty: *ptypkg.Pty, argv: []const []const u8) !posix.pid_t {
         prefix.len + argv.len,
         null,
     );
-    for (prefix, 0..) |arg, i| argv_z[i] = try alloc.dupeZ(u8, arg);
-    for (argv, 0..) |arg, i| argv_z[prefix.len + i] = try alloc.dupeZ(u8, arg);
+    for (prefix, 0..) |arg, i| argv_z[i] = try alloc.dupeSentinel(u8, arg, 0);
+    for (argv, 0..) |arg, i| argv_z[prefix.len + i] = try alloc.dupeSentinel(u8, arg, 0);
 
     const rc = posix.system.fork();
     const pid: posix.pid_t = switch (posix.errno(rc)) {

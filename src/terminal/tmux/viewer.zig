@@ -423,14 +423,14 @@ pub const Viewer = struct {
                 try writer.writeAll(@tagName(@as(TagType, self)));
                 try writer.writeAll(" = ");
 
-                inline for (info.fields) |u_field| {
-                    if (self == @field(TagType, u_field.name)) {
-                        const value = @field(self, u_field.name);
+                inline for (info.field_names, info.field_types) |field_name, field_type| {
+                    if (self == @field(TagType, field_name)) {
+                        const value = @field(self, field_name);
                         // What the user copied is nobody's business,
                         // least of all the log's.
-                        if (comptime std.mem.eql(u8, u_field.name, "paste_buffer")) {
+                        if (comptime std.mem.eql(u8, field_name, "paste_buffer")) {
                             try writer.print("[{d} bytes]", .{value.len});
-                        } else switch (u_field.type) {
+                        } else switch (field_type) {
                             []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
                             // Window embeds ArenaAllocator.State; dumping
                             // `{any}` walks freed/poisoned arena nodes.
@@ -6306,8 +6306,9 @@ pub const Viewer = struct {
         // pane's own, which comes back as one run of `data` whatever
         // escape sequences are in it, so the list nearly always holds a
         // single op and is kept off the heap.
-        var stack = std.heap.stackFallback(8 * @sizeOf(sinkpkg.Op), self.alloc);
-        const alloc = stack.get();
+        var stack_buf: [8 * @sizeOf(sinkpkg.Op)]u8 align(@alignOf(sinkpkg.Op)) = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.alloc);
+        const alloc = stack.allocator();
         var ops: OpCollector = .{ .alloc = alloc };
         defer ops.list.deinit(alloc);
         try pane.passthrough.feed(data, &ops);
@@ -6351,6 +6352,17 @@ pub const Viewer = struct {
         };
     }
 
+    /// Walk `layout` and make sure every pane in it has an entry in
+    /// `panes_new`.
+    ///
+    /// Panes that already exist in `panes_old` are copied over as is.
+    /// New panes get a fresh terminal sized to match the layout.
+    ///
+    /// The layout comes from the control mode stream, which any program
+    /// running in the terminal can write to. Parsing has already rejected
+    /// zero sizes, and `layoutCellCount` clamps any too large for a
+    /// terminal. Callers treat any error as fatal and move the viewer to
+    /// the defunct state.
     fn initLayout(
         io: std.Io,
         gpa_alloc: Allocator,
@@ -7878,6 +7890,130 @@ test "layout change" {
     });
 }
 
+test "layout change with zero width pane becomes defunct" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0 host" } } },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 0 0 0 %0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, v.windows.items.len);
+                    try testing.expectEqual(1, v.panes.count());
+                    try testing.expect(v.panes.contains(0));
+                }
+            }).check,
+        },
+        // Complete the capture-pane commands for pane 0, on its primary
+        // screen, plus pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // The subscription.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Send a layout_change with a valid checksum but a zero-width pane.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "52aa,83x44,0,0[83x22,0,0,0,0x21,0,23,2]",
+                .visible_layout = "52aa,83x44,0,0[83x22,0,0,0,0x21,0,23,2]",
+                .raw_flags = "*",
+            } } },
+            .contains_tags = &.{.exit},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(.defunct, v.state);
+                    try testing.expect(!v.panes.contains(2));
+                }
+            }).check,
+        },
+    });
+}
+
+test "layout change with oversized pane is clamped" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // The version reply. list-windows was sent along with the
+        // version query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0 host" } } },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 0 0 0 %0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, v.windows.items.len);
+                    try testing.expectEqual(1, v.panes.count());
+                    try testing.expect(v.panes.contains(0));
+                }
+            }).check,
+        },
+        // Complete the capture-pane commands for pane 0, on its primary
+        // screen, plus pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_err = "no alternate screen" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // The subscription.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Send a layout_change with a valid checksum but a pane wider than
+        // our max column count.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "3afd,83x44,0,0[83x22,0,0,0,70000x21,0,23,2]",
+                .visible_layout = "3afd,83x44,0,0[83x22,0,0,0,70000x21,0,23,2]",
+                .raw_flags = "*",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.state != .defunct);
+                    const pane = v.panes.get(2).?;
+                    try testing.expectEqual(
+                        std.math.maxInt(size.CellCountInt),
+                        pane.terminal.cols,
+                    );
+                }
+            }).check,
+        },
+    });
+}
+
 test "layout_change does not wait for commands already in flight" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
@@ -8395,7 +8531,7 @@ test "pane state ignores out of bounds scroll region" {
         .{
             .input = .{ .tmux = .{ .output = .{
                 .pane_id = 0,
-                .data = "\x0b" ** 30,
+                .data = &@as([30]u8, @splat('\x0b')),
             } } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
@@ -11222,7 +11358,7 @@ test "a layout change keeps the window name" {
 
 /// Long enough that a layout parsed into the same arena is certain to
 /// land on top of it, rather than happening to stop short.
-const long_window_name = "a" ** 512;
+const long_window_name: []const u8 = &@as([512]u8, @splat('a'));
 
 test "a window rename reaches the GUI without a round trip" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});

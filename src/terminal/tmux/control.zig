@@ -1133,10 +1133,10 @@ pub const Notification = union(enum) {
             try writer.writeAll(@tagName(@as(TagType, self)));
             try writer.writeAll(" = ");
 
-            inline for (info.fields) |u_field| {
-                if (self == @field(TagType, u_field.name)) {
-                    const value = @field(self, u_field.name);
-                    switch (u_field.type) {
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                if (self == @field(TagType, field_name)) {
+                    const value = @field(self, field_name);
+                    switch (field_type) {
                         []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
                         else => try writer.print("{any}", .{value}),
                     }
@@ -1281,12 +1281,13 @@ test "tmux block over max_block_bytes with one long line" {
     // the line limit can bound a line.
     var c: Parser = .{ .buffer = .init(alloc), .max_block_bytes = 16 };
     defer c.deinit();
+    const xs: [20]u8 = @splat('x');
     for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
-    for ("old\n" ++ "x" ** 20 ++ "\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("old\n" ++ xs ++ "\n") |byte| try testing.expect(try c.put(byte) == null);
     for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
-    try testing.expectEqualStrings("x" ** 20, n.block_end);
+    try testing.expectEqualStrings(&xs, n.block_end);
 }
 
 test "tmux begin/end data" {

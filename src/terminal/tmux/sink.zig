@@ -313,11 +313,12 @@ pub const Op = union(enum) {
             .pane_state => |data| state: {
                 var copy = data;
                 errdefer freePaneState(alloc, copy, data);
-                inline for (@typeInfo(PaneStateData).@"struct".fields) |f| {
-                    if (comptime f.type == []const u8) {
-                        @field(copy, f.name) = try alloc.dupe(
+                const info = @typeInfo(PaneStateData).@"struct";
+                inline for (info.field_names, info.field_types) |name, T| {
+                    if (comptime T == []const u8) {
+                        @field(copy, name) = try alloc.dupe(
                             u8,
-                            @field(data, f.name),
+                            @field(data, name),
                         );
                     }
                 }
@@ -359,11 +360,12 @@ pub const Op = union(enum) {
         copy: PaneStateData,
         original: ?PaneStateData,
     ) void {
-        inline for (@typeInfo(PaneStateData).@"struct".fields) |f| {
-            if (comptime f.type == []const u8) {
-                const field = @field(copy, f.name);
+        const info = @typeInfo(PaneStateData).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            if (comptime T == []const u8) {
+                const field = @field(copy, name);
                 const skip = if (original) |o|
-                    field.ptr == @field(o, f.name).ptr
+                    field.ptr == @field(o, name).ptr
                 else
                     false;
                 if (!skip) alloc.free(field);
