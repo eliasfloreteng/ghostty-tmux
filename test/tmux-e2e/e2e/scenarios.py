@@ -603,14 +603,15 @@ def connection_lost_reattach(ctx: Context) -> None:
     the prompt mark is the command offered again, and only an escape
     sequence ends the DCS. A bare `gateway$ ` is text, which control mode
     drops, so without the marks the app never hears the connection went.
-    SOH and STX around each mark keep readline from counting it in the
-    prompt's width, as `\\[` and `\\]` would.
+    `\\[` and `\\]` around each mark keep readline from counting it in
+    the prompt's width. Raw SOH and STX put in by `printf` do not, in
+    /bin/sh (bash 3.2): readline took the prompt for 18 columns wider than
+    it is, wrapped the command line that much early, and the carriage
+    return of that wrap drew the rest of it over its start. All that was
+    left to read back, and run again, was its tail.
     """
     ctx.open_gateway()
-    ctx.app.type_line(
-        ctx.gateway,
-        r"PS1=$(printf '\001\033]133;A\007\002gateway$ \001\033]133;B\007\002')",
-    )
+    ctx.app.type_line(ctx.gateway, r"PS1='\[\e]133;A\a\]gateway$ \[\e]133;B\a\]'")
     two_window_layout(ctx)
     enter_session(ctx)
     out = ctx.tmux.run("list-clients", "-F", "#{client_pid}\t#{client_control_mode}")
