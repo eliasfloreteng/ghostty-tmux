@@ -311,12 +311,17 @@ const Session = struct {
 
         // -CC, not -C: only the doubled form wraps the stream in the DCS
         // that this whole chain exists to parse.
+        //
+        // To the session made above, by id: the first on a server is
+        // always $0. A bare `attach` takes the newest session, and a test
+        // that makes another one right after starting would race the
+        // attach for which one that is.
         const pid = if (opts.read_only) try spawn(&pty, &.{
-            "tmux", "-f",  "/dev/null", "-S",
-            socket, "-CC", "attach",    "-r",
+            "tmux", "-f",     "/dev/null", "-S", socket,
+            "-CC",  "attach", "-t",        "$0", "-r",
         }) else try spawn(&pty, &.{
-            "tmux", "-f",  "/dev/null", "-S",
-            socket, "-CC", "attach",
+            "tmux", "-f",     "/dev/null", "-S", socket,
+            "-CC",  "attach", "-t",        "$0",
         });
         errdefer {
             posix.kill(pid, .KILL) catch {};
