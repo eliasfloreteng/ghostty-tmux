@@ -19,6 +19,7 @@ window to show up (see `Context.ax_window`), activating the app meanwhile.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Iterator
 
 from .util import Skip, log
@@ -154,16 +155,30 @@ def press_button(pid: int, window_name: str, title: str) -> None:
     log(f"pressed {title!r} in {window_name!r}")
 
 
-def press_checkbox(pid: int, window_name: str, title: str) -> None:
-    """Toggle the first checkbox (a SwiftUI `Toggle`) titled `title`."""
-    wins = windows(pid)
-    if window_name in wins:
-        for e in _walk(wins[window_name]):
-            if _attr(e, "AXRole") == "AXCheckBox" and title in (_attr(e, "AXTitle"), _attr(e, "AXDescription")):
-                if AS.AXUIElementPerformAction(e, "AXPress") == 0:
+def press_checkbox(pid: int, window_name: str, title: str, timeout: float = 5.0) -> None:
+    """Toggle the first checkbox (a SwiftUI `Toggle`) titled `title`.
+
+    Waits for it: a window can be on screen before its list is filled in.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        wins = windows(pid)
+        seen: list[tuple[Any, Any, Any]] = []
+        if window_name in wins:
+            for e in _walk(wins[window_name]):
+                if _attr(e, "AXRole") != "AXCheckBox":
+                    continue
+                labels = (_attr(e, "AXTitle"), _attr(e, "AXDescription"), _attr(e, "AXValue"))
+                seen.append(labels)
+                if title in labels[:2] and AS.AXUIElementPerformAction(e, "AXPress") == 0:
                     log(f"toggled {title!r} in {window_name!r}")
                     return
-    raise RuntimeError(f"no checkbox {title!r} in window {window_name!r} (windows: {list(wins)})")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"no checkbox {title!r} in window {window_name!r} "
+                f"(checkboxes as title, description, value: {seen}; windows: {list(wins)})"
+            )
+        time.sleep(0.2)
 
 
 def dismiss_sheets(pid: int, button: str = "OK") -> None:
