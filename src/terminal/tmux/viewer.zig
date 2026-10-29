@@ -2622,7 +2622,19 @@ pub const Viewer = struct {
 
         // The commands pass to the queue, success or not; the list
         // holding them is ours to free either way.
-        return self.queueUserCommands(commands.items);
+        const actions = try self.queueUserCommands(commands.items);
+
+        // Where the window will be once tmux has run the swaps, so that a
+        // move asked for before it answers is a move from there. tmux runs
+        // commands in order, so that is where the window is when the next
+        // move reaches it. Measured from the order tmux last listed, two
+        // quick moves of one place would each swap with the same window
+        // and undo each other. The list-windows queued above puts tmux's
+        // own order back in its place.
+        const moved = self.windows.orderedRemove(@intCast(from));
+        self.windows.insertAssumeCapacity(@intCast(to), moved);
+
+        return actions;
     }
 
     /// Ask tmux to toggle zoom on a pane.
@@ -10315,6 +10327,28 @@ test "moving a tab back walks it past each window" {
                 "swap-window -d -s @9 -t @0\n",
                 "list-windows",
             },
+        },
+    });
+}
+
+test "a second move before tmux answers moves on from the first" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testThreeWindowSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .move_window = .{ .pane_id = 0, .amount = 1 } },
+            .commands = &.{ "swap-window -d -s @0 -t @5\n", "list-windows" },
+        },
+
+        // No reply yet, so tmux has not listed @5 @0 @9. The window is
+        // second all the same, and one more along is past @9: swapping
+        // with @5 again would put it back where it started.
+        .{
+            .input = .{ .move_window = .{ .pane_id = 0, .amount = 1 } },
+            .commands = &.{ "swap-window -d -s @0 -t @9\n", "list-windows" },
         },
     });
 }

@@ -705,6 +705,13 @@ class TmuxWindowManager {
     /// when it is first), worked out in tmux's whole window order, since
     /// windows of the session in other native windows are part of it too.
     /// It is sent as `move_tab`, which on a tmux pane moves its window.
+    ///
+    /// Measured from the order already asked for, if a move is on its
+    /// way, rather than the last one tmux listed. Every tab's controller
+    /// hears of the same drag and posts it, and a later drag can come
+    /// before tmux answers an earlier one. Against tmux's stale order each
+    /// of those would ask for the move again, and the repeated swaps
+    /// would undo one another.
     @objc private func tabsDidReorder(_ notification: Notification) {
         guard let event = NSApp.currentEvent,
               [.leftMouseDragged, .leftMouseUp].contains(event.type) else { return }
@@ -712,7 +719,7 @@ class TmuxWindowManager {
 
         let hosts = Set(windows.keys.map(\.host))
         for host in hosts {
-            guard let order = windowOrder[host] else { continue }
+            guard let order = pendingOrder[host]?.order ?? windowOrder[host] else { continue }
             let tabs = tabOrder(of: group, host: host)
             let tmux = order.filter { tabs.contains($0) }
             guard tabs != tmux, let moved = Self.movedWindow(from: tmux, to: tabs) else { continue }
