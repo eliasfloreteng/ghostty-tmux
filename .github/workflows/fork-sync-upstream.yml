@@ -4,12 +4,19 @@
 # keeping the fork's own changes (a merge, never a rebase, so the fork's
 # history is left alone). Then:
 #
-#   - If the merge conflicts, stop. Nothing is pushed; the run fails and
-#     its summary lists the conflicting files, to be resolved by hand.
-#   - If it merges but the tests fail, skip the update. Nothing is pushed;
-#     the run fails and says which step did. Next week tries again with
-#     whatever upstream has by then.
-#   - Otherwise push the merge to `main`.
+#   - If the merge conflicts, Claude Code resolves the conflicts and the
+#     merge is committed with the files it resolved listed.
+#   - If the tests fail after the merge, Claude Code fixes what the merge
+#     broke as a separate commit on top, and the tests run again.
+#   - If the tests pass, push the result to `main`. Otherwise nothing is
+#     pushed; the run fails and says which step did. Next week tries again
+#     with whatever upstream has by then.
+#
+# Claude Code needs an Anthropic API key as the `ANTHROPIC_API_KEY`
+# secret. Without it a conflict or a test failure fails the run as it
+# would without Claude. Each Claude session's transcript is uploaded as
+# the `claude-transcripts` artifact, and its final report is put in the
+# run's summary.
 #
 # Upstream's own workflows run on ghostty-org's custom runners and are
 # gated on `github.repository == 'ghostty-org/ghostty'`, so they do not
@@ -19,7 +26,8 @@
 # token with the `workflow` scope, which the default GITHUB_TOKEN never
 # has. Set a fine-grained token with "Contents" and "Workflows" write on
 # this repository as the `FORK_SYNC_TOKEN` secret for those weeks to go
-# through; without it such a push is rejected and the run fails.
+# through; without it such a push is rejected and the run fails. The
+# token is only handed to the push step, never to Claude.
 name: Sync with upstream
 
 on:
@@ -39,14 +47,14 @@ jobs:
   sync:
     if: github.repository == 'eliasfloreteng/ghostty-tmux'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     steps:
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          persist-credentials: false
 
       - name: Merge upstream main
         id: merge
@@ -63,32 +71,37 @@ jobs:
           fi
 
           upstream=$(git rev-parse --short upstream/main)
-          if ! git merge --no-ff --no-edit -m "Merge upstream ghostty-org/ghostty main ($upstream)" upstream/main; then
-            {
-              echo "## Merge conflict: not synced"
-              echo
-              echo "Merging upstream \`$upstream\` into \`main\` conflicts in:"
-              echo
-              git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/'
-              echo
-              echo "Resolve by hand: \`git fetch upstream && git merge upstream/main\` on \`main\`."
-            } >> "$GITHUB_STEP_SUMMARY"
-            git merge --abort
-            exit 1
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "Merging upstream \`$upstream\`:"
+            echo
+            git log --oneline --no-merges HEAD..upstream/main | head -50 | sed 's/^/    /'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if git merge --no-ff --no-edit -m "Merge upstream ghostty-org/ghostty main ($upstream)" upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          # Leave the merge in progress for Claude to resolve.
+          echo "conflict=true" >> "$GITHUB_OUTPUT"
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
           {
-            echo "Merged upstream \`$upstream\`:"
+            echo "## Merge conflicts"
             echo
-            git log --oneline --no-merges HEAD^1..HEAD^2 | head -50 | sed 's/^/    /'
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
 
+      # build.zig.zon may itself be conflicted; the last match is then
+      # upstream's side, which is the version the merge is heading to.
       - name: Get required Zig version
         if: steps.merge.outputs.changed == 'true'
         id: zig
         run: |
-          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon | tail -n1)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Zig
         if: steps.merge.outputs.changed == 'true'
@@ -104,48 +117,225 @@ jobs:
           sudo apt-get -qq update
           sudo apt-get -qq -y --no-install-recommends install \
             build-essential \
+            jq \
             libbz2-dev \
             libonig-dev \
             libxml2-utils \
             pandoc \
             tmux
 
-      - name: zig build test
+      - name: Install Claude Code
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_API_KEY is not set; conflicts and test failures will not be fixed."
+            exit 0
+          fi
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/claude"
+
+          # Run Claude headless with a prompt; print its final report and
+          # add it to the run's summary. Usage: run-claude <name> <prompt>
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/run-claude" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          name=$1 prompt=$2
+          transcript="$RUNNER_TEMP/claude/$name.jsonl"
+          status=0
+          claude -p "$prompt" \
+            --dangerously-skip-permissions \
+            --output-format stream-json --verbose \
+            > "$transcript" || status=$?
+          report=$(jq -r 'select(.type == "result") | .result // empty' "$transcript" | tail -n1)
+          echo "$report"
+          {
+            echo "### Claude: $name"
+            echo
+            echo "$report"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+          EOF
+          chmod +x "$RUNNER_TEMP/bin/run-claude"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve conflicts with Claude
+        if: steps.merge.outputs.conflict == 'true'
+        timeout-minutes: 90
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "Resolve by hand: \`git fetch upstream && git merge upstream/main\` on \`main\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          run-claude "resolve conflicts" "$(cat <<EOF
+          This is eliasfloreteng/ghostty-tmux, a fork of the Ghostty terminal
+          (ghostty-org/ghostty) that adds native tmux integration. A merge of
+          upstream's main ($UPSTREAM) into the fork's main is in progress and
+          has conflicts in:
+
+          $(cat "$RUNNER_TEMP/conflicts.txt")
+
+          Resolve every conflict. See AGENTS.md for how to build and test.
+          \`git log --oneline MERGE_HEAD..HEAD\` lists the fork's own commits and
+          \`git log --oneline HEAD..MERGE_HEAD\` upstream's new ones; read the
+          commits that touched each conflicted region on both sides so you
+          understand what each side intended.
+
+          - Keep the fork's behavior and adopt upstream's changes. Where upstream
+            renamed, moved or reworked code the fork builds on, port the fork's
+            changes onto upstream's new shape rather than reverting upstream.
+          - Do not drop either side's changes to make the conflict go away.
+          - Check the result compiles and the tests touching the conflicted code
+            pass: \`zig build test -Dapp-runtime=none -Dtest-filter=<name>\`.
+            Swift under macos/ cannot be built here; just keep it consistent.
+          - Stage the resolved files with \`git add\`. Do not commit, abort the
+            merge, push, or touch any branch: the workflow commits the merge.
+
+          Finish with a short report: per file, how you resolved it, and anything
+          you were unsure about.
+          EOF
+          )"
+
+      - name: Commit merge
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
+        run: |
+          if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "::error::The merge is no longer in progress; Claude committed or aborted it."
+            exit 1
+          fi
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Files are still unmerged:"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          git add -u
+          if git diff --cached HEAD | grep -nE '^\+(<<<<<<<|>>>>>>>) '; then
+            echo "::error::Conflict markers are left in the merge."
+            exit 1
+          fi
+          {
+            echo "Merge upstream ghostty-org/ghostty main ($UPSTREAM)"
+            echo
+            echo "Conflicts resolved by Claude Code in:"
+            echo
+            sed 's/^/- /' "$RUNNER_TEMP/conflicts.txt"
+          } | git commit -F -
+          echo "Committed the merge as $(git rev-parse --short HEAD)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test
         if: steps.merge.outputs.changed == 'true'
         id: test
-        run: zig build test -Dapp-runtime=none --summary all
+        continue-on-error: true
+        run: &test |
+          set -o pipefail
+          {
+            tmux -V
+            # Building the library compiles the embedded apprt, which the
+            # macOS app uses and the test step does not build. The live
+            # tests are the fork's own, against a real tmux server.
+            zig build test -Dapp-runtime=none --summary all &&
+            zig build -Dapp-runtime=none --summary all &&
+            zig build test-tmux-live -Dapp-runtime=none --summary all
+          } 2>&1 | tee "$RUNNER_TEMP/test.log"
 
-      # Building the library compiles the embedded apprt, which the macOS
-      # app uses and the test step does not build.
-      - name: zig build (lib)
-        if: steps.merge.outputs.changed == 'true'
-        id: build
-        run: zig build -Dapp-runtime=none --summary all
-
-      # The fork's own tests against a real tmux server.
-      - name: zig build test-tmux-live
-        if: steps.merge.outputs.changed == 'true'
-        id: live
+      - name: Fix test failures with Claude
+        if: steps.test.outcome == 'failure'
+        id: fix
+        timeout-minutes: 90
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
         run: |
-          tmux -V
-          zig build test-tmux-live -Dapp-runtime=none --summary all
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            exit 1
+          fi
+          tail -n 300 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log"
+
+          run-claude "fix tests" "$(cat <<EOF
+          This is eliasfloreteng/ghostty-tmux, a fork of the Ghostty terminal
+          (ghostty-org/ghostty) that adds native tmux integration. HEAD merges
+          upstream's main ($UPSTREAM) into the fork's main, and the tests fail
+          since. See AGENTS.md for how to build and test. These were run:
+
+              zig build test -Dapp-runtime=none --summary all
+              zig build -Dapp-runtime=none --summary all
+              zig build test-tmux-live -Dapp-runtime=none --summary all
+
+          The end of their output is in $RUNNER_TEMP/test-tail.log and all of it
+          in $RUNNER_TEMP/test.log.
+
+          Find out why they fail and fix it. Most likely upstream changed code
+          the fork builds on (\`git log --oneline HEAD^2..HEAD^1\` lists the fork's
+          own commits, \`git log --oneline HEAD^1..HEAD^2\` upstream's new ones);
+          then adapt the fork's code to upstream's change.
+
+          - Fix the cause. Do not delete, skip or loosen tests to make them pass.
+          - If a failure is flaky or has nothing to do with the merge, leave it
+            alone and say so; the tests run again after you.
+          - Run the failing tests to check your fix, filtered where you can.
+          - Leave your changes uncommitted. Do not commit, push, or touch any
+            branch. If you change anything, write a commit message for it to
+            $RUNNER_TEMP/fix-message.txt, in the style of \`git log --no-merges\`:
+            a short subject line, a blank line, then why.
+
+          Finish with a short report of what failed, why, and what you changed.
+          EOF
+          )"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Claude changed nothing; testing again." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ ! -s "$RUNNER_TEMP/fix-message.txt" ]; then
+            printf 'Fix the fork after merging upstream %s\n' "$UPSTREAM" > "$RUNNER_TEMP/fix-message.txt"
+          fi
+          printf '\nFixed by Claude Code after the tests failed on the merge.\n' >> "$RUNNER_TEMP/fix-message.txt"
+          git commit -F "$RUNNER_TEMP/fix-message.txt"
+          echo "Committed Claude's fix as $(git rev-parse --short HEAD)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test again
+        if: steps.test.outcome == 'failure'
+        id: retest
+        run: *test
+
+      - name: Upload Claude transcripts
+        if: always() && steps.merge.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claude-transcripts
+          path: ${{ runner.temp }}/claude/
+          if-no-files-found: ignore
 
       - name: Report skipped update
         if: failure() && steps.merge.outputs.changed == 'true'
         run: |
           {
             echo
-            echo "## Tests failed after merging: not synced"
+            echo "## Not synced"
             echo
-            echo "- zig build test: ${{ steps.test.outcome }}"
-            echo "- zig build (lib): ${{ steps.build.outcome }}"
-            echo "- zig build test-tmux-live: ${{ steps.live.outcome }}"
+            echo "- conflicts: ${{ steps.merge.outputs.conflict }}"
+            echo "- tests: ${{ steps.test.outcome }}"
+            echo "- Claude's fix: ${{ steps.fix.outcome }}"
+            echo "- tests again: ${{ steps.retest.outcome }}"
             echo
             echo "\`main\` was left as it was."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Push
         if: steps.merge.outputs.changed == 'true'
+        env:
+          TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
         run: |
-          git push origin HEAD:main
+          git push "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" HEAD:main
           echo "Pushed $(git rev-parse --short HEAD) to main." >> "$GITHUB_STEP_SUMMARY"
