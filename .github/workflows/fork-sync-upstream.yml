@@ -150,7 +150,7 @@ jobs:
             --dangerously-skip-permissions \
             --output-format stream-json --verbose \
             > "$transcript" || status=$?
-          report=$(jq -r 'select(.type == "result") | .result // empty' "$transcript" | tail -n1)
+          report=$(jq -rs 'map(select(.type == "result")) | last | .result // empty' "$transcript")
           echo "$report"
           {
             echo "### Claude: $name"
