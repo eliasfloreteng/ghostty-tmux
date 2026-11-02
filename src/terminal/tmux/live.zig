@@ -1358,7 +1358,7 @@ const PasteTarget = struct {
     path: []u8,
 
     fn start(alloc: Allocator, bracketed: bool) !PasteTarget {
-        const out = try run(alloc, &.{ "mktemp", "-t", "ghostty-tmux-paste" });
+        const out = try run(alloc, &.{ "mktemp", "-t", "ghostty-tmux-paste.XXXXXX" });
         defer alloc.free(out);
         const path = try alloc.dupe(u8, std.mem.trim(u8, out, " \r\n"));
         errdefer alloc.free(path);
@@ -2746,13 +2746,21 @@ test "live: a large paste arrives whole and in order" {
     try paste.appendSlice(alloc, "\x1b[201~");
     try testing.expectEqual(204800, paste.items.len);
 
-    // What cksum should print for it, worked out by cksum itself.
+    // What cksum should print for it: POSIX's CRC over the data and then
+    // its length, least significant byte first and with no zero bytes
+    // past the last one that is not. Worked out here because the paste
+    // is too large for an argument to a `cksum` we would run (Linux caps
+    // each one at 128 KiB).
     const expected = expected: {
-        const out = try run(alloc, &.{
-            "sh", "-c", "printf '%s' \"$0\" | cksum", paste.items,
-        });
-        defer alloc.free(out);
-        break :expected try alloc.dupe(u8, std.mem.trim(u8, out, " \r\n"));
+        var crc: std.hash.crc.@"CRC-32/CKSUM" = .init();
+        crc.update(paste.items);
+        var len = paste.items.len;
+        while (len != 0) : (len >>= 8) crc.update(&.{@truncate(len)});
+        break :expected try std.fmt.allocPrint(
+            alloc,
+            "{d} {d}",
+            .{ crc.final(), paste.items.len },
+        );
     };
     defer alloc.free(expected);
 
