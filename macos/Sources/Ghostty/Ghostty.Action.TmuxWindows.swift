@@ -132,13 +132,13 @@ extension Ghostty.Action {
         }
 
         init(c: ghostty_action_tmux_windows_s) {
-            self.sessionName = c.session_name.map { String(cString: $0) } ?? ""
+            self.sessionName = String(cString: c.session_name)
 
-            if c.sessions_len > 0, let cSessions = c.sessions {
-                self.sessions = UnsafeBufferPointer(start: cSessions, count: c.sessions_len).map {
+            if c.sessions_len > 0 {
+                self.sessions = UnsafeBufferPointer(start: c.sessions, count: c.sessions_len).map {
                     Session(
                         id: $0.id,
-                        name: $0.name.map { String(cString: $0) } ?? "",
+                        name: String(cString: $0.name),
                         windows: $0.windows,
                         attached: $0.attached)
                 }
@@ -146,16 +146,16 @@ extension Ghostty.Action {
                 self.sessions = []
             }
 
-            guard c.len > 0, let cWindows = c.windows else {
+            guard c.len > 0 else {
                 self.windows = []
                 return
             }
 
-            self.windows = UnsafeBufferPointer(start: cWindows, count: c.len).map { cWindow in
+            self.windows = UnsafeBufferPointer(start: c.windows, count: c.len).map { cWindow in
                 let nodes: [Node]
-                if cWindow.nodes_len > 0, let cNodes = cWindow.nodes {
+                if cWindow.nodes_len > 0 {
                     nodes = UnsafeBufferPointer(
-                        start: cNodes,
+                        start: cWindow.nodes,
                         count: cWindow.nodes_len
                     ).map { Node(c: $0) }
                 } else {
@@ -164,7 +164,7 @@ extension Ghostty.Action {
 
                 return Window(
                     id: cWindow.id,
-                    name: cWindow.name.map { String(cString: $0) } ?? "",
+                    name: String(cString: cWindow.name),
                     active: cWindow.active,
                     width: cWindow.width,
                     height: cWindow.height,

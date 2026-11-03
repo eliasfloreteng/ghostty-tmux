@@ -17,9 +17,9 @@ extension Ghostty.Action {
         init(c: ghostty_action_tmux_status_s) {
             // UTF-8 in practice, but nothing promises it; String(cString:)
             // repairs anything else rather than failing.
-            self.left = c.left.map { String(cString: $0) } ?? ""
-            self.windows = c.windows.map { String(cString: $0) } ?? ""
-            self.right = c.right.map { String(cString: $0) } ?? ""
+            self.left = String(cString: c.left)
+            self.windows = String(cString: c.windows)
+            self.right = String(cString: c.right)
         }
     }
 }

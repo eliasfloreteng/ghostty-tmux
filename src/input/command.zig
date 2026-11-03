@@ -788,7 +788,7 @@ fn actionCommands(action: Action.Key) []const Command {
 
         .text => comptime &.{.{
             .action = .{ .text = "👻" },
-            .title = i18n.N_("Ghostty"),
+            .title = "Ghostty",
             .description = i18n.N_("Put a little Ghostty in your terminal."),
         }},
 

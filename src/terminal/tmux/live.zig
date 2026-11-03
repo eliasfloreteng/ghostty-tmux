@@ -686,12 +686,12 @@ const CellLook = struct {
             page.styles.get(page.memory, c.cell.style_id).*;
 
         const bg: Style.Color = switch (c.cell.content_tag) {
-            .bg_color_palette => .{ .palette = c.cell.content.color_palette.data },
-            .bg_color_rgb => .{ .rgb = .{
+            .bg_color_palette => .palette(c.cell.content.color_palette.data),
+            .bg_color_rgb => .rgb(.{
                 .r = c.cell.content.color_rgb.r,
                 .g = c.cell.content.color_rgb.g,
                 .b = c.cell.content.color_rgb.b,
-            } },
+            }),
             else => style.bg_color,
         };
 
@@ -717,7 +717,7 @@ const CellLook = struct {
     }
 
     fn eql(a: CellLook, b: CellLook) bool {
-        return a.cp == b.cp and a.fg.eql(b.fg) and a.bg.eql(b.bg) and
+        return a.cp == b.cp and a.fg == b.fg and a.bg == b.bg and
             a.flags == b.flags;
     }
 };
@@ -920,10 +920,7 @@ test "live: a styled pane survives its own capture" {
     const cell = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
     const page = cell.node.page();
     const style = page.styles.get(page.memory, cell.cell.style_id);
-    try testing.expectEqual(
-        @as(u8, 1),
-        style.fg_color.palette,
-    );
+    try testing.expectEqual(Style.Color.palette(1), style.fg_color);
 }
 
 test "live: a window follows the size we ask for" {
@@ -1122,7 +1119,7 @@ test "live: a flooding pane does not break the session" {
     const cell = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
     const page = cell.node.page();
     const style = page.styles.get(page.memory, cell.cell.style_id);
-    try testing.expectEqual(@as(u8, 1), style.fg_color.palette);
+    try testing.expectEqual(Style.Color.palette(1), style.fg_color);
 }
 
 test "live: killing a tmux window drops it here too" {

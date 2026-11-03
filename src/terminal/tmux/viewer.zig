@@ -413,6 +413,18 @@ pub const Viewer = struct {
         /// empty.
         paste_buffer: []const u8,
 
+        /// Tmux's current window changed (`%session-window-changed`)
+        /// for the session this viewer is attached to, including from
+        /// an external `select-window`.
+        ///
+        /// The same move is also reflected in `Window.active` in the
+        /// `windows` action that follows it whenever the window is one
+        /// we know, which is what the GUI acts on; this is the move on
+        /// its own, sent even for a window not listed yet. Not sent for
+        /// what our own `select-window` is still waiting on, nor for a
+        /// notification that leaves tmux where we already had it.
+        active_window: usize,
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -2295,6 +2307,14 @@ pub const Viewer = struct {
         // move to.
         if (self.session_id != session_id) return;
         if (self.windowSelectUnanswered()) return;
+
+        // The move itself, as its own action, for whoever wants only
+        // that. The windows action below is what the GUI follows.
+        if (self.current_window_id != window_id) {
+            var arena = self.action_arena.promote(self.alloc);
+            defer self.action_arena = arena.state;
+            try actions.append(arena.allocator(), .{ .active_window = window_id });
+        }
 
         // A window we have never heard of is not one the GUI can focus.
         // The layout that introduces it will arrive on its own, carrying
@@ -8317,6 +8337,146 @@ test "window_add queues list_windows when queue empty" {
     });
 }
 
+test "session_window_changed emits active_window for this session" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, v.session_id);
+                }
+            }).check,
+        },
+        // Matching session: this is the only notification that moves
+        // the active window, including an external select-window.
+        .{
+            .input = .{ .tmux = .{ .session_window_changed = .{
+                .session_id = 1,
+                .window_id = 9,
+            } } },
+            .contains_tags = &.{.active_window},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, actions.len);
+                    switch (actions[0]) {
+                        .active_window => |id| try testing.expectEqual(9, id),
+                        else => return error.TestUnexpectedResult,
+                    }
+                }
+            }).check,
+        },
+        // Broadcasts for other sessions must be ignored.
+        .{
+            .input = .{ .tmux = .{ .session_window_changed = .{
+                .session_id = 2,
+                .window_id = 4,
+            } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+        // Active pane within a window is not a window change.
+        .{
+            .input = .{ .tmux = .{ .window_pane_changed = .{
+                .window_id = 9,
+                .pane_id = 1,
+            } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .{ .exit = null } },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "window_close queues list_windows" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // The version query and list-windows are both in flight.
+                    try testing.expectEqual(2, v.command_queue.len());
+                }
+            }).check,
+        },
+        // Commands are sent as soon as they are queued, so list-windows
+        // goes out at once, behind the two still in flight.
+        .{
+            .input = .{ .tmux = .{ .window_close = .{ .id = 3 } } },
+            .contains_command = "list-windows",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(3, v.command_queue.len());
+                    var list_windows: usize = 0;
+                    var it = v.command_queue.iterator(.forward);
+                    while (it.next()) |cmd| {
+                        if (cmd.* == .list_windows) list_windows += 1;
+                    }
+                    try testing.expectEqual(2, list_windows);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .{ .exit = null } },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "list-windows parse failure frees earlier windows" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // The version reply. list-windows went out with the version
+        // query, so this sends nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a 0 host" } } },
+        // First line is a real window. The second is not, so parsing
+        // stops after the first layout arena has been allocated.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0 0 0 0 0 %0
+                \\not a window
+                ,
+            } },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
 test "window_add queues list_windows when queue not empty" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
@@ -8751,7 +8911,7 @@ fn testRawStartupScreen(comptime alternate_on: bool) !void {
                         );
                         command_index += 1;
                     },
-                    .windows, .notice, .status, .paste_buffer => {},
+                    .windows, .notice, .status, .paste_buffer, .active_window => {},
                     .exit => {
                         return error.UnexpectedViewerExit;
                     },
@@ -13957,8 +14117,8 @@ test "a pane tmux resizes is read again, without breaking a sequence in flight" 
         const cell = screen.pages.getCell(.{ .active = .{ .x = 12, .y = 0 } }).?;
         const page = cell.node.page();
         const style = page.styles.get(page.memory, cell.cell.style_id);
-        try testing.expectEqual(@as(u8, 2), style.fg_color.palette);
-        try testing.expect(style.bg_color == .none);
+        try testing.expectEqual(@as(u8, 2), style.fg_color.value().palette);
+        try testing.expect(style.bg_color == @TypeOf(style.bg_color).none);
         try testing.expect(style.flags.underline != .none);
 
         // The capture's styled cells survived, its plain padding did

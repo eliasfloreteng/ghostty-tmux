@@ -55,12 +55,12 @@ extension Ghostty.Action {
         let text: String
 
         init?(c: ghostty_action_tmux_notice_s) {
-            guard let kind = Kind(c.kind), let text = c.text else { return nil }
+            guard let kind = Kind(c.kind) else { return nil }
             self.kind = kind
 
             // tmux's text is UTF-8 in practice, but nothing promises it.
             // String(cString:) repairs anything else rather than failing.
-            self.text = String(cString: text)
+            self.text = String(cString: c.text)
         }
     }
 }
